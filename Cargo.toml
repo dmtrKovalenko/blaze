@@ -88,6 +88,7 @@ hir-ty-borrowck = { path = "vendor/rust-analyzer/crates/hir-ty-borrowck", versio
 hir-ty-wfcheck = { path = "vendor/rust-analyzer/crates/hir-ty-wfcheck", version = "0.0.0" }
 hir-ty-codegen = { path = "crates/hir-ty-codegen" }
 ra-jit-expand = { path = "crates/ra-jit-expand" }
+ra-jit-macro-wasm = { path = "crates/ra-jit-macro-wasm" }
 ra-jit-store = { path = "crates/ra-jit-store" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }

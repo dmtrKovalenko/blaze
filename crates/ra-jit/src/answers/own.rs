@@ -136,6 +136,19 @@ fn releases() -> &'static [Release] {
     })
 }
 
+/// Whether `sysroot` has the compiler's library, which is what makes it a toolchain. rustc
+/// loads it from `lib/librustc_driver-*`, and on Windows, where a DLL is found beside the
+/// executable, from `bin/rustc_driver-*.dll`.
+fn has_driver(sysroot: &Path) -> bool {
+    [("lib", "librustc_driver-"), ("bin", "rustc_driver-")].into_iter().any(|(dir, prefix)| {
+        std::fs::read_dir(sysroot.join(dir)).is_ok_and(|mut found| {
+            found.any(|it| {
+                it.is_ok_and(|it| it.file_name().to_str().is_some_and(|it| it.starts_with(prefix)))
+            })
+        })
+    })
+}
+
 /// The toolchain `rustc` is of, as far as ra-jit can tell without running it.
 struct Toolchain {
     sysroot: PathBuf,
@@ -148,14 +161,10 @@ impl Toolchain {
     /// rustc finds its sysroot by where its library is, which is beside it.
     fn of(rustc: &Path) -> Option<Toolchain> {
         let sysroot = rustc.parent()?.parent()?.to_owned();
-        let lib = sysroot.join("lib");
-        let has_driver = std::fs::read_dir(&lib).ok()?.flatten().any(|it| {
-            it.file_name().to_str().is_some_and(|name| name.starts_with("librustc_driver-"))
-        });
-        if !has_driver {
+        if !has_driver(&sysroot) {
             return None;
         }
-        let rustlib = lib.join("rustlib");
+        let rustlib = sysroot.join("lib").join("rustlib");
         let host = std::fs::read_dir(&rustlib).ok()?.flatten().find_map(|it| {
             it.file_name().to_str()?.strip_prefix("manifest-rustc-").map(str::to_owned)
         })?;
@@ -563,6 +572,27 @@ pub(super) fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The compiler's library is beside rustc on Windows and in `lib` elsewhere: a sysroot with
+    /// neither is no toolchain.
+    #[test]
+    fn a_toolchain_has_the_compilers_library_in_lib_or_beside_rustc() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-driver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sysroot = |name: &str| {
+            let sysroot = dir.join(name);
+            std::fs::create_dir_all(sysroot.join("lib")).unwrap();
+            std::fs::create_dir_all(sysroot.join("bin")).unwrap();
+            sysroot
+        };
+        let (unix, windows, neither) = (sysroot("unix"), sysroot("windows"), sysroot("neither"));
+        std::fs::write(unix.join("lib/librustc_driver-0123abcd.so"), b"").unwrap();
+        std::fs::write(windows.join("bin/rustc_driver-0123abcd.dll"), b"").unwrap();
+        std::fs::write(neither.join("lib/libstd-0123abcd.so"), b"").unwrap();
+        let found = [&unix, &windows, &neither].map(|it| has_driver(it));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, [true, true, false]);
+    }
 
     #[test]
     fn cfgs_given() {

@@ -39,6 +39,7 @@
 //! collection and a change of format, from running at once.
 
 use std::{
+    borrow::Cow,
     fs::{File, OpenOptions},
     io::{self, Write},
     ops::Range,
@@ -583,11 +584,13 @@ impl Index {
 }
 
 /// A sealed pack on its way, made of values in the order they are added.
-struct Sealing {
+struct Sealing<'a> {
     blocks: Vec<(u32, u32, bool)>,
     entries: Vec<Entry>,
-    /// The blocks that are done, as they are on disk.
-    data: Vec<u8>,
+    /// The blocks that are done, as they are on disk, in pieces: a value too large for a
+    /// block is a block of its own, and one added from where it outlives the pack is not
+    /// copied, which for the files of a program is hundreds of megabytes.
+    data: Vec<Cow<'a, [u8]>>,
     /// The values of the block being filled.
     raw: Vec<u8>,
     /// Whether a value, empty or not, is in the block being filled.
@@ -596,8 +599,8 @@ struct Sealing {
     packer: Option<zstd::bulk::Compressor<'static>>,
 }
 
-impl Sealing {
-    fn new() -> Sealing {
+impl<'a> Sealing<'a> {
+    fn new() -> Sealing<'a> {
         Sealing {
             blocks: Vec::new(),
             entries: Vec::new(),
@@ -610,6 +613,9 @@ impl Sealing {
     }
 
     fn add(&mut self, key: &[u8; KEY], value: &[u8], checksum: u32) {
+        if value.len() > BLOCK_MAX {
+            return self.alone(key, Cow::Owned(value.to_vec()), checksum);
+        }
         if self.raw.len() + value.len() > BLOCK_MAX {
             self.close();
         }
@@ -621,6 +627,24 @@ impl Sealing {
         if self.raw.len() >= BLOCK {
             self.close();
         }
+    }
+
+    /// As [`Self::add`], for a value that is held for as long as the pack is.
+    fn add_held(&mut self, key: &[u8; KEY], value: &'a [u8], checksum: u32) {
+        if value.len() > BLOCK_MAX {
+            self.alone(key, Cow::Borrowed(value), checksum);
+        } else {
+            self.add(key, value, checksum);
+        }
+    }
+
+    /// Adds a value too large to be compressed as the block of its own it is stored as.
+    fn alone(&mut self, key: &[u8; KEY], value: Cow<'a, [u8]>, checksum: u32) {
+        self.close();
+        let (block, len) = (self.blocks.len() as u32, value.len() as u32);
+        self.entries.push(Entry { key: *key, block, at: 0, len, checksum });
+        self.blocks.push((len, len, false));
+        self.data.push(value);
     }
 
     /// Ends the block being filled: compressed, unless that does not make it smaller.
@@ -638,7 +662,10 @@ impl Sealing {
         let packed: Option<Vec<u8>> = None;
         let stored = packed.as_deref().unwrap_or(&raw);
         self.blocks.push((stored.len() as u32, raw.len() as u32, packed.is_some()));
-        self.data.extend_from_slice(stored);
+        match self.data.last_mut() {
+            Some(Cow::Owned(last)) => last.extend_from_slice(stored),
+            _ => self.data.push(Cow::Owned(stored.to_vec())),
+        }
         self.raw = raw;
         self.raw.clear();
     }
@@ -646,51 +673,81 @@ impl Sealing {
     /// The bytes of the pack.
     fn finish(mut self) -> Vec<u8> {
         self.close();
+        let mut pack = self.head();
+        pack.reserve(self.data.iter().map(|it| it.len()).sum());
+        for piece in &self.data {
+            pack.extend_from_slice(piece);
+        }
+        pack
+    }
+
+    /// Writes the pack into `dir` under the name of its bytes, a piece at a time.
+    fn write_into(mut self, dir: &Path) -> io::Result<()> {
+        self.close();
+        let head = self.head();
+        let mut pieces = vec![&head[..]];
+        pieces.extend(self.data.iter().map(|it| &**it));
+        let hash = pieces.iter().fold(Sha256::new(), |hash, it| hash.chain_update(it)).finalize();
+        write_whole(&dir.join(named(&hash)), &pieces, true)
+    }
+
+    /// What comes before the blocks: how many there are of them and of the values, and
+    /// where each is.
+    fn head(&self) -> Vec<u8> {
         let index = BLOCK_HEADER * self.blocks.len() + ENTRY * self.entries.len();
-        let mut pack = Vec::with_capacity(MAGIC.len() + 8 + index + self.data.len());
+        let mut pack = Vec::with_capacity(MAGIC.len() + 8 + index);
         pack.extend_from_slice(MAGIC);
         pack.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
         pack.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
-        for (stored, raw, packed) in self.blocks {
+        for &(stored, raw, packed) in &self.blocks {
             for field in [stored, raw, u32::from(packed)] {
                 pack.extend_from_slice(&field.to_le_bytes());
             }
         }
-        for entry in self.entries {
+        for entry in &self.entries {
             pack.extend_from_slice(&entry.key);
             for field in [entry.block, entry.at, entry.len, entry.checksum] {
                 pack.extend_from_slice(&field.to_le_bytes());
             }
         }
-        pack.extend_from_slice(&self.data);
         pack
     }
 }
 
-/// Seals the whole records at the start of the open pack `bytes`, which is at `path` and
+/// Seals the whole records at the start of the open pack `file`, which is at `path` and
 /// held: writes them as a sealed pack, then removes the open one. One with no whole record
-/// is only removed.
-fn seal_records(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let (records, _) = records(bytes);
-    if !records.is_empty() {
-        let mut sealing = Sealing::new();
-        for record in &records {
-            sealing.add(&record.key, &bytes[record.value.clone()], record.checksum);
+/// is only removed. The pack is mapped and not read: one that the files of a program were
+/// added to is hundreds of megabytes.
+fn seal_records(dir: &Path, path: &Path, file: &File) -> io::Result<()> {
+    {
+        // SAFETY: an open pack is written only by whoever holds its lock, which is the
+        // caller, and the caller writes nothing more to it. The map is gone before the
+        // pack is removed, which Windows refuses a mapped file.
+        let bytes = unsafe { memmap2::Mmap::map(file) }?;
+        let (records, _) = records(&bytes);
+        if !records.is_empty() {
+            let mut sealing = Sealing::new();
+            for record in &records {
+                sealing.add_held(&record.key, &bytes[record.value.clone()], record.checksum);
+            }
+            sealing.write_into(dir)?;
         }
-        let sealed = sealing.finish();
-        write_whole(&dir.join(named(&Sha256::digest(&sealed))), &sealed, true)?;
     }
     std::fs::remove_file(path)?;
     sync_dir(dir)
 }
 
 fn record(key: &[u8; KEY], value: &[u8], len: u32) -> Vec<u8> {
-    let mut record = Vec::with_capacity(HEADER + value.len());
-    record.extend_from_slice(key);
-    record.extend_from_slice(&len.to_le_bytes());
-    record.extend_from_slice(&checksum(key, value).to_le_bytes());
-    record.extend_from_slice(value);
-    record
+    [&head(key, value, len)[..], value].concat()
+}
+
+/// What comes before the value in its record.
+fn head(key: &[u8; KEY], value: &[u8], len: u32) -> [u8; HEADER] {
+    let mut head = [0; HEADER];
+    head[..KEY].copy_from_slice(key);
+    head[KEY..KEY + 4].copy_from_slice(&len.to_le_bytes());
+    head[KEY + 4..].copy_from_slice(&checksum(key, value).to_le_bytes());
+    head
 }
 
 /// Has the directory's entries on disk, so that a rename in it outlasts a loss of power.
@@ -925,7 +982,7 @@ impl StoreDir {
     /// Writes a file that readers see all of or not at all, and that is whole after a loss
     /// of power once this returns.
     pub fn write_whole(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-        write_whole(&self.dir.join(name), bytes, true)
+        write_whole(&self.dir.join(name), &[bytes], true)
     }
 
     /// The names of the files in the directory. One that is not there has none, and one
@@ -996,10 +1053,8 @@ impl StoreDir {
     }
 
     /// Seals the whole records of an open pack that is held here, and removes it.
-    fn seal_left(&self, path: &Path, mut file: &File) -> io::Result<()> {
-        let mut pack = Vec::new();
-        io::Read::read_to_end(&mut file, &mut pack)?;
-        seal_records(&self.dir, path, &pack)
+    fn seal_left(&self, path: &Path, file: &File) -> io::Result<()> {
+        seal_records(&self.dir, path, file)
     }
 
     /// Counts what is in the directory without reading any of it.
@@ -1187,7 +1242,7 @@ struct Listed {
     used: SystemTime,
 }
 
-fn write_whole(to: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
+fn write_whole(to: &Path, pieces: &[&[u8]], private: bool) -> io::Result<()> {
     let dir = to.parent().ok_or(io::ErrorKind::InvalidInput)?;
     let name = to.file_name().ok_or(io::ErrorKind::InvalidInput)?.to_string_lossy();
     let partial = dir.join(format!("{name}.{}-{}.tmp", std::process::id(), nanos()));
@@ -1199,7 +1254,7 @@ fn write_whole(to: &Path, bytes: &[u8], private: bool) -> io::Result<()> {
     let mut file = options.open(&partial)?;
     let written = file
         .lock()
-        .and_then(|()| file.write_all(bytes))
+        .and_then(|()| pieces.iter().try_for_each(|it| file.write_all(it)))
         .and_then(|()| name_file_whole(&file, &partial, to));
     if written.is_err() {
         _ = std::fs::remove_file(&partial);
@@ -1220,7 +1275,7 @@ pub fn name_file_whole(file: &File, from: &Path, to: &Path) -> io::Result<()> {
 
 /// Writes a file outside a store the way [`StoreDir::write_whole`] writes one inside.
 pub fn write_file_whole(to: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_whole(to, bytes, false)
+    write_whole(to, &[bytes], false)
 }
 
 pub struct Store {
@@ -1913,9 +1968,9 @@ impl Store {
         // Every thread that compiles adds here: the lock is held to put the record with the
         // others and no longer. Its checksum is worked out before, and a pack that is full
         // is hashed and sealed after.
-        let record = record(&key, value, len);
+        let head = head(&key, value, len);
         let roll_at = self.tuning.seal_at.saturating_mul(ROLL_AFTER);
-        let Some(full) = self.writer().add(&self.dir, roll_at, &key, &record) else {
+        let Some(full) = self.writer().add(&self.dir, roll_at, &key, [&head[..], value]) else {
             return;
         };
         let sealed = full.seal(&self.dir.dir);
@@ -1938,7 +1993,13 @@ impl Store {
 impl Writer {
     /// Adds the record of `key`, unless it was added. What comes back is the open pack once
     /// it has `roll_at` bytes, for the caller to seal: the next record opens another.
-    fn add(&mut self, dir: &StoreDir, roll_at: u64, key: &[u8; KEY], record: &[u8]) -> Option<New> {
+    fn add(
+        &mut self,
+        dir: &StoreDir,
+        roll_at: u64,
+        key: &[u8; KEY],
+        record: [&[u8]; 2],
+    ) -> Option<New> {
         if self.stopped.is_some() {
             self.dropped += 1;
             return None;
@@ -1959,14 +2020,28 @@ impl Writer {
         }
     }
 
-    fn append(&mut self, dir: &StoreDir, roll_at: u64, record: &[u8]) -> io::Result<Option<New>> {
+    /// Appends a record, its head and its value. One as large as what waits is written out
+    /// is written from where it is, and not copied to wait.
+    fn append(
+        &mut self,
+        dir: &StoreDir,
+        roll_at: u64,
+        record: [&[u8]; 2],
+    ) -> io::Result<Option<New>> {
         let new = match &mut self.open {
             Some(new) => new,
             empty => empty.insert(New::create(&dir.dir)?),
         };
-        new.pending.extend_from_slice(record);
-        if new.pending.len() >= WRITE_AT {
+        let [head, value] = record;
+        if value.len() >= WRITE_AT {
             new.write_out()?;
+            new.write_now(&[head, value])?;
+        } else {
+            new.pending.extend_from_slice(head);
+            new.pending.extend_from_slice(value);
+            if new.pending.len() >= WRITE_AT {
+                new.write_out()?;
+            }
         }
         Ok(if new.written >= roll_at { self.open.take() } else { None })
     }
@@ -2039,12 +2114,24 @@ impl New {
         if self.pending.is_empty() {
             return Ok(());
         }
-        if let Err(e) = self.file.write_all(&self.pending) {
-            _ = self.file.set_len(self.written);
-            return Err(e);
+        let pending = std::mem::take(&mut self.pending);
+        let written = self.write_now(&[&pending]);
+        self.pending = pending;
+        if written.is_ok() {
+            self.pending.clear();
         }
-        self.written += self.pending.len() as u64;
-        self.pending.clear();
+        written
+    }
+
+    /// Writes `pieces` to the file after what is in it, as `write_out` does what waits.
+    fn write_now(&mut self, pieces: &[&[u8]]) -> io::Result<()> {
+        for piece in pieces {
+            if let Err(e) = self.file.write_all(piece) {
+                _ = self.file.set_len(self.written);
+                return Err(e);
+            }
+        }
+        self.written += pieces.iter().map(|it| it.len() as u64).sum::<u64>();
         Ok(())
     }
 
@@ -2054,10 +2141,7 @@ impl New {
     /// waits for.
     fn seal(mut self, dir: &Path) -> io::Result<()> {
         self.write_out()?;
-        let mut pack = Vec::with_capacity(self.written as usize);
-        io::Seek::seek(&mut self.file, io::SeekFrom::Start(0))?;
-        io::Read::read_to_end(&mut self.file, &mut pack)?;
-        seal_records(dir, &self.path, &pack)
+        seal_records(dir, &self.path, &self.file)
     }
 }
 
@@ -3004,6 +3088,27 @@ mod tests {
         }
         assert_eq!(reader.get(&[9; KEY]), Some(large));
         assert!(StoreDir::at(&dir).verify().unwrap().corrupt.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pack_written_in_pieces_is_the_pack_made_whole() {
+        let dir = scratch("sealed-pieces");
+        private::create_dir(&dir).unwrap();
+        let (small, large) = (noise(3, 300), noise(9, BLOCK_MAX + 1));
+        let values: [(&[u8], u8); 4] = [(&small, 1), (&large, 2), (b"", 3), (&large, 4)];
+        let sealing = || {
+            let mut sealing = Sealing::new();
+            for (value, key) in values {
+                sealing.add_held(&[key; KEY], value, checksum(&[key; KEY], value));
+            }
+            sealing
+        };
+        let whole = sealing().finish();
+        sealing().write_into(&dir).unwrap();
+        let [pack] = &files(&dir, Kind::Pack)[..] else { panic!("one pack") };
+        assert_eq!(std::fs::read(pack).unwrap(), whole);
+        assert_eq!(pack.file_name().unwrap().to_str(), Some(&*named(&Sha256::digest(&whole))));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

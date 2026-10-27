@@ -6349,7 +6349,7 @@ impl<'db> Builder<'_, '_, 'db> {
         let interner = self.interner();
         let (canonical, vars) = canonical_regions(self.ctx, trait_ref)?;
         let env = hir_ty::ParamEnvAndCrate { param_env: self.ctx.env, krate: self.ctx.krate };
-        let (pairs, obligations) = match prove_query(
+        let (pairs, obligations, universes) = match prove_query(
             self.ctx.db,
             env.store(),
             hir_ty::next_solver::StoredTraitRef::new(canonical),
@@ -6357,10 +6357,12 @@ impl<'db> Builder<'_, '_, 'db> {
         ) {
             Proven::Here => return None,
             &Proven::Error(true_error) => return Some(Err(true_error)),
-            Proven::Gives { pairs, obligations } => (pairs, obligations),
+            Proven::Gives { pairs, obligations, universes, in_universe } => {
+                (pairs, obligations, Universes::new(self.ctx, *universes, in_universe))
+            }
         };
         let mut made = FxHashMap::default();
-        let mut map = |region| region_from_query(self.ctx, &vars, &mut made, region);
+        let mut map = |region| region_from_query(self.ctx, &vars, &universes, &mut made, region);
         let pairs =
             pairs.iter().map(|(a, b)| (map(a.as_ref()), map(b.as_ref()))).collect::<Vec<_>>();
         let obligations = obligations
@@ -6390,18 +6392,45 @@ impl<'db> Builder<'_, '_, 'db> {
 }
 
 /// What proving a trait reference gives a body, as salsa keeps it: its region variables are
-/// the trait reference's, numbered in order, and after them the ones proving it made.
+/// the trait reference's, numbered in order, and after them the ones proving it made. The
+/// universes it names past the root, of the placeholders of a `for<'a>` it proved and of the
+/// variables made in them, are the query's own, `1..=universes`, which the body makes anew in
+/// the same order, as rustc's canonical query response does.
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
 enum Proven {
-    /// What it gives names a placeholder, or a variable of another universe, which only the
-    /// body's own inference context can say what it is.
+    /// What it gives names a variable the query resolved, which the body would have to see
+    /// resolved too.
     Here,
     /// It does not hold; whether that is a true error.
     Error(bool),
     Gives {
         pairs: Vec<(StoredRegion, StoredRegion)>,
         obligations: Vec<(StoredTy, StoredRegion)>,
+        universes: u32,
+        /// Each variable it made outside the root universe, and that universe.
+        in_universe: Vec<(u32, u32)>,
     },
+}
+
+/// The universes of a query's answer past the root as the body has them: the body's for each
+/// of the query's, and the universe of each variable the query made outside the root.
+#[derive(Default)]
+struct Universes {
+    fresh: Vec<rustc_type_ir::UniverseIndex>,
+    of_var: FxHashMap<u32, u32>,
+}
+
+impl Universes {
+    fn new(ctx: &Ctx<'_, '_>, universes: u32, in_universe: &[(u32, u32)]) -> Self {
+        Universes {
+            fresh: (0..universes).map(|_| ctx.infcx.create_next_universe()).collect(),
+            of_var: in_universe.iter().copied().collect(),
+        }
+    }
+
+    fn get(&self, universe: u32) -> Option<rustc_type_ir::UniverseIndex> {
+        self.fresh.get((universe as usize).checked_sub(1)?).copied()
+    }
 }
 
 /// `a <= b` for each of `constraints`: `b` outlives `a`.
@@ -6440,7 +6469,6 @@ fn prove_query(
         },
         obligation_ctxt::ObligationCtxt,
     };
-    use rustc_type_ir::TypeVisitableExt as _;
     let env = env.as_ref(db);
     let interner = DbInterner::new_with(db, env.krate).with_regions();
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -6467,25 +6495,47 @@ fn prove_query(
         inner.region_obligations().iter().map(|it| (it.sup_type, it.sub_region)).collect();
     let mut constraints = inner.unwrap_region_constraints();
     let pairs = constraint_pairs(interner, &constraints.region_constraint_data().constraints);
-    let mut own = |region: Region<'_>| match region.kind() {
-        RegionKind::RePlaceholder(_) => false,
-        RegionKind::ReVar(vid) => {
-            vid.as_u32() < vars
-                || constraints.probe_value(vid) == Err(rustc_type_ir::UniverseIndex::ROOT)
+    let mut universes = 0;
+    let mut in_universe = FxHashMap::default();
+    let mut resolved = false;
+    let mut visit = |region: Region<'_>| match region.kind() {
+        RegionKind::RePlaceholder(placeholder) => {
+            universes = universes.max(placeholder.universe.as_u32());
         }
-        _ => true,
+        RegionKind::ReVar(vid) if vid.as_u32() >= vars => match constraints.probe_value(vid) {
+            Err(universe) if universe != rustc_type_ir::UniverseIndex::ROOT => {
+                universes = universes.max(universe.as_u32());
+                in_universe.insert(vid.as_u32(), universe.as_u32());
+            }
+            Err(_) => {}
+            Ok(_) => resolved = true,
+        },
+        _ => {}
     };
-    if !pairs.iter().all(|&(a, b)| own(a) && own(b))
-        || !obligations.iter().all(|&(ty, region)| own(region) && !ty.has_placeholders())
-    {
+    for &(a, b) in &pairs {
+        visit(a);
+        visit(b);
+    }
+    for &(ty, region) in &obligations {
+        visit(region);
+        rustc_type_ir::fold_regions(interner, ty, |it, _| {
+            visit(it);
+            it
+        });
+    }
+    if resolved {
         return Proven::Here;
     }
+    let mut in_universe: Vec<_> = in_universe.into_iter().collect();
+    in_universe.sort_unstable();
     Proven::Gives {
         pairs: pairs.into_iter().map(|(a, b)| (a.store(), b.store())).collect(),
         obligations: obligations
             .into_iter()
             .map(|(ty, region)| (ty.store(), region.store()))
             .collect(),
+        universes,
+        in_universe,
     }
 }
 
@@ -7184,21 +7234,37 @@ fn canonical_regions<'db, T: rustc_type_ir::TypeFoldable<hir_ty::next_solver::Db
     (!here).then_some((canonical, vars))
 }
 
-/// A region of a query's answer in the body: one of `vars`, which the query was asked with, or
-/// a fresh variable for each the query made.
+/// A region of a query's answer in the body: one of `vars`, which the query was asked with, a
+/// fresh variable for each the query made, in its universe, or a placeholder of the universe
+/// made for the query's.
 fn region_from_query<'db>(
     ctx: &Ctx<'_, 'db>,
     vars: &[Region<'db>],
+    universes: &Universes,
     made: &mut FxHashMap<u32, Region<'db>>,
     region: Region<'db>,
 ) -> Region<'db> {
     match region.kind() {
         RegionKind::ReVar(vid) => match vars.get(vid.index()) {
             Some(&it) => it,
-            None => *made
-                .entry(vid.as_u32())
-                .or_insert_with(|| ctx.infcx.next_region_var(hir_ty::Span::Dummy)),
+            None => *made.entry(vid.as_u32()).or_insert_with(|| {
+                match universes.of_var.get(&vid.as_u32()).and_then(|&it| universes.get(it)) {
+                    Some(universe) => {
+                        ctx.infcx.next_region_var_in_universe(universe, hir_ty::Span::Dummy)
+                    }
+                    None => ctx.infcx.next_region_var(hir_ty::Span::Dummy),
+                }
+            }),
         },
+        RegionKind::RePlaceholder(placeholder) => {
+            match universes.get(placeholder.universe.as_u32()) {
+                Some(universe) => Region::new_placeholder(
+                    ctx.infcx.interner,
+                    placeholder.with_updated_universe(universe),
+                ),
+                None => region,
+            }
+        }
         _ => region,
     }
 }
@@ -7226,14 +7292,15 @@ fn normalize_canonical<'db>(
         };
     let interner = ctx.infcx.interner;
     let mut made = FxHashMap::default();
+    let universes = Universes::default();
     let normalized = rustc_type_ir::fold_regions(interner, normalized.as_ref(), |it, _| {
-        region_from_query(ctx, &vars, &mut made, it)
+        region_from_query(ctx, &vars, &universes, &mut made, it)
     });
     let constraints = pairs
         .iter()
         .map(|(a, b)| {
-            let a = region_from_query(ctx, &vars, &mut made, a.as_ref());
-            let b = region_from_query(ctx, &vars, &mut made, b.as_ref());
+            let a = region_from_query(ctx, &vars, &universes, &mut made, a.as_ref());
+            let b = region_from_query(ctx, &vars, &universes, &mut made, b.as_ref());
             match (a.kind(), b.kind()) {
                 (RegionKind::ReVar(a), RegionKind::ReVar(b)) => Constraint::VarSubVar(a, b),
                 (_, RegionKind::ReVar(b)) => Constraint::RegSubVar(a, b),

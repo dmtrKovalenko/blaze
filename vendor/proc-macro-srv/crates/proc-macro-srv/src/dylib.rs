@@ -121,6 +121,15 @@ impl ProcMacroLibrary {
                 format!("{shown} has no list of proc macros: ra-jit did not link it"),
             ));
         }
+        // SAFETY: `list` is what `dlsym` found.
+        unsafe { Self::from_list(&shown.to_string(), list) }
+    }
+
+    /// The library behind `list`, the address of ra-jit's `static RA_JIT_PROC_MACROS: &[Macro]`.
+    ///
+    /// # Safety
+    /// `list` is that static, in a library that stays loaded for as long as the process runs.
+    unsafe fn from_list(shown: &str, list: *mut std::ffi::c_void) -> io::Result<Self> {
         // SAFETY: ra-jit exports the list as a `static RA_JIT_PROC_MACROS: &[Macro]`, and the
         // library stays loaded for as long as the process runs.
         let list: &'static [Macro] = unsafe { *list.cast::<&'static [Macro]>() };
@@ -143,7 +152,41 @@ impl ProcMacroLibrary {
         Ok(ProcMacroLibrary { proc_macros: ProcMacros::new(macros) })
     }
 
-    #[cfg(not(unix))]
+    /// The same on Windows, with `LoadLibraryW` and `GetProcAddress`: the library is a DLL
+    /// ra-jit linked, which exports the list by name.
+    #[cfg(windows)]
+    fn open(path: &Path) -> io::Result<Self> {
+        use std::ffi::c_void;
+        use std::os::windows::ffi::OsStrExt;
+
+        unsafe extern "system" {
+            fn LoadLibraryW(name: *const u16) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        }
+        let shown = path.display();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: loading a library runs its initializers, which a proc-macro library is
+        // trusted to have, as rustc trusts it. The name ends with a zero.
+        let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if handle.is_null() {
+            return Err(io::Error::other(format!(
+                "cannot load {shown}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: the handle is a loaded library's; the name ends with a zero.
+        let list = unsafe { GetProcAddress(handle, SYMBOL.as_ptr().cast()) };
+        if list.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{shown} has no list of proc macros: ra-jit did not link it"),
+            ));
+        }
+        // SAFETY: `list` is what `GetProcAddress` found.
+        unsafe { Self::from_list(&shown.to_string(), list) }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn open(path: &Path) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

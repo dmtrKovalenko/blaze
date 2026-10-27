@@ -1858,6 +1858,15 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   64.4 s and 64.3 s before, 58.0 s and 57.5 s after.
 - `blaze disable` removes the `bin` directory of cargo's home that `enable` made for the links
   of `cargo fmt` and `cargo clippy`, when nothing else is in it: the home is as it was.
+- A load refused for configuration is retried on the next build, so editing or deleting
+  `.cargo/config.toml` no longer leaves `cargo blaze run` reporting an old refusal until
+  `cargo blaze stop` (#597). Reported by @enricoschaaf.
+
+- A plain `cargo blaze check` leaves integration tests, examples and benchmarks out of its
+  diagnostics, as `cargo check` does. Those targets were checked without their
+  dev-dependencies, producing false unresolved imports and method errors; explicitly
+  selecting dev targets still checks them with their dependencies (#634, reported by
+  @om606bosch; also #632).
 
 ## [0.1.0] - 2026-10-20
 

@@ -40,9 +40,16 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
         crate::load(&projects, &cargo_config, crate::load_config(), selection, None, None)?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
-    let excludes = &args.selection.excludes;
-    let mut checker =
-        Checker::new(&db, &vfs, &checkouts, &members, excludes, read_from, root, lints_capped);
+    let mut checker = Checker::new(
+        &db,
+        &vfs,
+        &checkouts,
+        &members,
+        &args.selection,
+        read_from,
+        root,
+        lints_capped,
+    );
     let served = match crate::socket::Served::bind(&socket) {
         Ok(served) => served,
         Err(crate::socket::NotServed::Taken) => {
@@ -98,7 +105,16 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
-    let checker = Checker::new(&db, &vfs, &checkouts, &members, &[], read_from, root, lints_capped);
+    let checker = Checker::new(
+        &db,
+        &vfs,
+        &checkouts,
+        &members,
+        &args.selection,
+        read_from,
+        root,
+        lints_capped,
+    );
     if let Some(refused) = checker.refused(&db) {
         return Ok(Some(refused));
     }
@@ -155,7 +171,7 @@ impl Checker {
         vfs: &Vfs,
         checkouts: &crate::Checkouts,
         members: &FxHashSet<ide_db::base_db::Crate>,
-        excludes: &[String],
+        selection: &crate::plan::Selection,
         read_from: SystemTime,
         root: PathBuf,
         lints_capped: bool,
@@ -181,7 +197,7 @@ impl Checker {
             }
             for package in cargo.packages().filter(|it| cargo[*it].is_local) {
                 manifests.insert(cargo[package].manifest.to_path_buf().into(), None);
-                let excluded = excludes.contains(&cargo[package].name);
+                let excluded = selection.excludes.contains(&cargo[package].name);
                 for &target in &cargo[package].targets {
                     let target = &cargo[target];
                     if excluded {
@@ -213,6 +229,17 @@ impl Checker {
             for &member in members {
                 let krate = hir::Crate::from(member);
                 if !krate.origin(db).is_local() {
+                    continue;
+                }
+                // Metadata includes dev targets even when the build loads none of their
+                // dev-dependencies. A plain check leaves them alone, as cargo does. Use
+                // the crate's kind: a test and a binary can share the same root file.
+                if !selection.dev_deps
+                    && matches!(
+                        krate.target_kind(db),
+                        TargetKind::Example | TargetKind::Test | TargetKind::Bench
+                    )
+                {
                     continue;
                 }
                 let root_file = krate.root_file(db);

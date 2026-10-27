@@ -202,17 +202,6 @@ fn aarch64_extension(feature: &str) -> Option<&'static str> {
     })
 }
 
-/// Returns its first float argument with the second left in the register it was passed in,
-/// which is where a pair of floats is returned.
-pub(super) fn join_floats() -> String {
-    format!(".globl {SYMBOL}\n{SYMBOL}:\nret\n")
-}
-
-/// Answers what is in the two registers a pair of floats is returned in, as integers.
-pub(super) fn split_floats() -> String {
-    format!(".globl {SYMBOL}\n{SYMBOL}:\nmovq rax, xmm0\nmovq rdx, xmm1\nret\n")
-}
-
 /// `vcvtps2ph` makes half-precision floats of the single-precision ones at its first
 /// argument and writes them to its second. The rounding is part of the instruction, so there
 /// is one for each of the eight, and the third argument says which runs.

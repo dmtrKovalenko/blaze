@@ -406,7 +406,7 @@ enum Warmth {
     Loading(Instant),
     Ready,
     /// Why the worker has no part in the checkout as cargo last built it.
-    Failed(String, SystemTime),
+    Failed(String),
     /// The errors in the source the worker found loading it or building it first: each
     /// program's build fails with them until a source is written.
     Broken(crate::errors::Said, SystemTime),
@@ -417,7 +417,7 @@ impl Warmth {
         match self {
             Warmth::Loading(since) => format!("loading for {:.0?}", since.elapsed()),
             Warmth::Ready => "ready".to_owned(),
-            Warmth::Failed(why, _) => format!("failed: {why}"),
+            Warmth::Failed(why) => format!("failed: {why}"),
             Warmth::Broken(..) => "the source has an error".to_owned(),
         }
     }
@@ -668,9 +668,9 @@ impl Worker {
             Err(why) => match std::fs::read(errors_beside(&self.socket)) {
                 Ok(said) => match serde_json::from_slice(&said) {
                     Ok(said) => Warmth::Broken(said, SystemTime::now()),
-                    Err(_) => Warmth::Failed(format!("{why:#}"), SystemTime::now()),
+                    Err(_) => Warmth::Failed(format!("{why:#}")),
                 },
-                _ => Warmth::Failed(format!("{why:#}"), SystemTime::now()),
+                _ => Warmth::Failed(format!("{why:#}")),
             },
         };
         eprintln!("{}: {}", checkout.root.display(), warmth.describe());
@@ -1278,10 +1278,7 @@ impl Daemon {
         *lock(&worker.asked) = Instant::now();
         let warmth = match lock(&worker.checkouts).get(&checkout.key) {
             Some(loaded) if loaded.generation == checkout.generation => loaded.warmth.clone(),
-            _ => Warmth::Failed(
-                "the daemon has not loaded this build of the workspace".to_owned(),
-                SystemTime::now(),
-            ),
+            _ => Warmth::Failed("the daemon has not loaded this build of the workspace".to_owned()),
         };
         match warmth {
             Warmth::Ready => worker.sync(checkout),
@@ -1291,7 +1288,7 @@ impl Daemon {
                     since.elapsed()
                 ),
             },
-            Warmth::Failed(reason, _) => Reply::Cold { reason },
+            Warmth::Failed(reason) => Reply::Cold { reason },
             Warmth::Broken(said, _) => {
                 let programs = checkout.programs.iter().map(|_| Err(NotBuilt::Error(said.clone())));
                 Reply::Synced { programs: programs.collect(), spans: Vec::new() }
@@ -1324,22 +1321,20 @@ impl Daemon {
     fn warm(&self, checkout: Checkout) -> anyhow::Result<()> {
         let id = checkout.config.id();
         let mut workers = lock(&self.workers);
-        // What a worker could not load once it can't load again, until cargo builds anew or
-        // a source is written: the failure may be an error in the source.
+        // Source diagnostics stay valid until a source is written. A failed load has not
+        // established its inputs: configuration, even a file since deleted, may have caused
+        // it. Retry that load on the next request rather than keep its error indefinitely.
         let failed = workers.get(&id).and_then(|it| match lock(&it.checkouts).get(&checkout.key) {
             Some(Loaded { generation, warmth, .. }) if *generation == checkout.generation => {
                 match warmth {
-                    Warmth::Failed(why, at) => Some((Some(why.clone()), *at)),
-                    // Its builds say the errors.
-                    Warmth::Broken(_, at) => Some((None, *at)),
+                    Warmth::Failed(_) | Warmth::Broken(..) => Some(warmth.clone()),
                     _ => None,
                 }
             }
             _ => None,
         });
         match failed {
-            Some((Some(why), at)) if !checkout.written_since(at) => anyhow::bail!(why),
-            Some((None, at)) if !checkout.written_since(at) => return Ok(()),
+            Some(Warmth::Broken(_, at)) if !checkout.written_since(at) => return Ok(()),
             Some(_) => {
                 if let Some(old) = workers.remove(&id) {
                     old.stop();

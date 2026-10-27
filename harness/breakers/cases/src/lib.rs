@@ -57,6 +57,7 @@ cases![
     static_str_array,
     type_id_const_arg,
     simd_sums,
+    simd_float_lanes,
     variant_alias,
     two_bitflags,
     extern_static,

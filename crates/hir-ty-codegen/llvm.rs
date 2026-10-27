@@ -1020,11 +1020,15 @@ impl Machine {
             .map_err(|e| Unhandled::Llvm(e.to_string_lossy().into()))?;
         // The baseline CPU, as rustc compiles for; position-independent, as the rest of
         // the program is.
+        // 128-bit atomics are `lock cmpxchg16b`: Windows 8.1 and later require the instruction,
+        // and the library calls LLVM makes otherwise (`__atomic_*_16`) are nobody's here.
+        let features =
+            if emitted.arch == Arch::X86_64 && name.contains("windows") { "+cx16" } else { "" };
         target
             .create_target_machine(
                 &triple,
                 emitted.cpu(),
-                "",
+                features,
                 optimization.level(),
                 RelocMode::PIC,
                 CodeModel::Default,

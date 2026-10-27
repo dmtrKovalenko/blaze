@@ -2123,11 +2123,10 @@ impl<'db> ExprCollector<'db> {
     fn collect_expr_path(&mut self, e: ast::PathExpr) -> Option<(Path, HygieneId)> {
         e.path().and_then(|path| {
             let path = self.lower_path(path, &mut Self::impl_trait_error_allocator)?;
-            // Need to enable `mod_path.len() < 1` for `self`. A longer plain path takes its
-            // hygiene too, for the items a `macro` names where it is defined.
+            // Need to enable `mod_path.len() < 1` for `self`. A longer path takes its hygiene
+            // too, whatever it starts with, for the items a `macro` names where it is defined.
             let may_be_variable = matches!(&path, Path::BarePath(mod_path) if mod_path.len() <= 1);
-            let plain = path.mod_path().is_some_and(|it| it.kind == PathKind::Plain);
-            let hygiene = if may_be_variable || plain {
+            let hygiene = if may_be_variable || path.mod_path().is_some() {
                 self.hygiene_id_for(e.syntax().text_range())
             } else {
                 HygieneId::ROOT

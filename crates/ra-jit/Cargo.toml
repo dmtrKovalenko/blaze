@@ -80,6 +80,7 @@ hir-ty.workspace = true
 hir-ty-codegen.workspace = true
 hir-ty-borrowck.workspace = true
 ra-jit-expand.workspace = true
+ra-jit-macro-wasm.workspace = true
 ra-jit-store.workspace = true
 blaze-doc.workspace = true
 blaze-fmt.workspace = true

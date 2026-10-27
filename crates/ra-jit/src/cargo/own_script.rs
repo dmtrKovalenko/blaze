@@ -66,6 +66,8 @@ pub(crate) struct Made<'a> {
     /// Whether it is built for wasm32-wasip1 with blaze's `std::process`, to run under WASI
     /// (`wasi_script.rs`), not for the host.
     pub(crate) wasi: bool,
+    /// Whether it is built as a WebAssembly module, for a proc macro ra-jit runs itself.
+    pub(crate) wasm: bool,
     pub(crate) exe: PathBuf,
     pub(crate) dep_info: PathBuf,
 }
@@ -147,6 +149,7 @@ pub(crate) fn compile(
         name: SCRIPT,
         proc_macro: false,
         wasi: false,
+        wasm: false,
         exe: exe.to_owned(),
         dep_info: exe.with_extension("d"),
     };
@@ -168,6 +171,7 @@ pub(crate) fn compile_wasi(
         name: SCRIPT,
         proc_macro: false,
         wasi: true,
+        wasm: false,
         exe: module.to_owned(),
         dep_info: module.with_extension("wasm.d"),
     };
@@ -203,6 +207,18 @@ pub(crate) fn compile_record(
     let env = record.crate_env.clone();
     let rustc_had = |name: &str| record.crate_env.get(name).cloned().or(std::env::var(name).ok());
     compile_in(sysroot, &asked, &record.source, env, made, dir, &rustc_had)
+}
+
+/// Builds the first crate of `described`, a `rust-project.json` over the standard library of
+/// `sysroot`, as `made` says, in `dir`: the store's build of the same description when every
+/// file it read is as it was.
+pub(crate) fn compile_described(
+    sysroot: &Path,
+    described: &str,
+    made: &Made<'_>,
+    dir: &Path,
+) -> Result<(), String> {
+    built(sysroot, described, &[], made, dir)
 }
 
 /// [`compile_as`] of the crate rustc was `asked` for, the variables its source reads by `env!`
@@ -306,7 +322,7 @@ fn built(
 ) -> Result<(), String> {
     let mut first = keyed::Key::new(BUILDS);
     first.field(described.as_bytes()).field(keyed::toolchain(sysroot).as_bytes());
-    first.field(&[u8::from(made.proc_macro)]);
+    first.field(&[u8::from(made.proc_macro) | u8::from(made.wasm) << 1]);
     if made.wasi {
         first.field(crate::RUN_TOOL_TARGET.as_bytes());
     }
@@ -326,7 +342,9 @@ fn built(
         return Ok(());
     }
     let inputs = dir.join("ra-jit-inputs");
-    if let Some(store) = super::daemon::store() {
+    if made.wasm {
+        super::own_macro::wasm_target(sysroot)?;
+    } else if let Some(store) = super::daemon::store() {
         standard_library_once(sysroot, &store, &dir.join("standard-library"))?;
     }
     // A script that reaches a function ra-jit could not compile is not built
@@ -496,6 +514,8 @@ fn build(
     }
     if made.wasi {
         ra_jit.args(["--target", crate::RUN_TOOL_TARGET, "--run-tool"]);
+    } else if made.wasm {
+        ra_jit.args(["--target", super::own_macro::WASM_TARGET]);
     }
     // What cargo set for the script's rustc is not the build's: the build ra-jit runs is its
     // own, which asks cargo nothing through a wrapper and is no doctest.
@@ -514,8 +534,8 @@ fn build(
     if let Some(store) = store {
         ra_jit.env("RA_JIT_CACHE", store);
     }
-    // No release ships the standard library with blaze's `std::process`.
-    if !shipped || made.wasi {
+    // No release ships the standard library for wasm32-wasip1, nor with blaze's `std::process`.
+    if !shipped || made.wasi || made.wasm {
         ra_jit.env("RA_JIT_STD_FROM", "off");
     }
     ra_jit.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::null());
@@ -593,6 +613,7 @@ pub(crate) fn build_nothing(
         name: SCRIPT,
         proc_macro: false,
         wasi: false,
+        wasm: false,
         dep_info: exe.with_extension("d"),
         exe,
     };

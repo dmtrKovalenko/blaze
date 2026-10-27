@@ -8,6 +8,11 @@ difference is a failure. So is a function ra-jit refused, in the harnesses that 
 There are also Rust unit tests in `crates/ra-jit` and in the code generator; the harnesses
 are what carries the weight.
 
+`checktargets.py` compares plain and explicit-test checks with cargo, using workspace and
+registry dev-dependencies (#634). Errors in unselected tests, examples and benches must not
+fail a plain check; errors in libraries and binaries must, and an all-targets check must
+report the dev targets' errors.
+
 ## Running them
 
 You need Python 3, the pinned nightly (`harness/toolchain`, `nightly-2026-10-25`) with
@@ -156,6 +161,7 @@ writes them again.
 | `latelisted.py` | What a file named by `include!` through a build script's variable declares is listed in its crate though the daemon reads the file only once the names are resolved, as bun's generated bindings are: an edit that adds a function then patches a few functions, not every one the file declares |
 | `rustsrc.py` | A toolchain without `rust-src` is turned down, saying how to install it |
 | `splices.py` | Edits that are hard on the splice: thread-locals, statics, vtables, function pointers, closures, panics, foreign calls. Counts how each step was linked |
+| `loadretry.py` | A refused load reports changed flags and recovers after configuration files are removed or rewritten, without restarting the daemon (#597). Both configuration filenames, inherited configuration, and cached source diagnostics are checked |
 | `farsplices.py` | Splices into a binary whose code is further from its end than an AArch64 branch reaches |
 | `farfile.py` | Edits of a program whose file is 2.3 GB of a section nothing loads, as a debug build of bevy's is mostly debug info: bodies, a caller, a new function and taking it back each have to be spliced, which a patch placed as far from the code as it is behind the file is not ([#79](https://github.com/indexable-inc/ra-jit/issues/79)). Linux |
 | `bigbinary.py` | Edits of a program larger than any place of the splice is sized for: 220 MB of code, over 16 MB of frames the unwinder reads from `__eh_frame` or `.eh_frame`, and on Linux 4.2 GB of `.debug_abbrev`. A function shorter than the long jump, one that panics through its replacement, 3,000 functions added and a new function each have to be spliced ([architecture.md](architecture.md#no-size-is-a-reason-to-link-in-full)). Nightly, Linux and macOS |

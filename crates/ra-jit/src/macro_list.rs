@@ -3,7 +3,9 @@
 //! (docs/no-rustc.md, step J2). ra-jit adds it to the root file of a proc-macro crate it links
 //! as a shared library, as a module of its own as it does a test harness: a static exported
 //! by name with each macro's kind, name, helper attributes and the client the server expands
-//! it through.
+//! it through. A proc macro compiled to WebAssembly gets exports instead, which call the
+//! macros through the `proc_macro` that stands in for the standard library's there
+//! (`crates/ra-jit-macro-wasm`, [`shim`]).
 
 use std::fmt::Write as _;
 
@@ -20,8 +22,9 @@ pub(crate) const SYMBOL: &str = "RA_JIT_PROC_MACROS";
 pub(crate) const MARK: &str =
     "\n// ra-jit's list of the crate's proc macros, which is not in the file on disk.\n";
 
-/// The module for the macros of `krate`, a proc-macro crate.
-pub(crate) fn module(db: &RootDatabase, krate: hir::Crate) -> String {
+/// The module for the macros of `krate`, a proc-macro crate, for a WebAssembly module when
+/// `wasm`.
+pub(crate) fn module(db: &RootDatabase, krate: hir::Crate, wasm: bool) -> String {
     let edition = krate.edition(db);
     let mut macros = Vec::new();
     for def in krate.root_module(db).declarations(db) {
@@ -44,7 +47,67 @@ pub(crate) fn module(db: &RootDatabase, krate: hir::Crate) -> String {
     }
     // rustc lists them as the crate declares them; the server finds them by name.
     macros.sort_by(|a, b| a.1.cmp(&b.1));
-    text(&macros)
+    if wasm { wasm_text(&macros) } else { text(&macros) }
+}
+
+/// The `proc_macro` crate `krate` links, a proc-macro crate compiled to WebAssembly, and the
+/// text of its root file there: ra-jit's `proc_macro` of `crates/ra-jit-macro-wasm`, which
+/// asks the host for what the standard library's asks the compiler's bridge.
+pub(crate) fn shim(db: &RootDatabase, krate: hir::Crate) -> Option<(vfs::FileId, String)> {
+    use ide_db::base_db::{CrateOrigin, LangCrateOrigin};
+    let data = ide_db::base_db::Crate::from(krate).data(db);
+    let proc_macro =
+        data.dependencies.iter().map(|dep| dep.crate_id).find(|it| {
+            matches!(it.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::ProcMacro))
+        })?;
+    Some((hir::Crate::from(proc_macro).root_file(db), ra_jit_macro_wasm::GUEST.to_owned()))
+}
+
+/// What a WebAssembly module of proc macros exports (`crates/ra-jit-macro-wasm`): room for
+/// the host to write an input in, the list of the macros as text, and the expansion of the
+/// macro at an index of that list.
+fn wasm_text(macros: &[(u32, String, Vec<String>, String)]) -> String {
+    let mut list = String::new();
+    for (kind, name, helpers, _) in macros {
+        _ = writeln!(list, "{kind}\t{name}\t{}", helpers.join(","));
+    }
+    let mut text = String::from(MARK);
+    _ = write!(
+        text,
+        "#[doc(hidden)]\n#[allow(warnings, clippy::all)]\npub mod {MODULE} {{\n    \
+         extern crate proc_macro;\n\n    \
+         #[unsafe(no_mangle)]\n    \
+         pub extern \"C\" fn {ALLOC}(len: usize) -> *mut u8 {{\n        \
+         proc_macro::__blaze::alloc(len)\n    \
+         }}\n\n    \
+         #[unsafe(no_mangle)]\n    \
+         pub extern \"C\" fn {LIST}() {{\n        \
+         proc_macro::__blaze::list({list:?})\n    \
+         }}\n\n    \
+         #[unsafe(no_mangle)]\n    \
+         pub extern \"C\" fn {EXPAND}(\n        \
+         index: u32,\n        \
+         attr: *const u8,\n        \
+         attr_len: usize,\n        \
+         input: *const u8,\n        \
+         input_len: usize,\n    \
+         ) {{\n        \
+         match index {{\n",
+        ALLOC = ra_jit_macro_wasm::exports::ALLOC,
+        LIST = ra_jit_macro_wasm::exports::LIST,
+        EXPAND = ra_jit_macro_wasm::exports::EXPAND,
+    );
+    for (index, (kind, _, _, path)) in macros.iter().enumerate() {
+        let call = match kind {
+            1 => format!(
+                "proc_macro::__blaze::expand2(crate::{path}, attr, attr_len, input, input_len)"
+            ),
+            _ => format!("proc_macro::__blaze::expand1(crate::{path}, input, input_len)"),
+        };
+        _ = writeln!(text, "            {index} => {call},");
+    }
+    text.push_str("            _ => {}\n        }\n    }\n}\n");
+    text
 }
 
 fn text(macros: &[(u32, String, Vec<String>, String)]) -> String {

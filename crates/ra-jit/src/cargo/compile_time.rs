@@ -59,7 +59,12 @@ pub(crate) fn build(
     asked: &OwnBuildAsked<'_>,
     selection: &Selection,
 ) -> anyhow::Result<Vec<(Package, OwnBuildOutput)>> {
-    if super::own_macro::server().is_none() {
+    let root: &Path = cargo.workspace_root().as_ref();
+    let native = match super::own_macro::wasm() {
+        true => Some(super::own_macro::native_proc_macros(root).map_err(anyhow::Error::msg)?),
+        false => None,
+    };
+    if native.is_none() && super::own_macro::server().is_none() {
         anyhow::bail!(
             "no proc-macro server is beside ra-jit ({}), and ra-jit links proc macros only for its own",
             super::own_macro::SHIPPED
@@ -78,7 +83,8 @@ pub(crate) fn build(
         .context("the load has no target directory of its own")?;
     let own = PathBuf::from(own.as_str()).join("compile-time");
     let dir = manifest.parent().unwrap_or(Path::new("/"));
-    let driver = Driver::new(cargo, &graph, &toolchain, host, &own, dir, selection, config)?;
+    let mut driver = Driver::new(cargo, &graph, &toolchain, host, &own, dir, selection, config)?;
+    driver.native = native;
     let ran = driver.run()?;
     Ok(driver.outputs(&ran))
 }
@@ -135,6 +141,10 @@ struct Driver<'a> {
     tools: script::unit::Tools,
     jobs: u32,
     made: Mutex<Made_>,
+    /// With proc macros built as WebAssembly modules (`own_macro::wasm`), the crates of those
+    /// the workspace expands natively (`own_macro::NATIVE_KEY`); `None` when every one is
+    /// linked for ra-jit's server.
+    native: Option<Vec<String>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -265,6 +275,7 @@ impl<'a> Driver<'a> {
             tools,
             jobs: u32::try_from(jobs).unwrap_or(1),
             made: Mutex::new(Made_::default()),
+            native: None,
         })
     }
 
@@ -655,6 +666,7 @@ impl<'a> Driver<'a> {
             name: SCRIPT,
             proc_macro: false,
             wasi: false,
+            wasm: false,
             dep_info: exe.with_extension("d"),
             exe: exe.clone(),
         };
@@ -662,7 +674,8 @@ impl<'a> Driver<'a> {
         Ok(exe)
     }
 
-    /// Links the proc macro of unit `at` for ra-jit's server: where its library is.
+    /// Builds the proc macro of unit `at` as a WebAssembly module, or links it for ra-jit's
+    /// server when the workspace expands it natively: where the module or library is.
     fn proc_macro(&self, at: usize) -> anyhow::Result<PathBuf> {
         let unit = self.unit(at);
         let name = unit.crate_name();
@@ -686,14 +699,27 @@ impl<'a> Driver<'a> {
         let (prefix, suffix) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX);
         let deps = self.own.join("deps");
         let stem = format!("{name}-{}", self.keys[at]);
+        let wasm = self.native.as_ref().is_some_and(|native| !native.contains(&name));
+        if !wasm && super::own_macro::server().is_none() {
+            anyhow::bail!("`{name}`: {}", super::own_macro::missing_server());
+        }
         let made = Made {
             name: &name,
             proc_macro: true,
             wasi: false,
-            exe: deps.join(format!("{prefix}{stem}{suffix}")),
+            wasm,
+            exe: match wasm {
+                true => deps.join(format!("{stem}.wasm")),
+                false => deps.join(format!("{prefix}{stem}{suffix}")),
+            },
             dep_info: deps.join(format!("{stem}.d")),
         };
-        self.compile(&crates, &made, &deps.join(&stem))?;
+        let compiled = self.compile(&crates, &made, &deps.join(&stem));
+        if let (true, Err(why)) = (wasm, &compiled) {
+            let root: &Path = self.cargo.workspace_root().as_ref();
+            anyhow::bail!(super::own_macro::refusal(&name, &format!("{why:#}"), root));
+        }
+        compiled?;
         Ok(made.exe)
     }
 

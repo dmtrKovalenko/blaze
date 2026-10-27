@@ -442,7 +442,12 @@ pub(crate) fn keep(
     let mut files = Vec::with_capacity(wrote.len());
     let mut bytes_kept = 0;
     for path in wrote {
-        let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let reading = |e: std::io::Error| format!("reading {}: {e}", path.display());
+        let file = std::fs::File::open(path).map_err(reading)?;
+        // Mapped and not read: the files of a large program are hundreds of megabytes, which
+        // the store writes from here. SAFETY: the daemon is the one that had them written,
+        // and it does not start another build while this keeps them.
+        let bytes = unsafe { memmap2::Mmap::map(&file) }.map_err(reading)?;
         let content: Hash = Sha256::digest(&bytes).into();
         store.insert(&content_key(&content), &bytes);
         bytes_kept += bytes.len();

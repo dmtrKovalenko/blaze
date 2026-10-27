@@ -61,6 +61,8 @@ HARNESSES = [
     ("core", ["wholeprogram.py"], {}, on("linux", "macos"), None),
     # `cargo blaze build` from nothing: G's whole build, no cargo build.
     ("core", ["coldbuild.py"], {}, on("linux"), 2),
+    # A load refused for configuration must be retried without stopping the daemon (#597).
+    ("core", ["loadretry.py"], {}, on("linux", "macos"), 2),
     # Its program of writable statics of its own crates on macOS too, where anim's `HOME` was refused.
     ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
     ("core", ["splices.py"], {}, EVERYWHERE, 2),
@@ -96,6 +98,7 @@ HARNESSES = [
     ("core", ["norustc.py"], {}, on("linux", "macos"), 2),
     # `cargo ra-jit check`'s diagnostics, in each `--message-format`, against rustc's.
     ("core", ["check_json.py"], {}, on("linux", "macos", backend="cranelift"), 2),
+    ("core", ["checktargets.py"], {}, on("linux", "macos", backend="cranelift"), 2),
     # ra-jit answers what is asked of rustc as rustc answers it, on every target it knows.
     ("core", ["answers.py"], {}, on("linux", "macos", backend="cranelift"), 1),
     ("core", ["worktrees.py"], {}, EVERYWHERE, 2),
@@ -148,6 +151,7 @@ FAST = {
     "unwinds.py": (11, ()),
     "growth.py": (31, (X64,)),
     "coldbuild.py": (78, (X64,)),
+    "loadretry.py": (30, ()),
     "splices.py": (51, ()),
     "live_e2e.py": (16, ()),
     "live_types.py": (9, ()),
@@ -167,6 +171,7 @@ FAST = {
     "rustsrc.py": (1, ()),
     "norustc.py": (253, (X64,)),
     "check_json.py": (38, (X64,)),
+    "checktargets.py": (40, (X64,)),
     "answers.py": (17, (X64,)),
     "worktrees.py": (26, (X64, MAC)),
     "worktrees.py --join --together": (28, ()),

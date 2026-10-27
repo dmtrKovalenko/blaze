@@ -4547,6 +4547,38 @@ pub fn stand_in_section(format: object::BinaryFormat) -> (&'static str, &'static
     }
 }
 
+/// The bytes of the object `product` makes, read once `product` is gone: they are written to
+/// a file first, which the kernel can keep on disk, so that a large program's object of
+/// gigabytes is not in memory twice. Where no such file can be made they are made in memory.
+fn write_object(product: cranelift_object::ObjectProduct) -> Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _, Write as _};
+    let failed = |e: &dyn fmt::Display| CodegenError::Backend(format!("writing the object: {e}"));
+    let Some(mut file) = unnamed_file() else {
+        return product.emit().map_err(|e| failed(&e));
+    };
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, &file);
+    product.object.write_stream(&mut out).map_err(|e| failed(&e))?;
+    out.flush().map_err(|e| failed(&e))?;
+    drop((out, product));
+    let len = file.seek(std::io::SeekFrom::End(0)).map_err(|e| failed(&e))?;
+    file.rewind().map_err(|e| failed(&e))?;
+    let mut object = Vec::with_capacity(len as usize);
+    file.read_to_end(&mut object).map_err(|e| failed(&e))?;
+    Ok(object)
+}
+
+/// A file of the temporary directory that is removed once it is closed, if one can be made.
+fn unnamed_file() -> Option<std::fs::File> {
+    static MADE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = format!("ra-jit-object-{}-{made}", std::process::id());
+    let path = std::env::temp_dir().join(name);
+    let file = std::fs::File::options().read(true).write(true).create_new(true).open(&path).ok()?;
+    // Windows removes a file that is open once it is closed.
+    _ = std::fs::remove_file(&path);
+    Some(file)
+}
+
 /// Gives the messages of the stand-ins of `product` their bytes, in [`stand_in_section`].
 fn place_stand_ins(
     product: &mut cranelift_object::ObjectProduct,
@@ -5370,7 +5402,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             std::thread::spawn(move || drop(freed));
         }
         let macho = product.object.format() == cranelift_object::object::BinaryFormat::MachO;
-        let mut object = product.emit().map_err(|e| CodegenError::Backend(e.to_string()))?;
+        let mut object = write_object(product)?;
         if macho {
             debuginfo::settle_macho(&mut object).map_err(CodegenError::Backend)?;
         }
@@ -11294,14 +11326,110 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
     }
 
+    /// Whether `block` is the `asm!` of `panic_unwind`'s `throw_exception` on Windows: it
+    /// lays out the `_ThrowInfo` of a Rust panic (the C++ runtime's description of the
+    /// exception) in `.rdata` with image-relative offsets, and gives its address. Its operands
+    /// are that address (out), `exception_cleanup`, `TYPE_DESCRIPTOR`, the size of `Exception`
+    /// and `exception_copy`.
+    fn is_seh_throw_info(&self, block: &hir_ty::mir::InlineAsm) -> bool {
+        use hir_ty::mir::AsmOperand::{Const, Reg, Sym};
+        self.cg.target.object_format == ObjectFormat::Coff
+            && !block.naked
+            && matches!(
+                &*block.operands,
+                [Reg { output: Some(_), input: None, .. }, Sym(_), Sym(_), Const(_), Sym(_)]
+            )
+    }
+
+    /// That block, as code. A static `_ThrowInfo` holds image-relative offsets, which an
+    /// assembled block cannot have (Cranelift has no such relocation), so they are written
+    /// when the exception is thrown, to a static of the object: the runtime reads it again
+    /// when the exception is caught or dropped, after this frame is gone.
+    fn seh_throw_info(&mut self, block: &hir_ty::mir::InlineAsm, size: i128) -> Result<()> {
+        use hir_ty::mir::AsmOperand;
+        let [
+            AsmOperand::Reg { output: Some(output), .. },
+            AsmOperand::Sym(cleanup),
+            AsmOperand::Sym(type_desc),
+            _,
+            AsmOperand::Sym(copy),
+        ] = &*block.operands
+        else {
+            unsupported!("the `asm!` of `throw_exception`");
+        };
+        let OperandKind::Static(type_desc) = &type_desc.kind else {
+            unsupported!("the `asm!` of `throw_exception`");
+        };
+        let mut function = |this: &mut Self, operand: &Operand| -> Result<Value> {
+            let ty = this.operand_ty(operand)?;
+            let id = this.fn_item(ty)?;
+            let id = this.cg.declare_func_address_in_func(id, this.builder.func);
+            Ok(this.builder.ins().func_addr(ptr(), id))
+        };
+        let (cleanup, copy) = (function(self, cleanup)?, function(self, copy)?);
+        let type_desc = self.cg.static_data(*type_desc);
+        let type_desc = self.cg.declare_data_in_func(type_desc, self.builder.func);
+        let type_desc = self.builder.ins().symbol_value(ptr(), type_desc);
+        // 14 words: `_ThrowInfo` (4), `_CatchableTypeArray` (2) and `_CatchableType` (7).
+        let info = self.cg.define_data(
+            ConstBlob {
+                bytes: vec![0; 56],
+                relocs: Vec::new(),
+                fn_relocs: Vec::new(),
+                align: 8,
+                type_ids: Vec::new(),
+            },
+            true,
+        )?;
+        let info = self.cg.declare_data_in_func(info, self.builder.func);
+        let info = self.builder.ins().symbol_value(ptr(), info);
+        // The image's base is what `GetModuleHandleW(NULL)` gives.
+        let mut sig = self.cg.make_signature();
+        sig.params.push(AbiParam::new(ptr()));
+        sig.returns.push(AbiParam::new(ptr()));
+        let handle = self.cg.import("GetModuleHandleW", &sig)?;
+        let handle = self.cg.declare_func_in_func(handle, self.builder.func);
+        let null = self.builder.ins().iconst(ptr(), 0);
+        let call = self.builder.ins().call(handle, &[null]);
+        let base = self.builder.inst_results(call)[0];
+        let b = &mut self.builder;
+        let rva = |b: &mut FunctionBuilder, address: Value| {
+            let offset = b.ins().isub(address, base);
+            b.ins().ireduce(types::I32, offset)
+        };
+        let (array, catchable) = (b.ins().iadd_imm(info, 16), b.ins().iadd_imm(info, 24));
+        let words = [
+            (0, b.ins().iconst(types::I32, 0)),
+            (4, rva(b, cleanup)),
+            (8, b.ins().iconst(types::I32, 0)),
+            (12, rva(b, array)),
+            (16, b.ins().iconst(types::I32, 1)),
+            (20, rva(b, catchable)),
+            (24, b.ins().iconst(types::I32, 0)),
+            (28, rva(b, type_desc)),
+            (32, b.ins().iconst(types::I32, 0)),
+            (36, b.ins().iconst(types::I32, -1)),
+            (40, b.ins().iconst(types::I32, 0)),
+            (44, b.ins().iconst(types::I32, size as i64)),
+            (48, rva(b, copy)),
+        ];
+        for (offset, word) in words {
+            b.ins().store(MEM, word, info, offset);
+        }
+        let (addr, _) = self.place(output)?;
+        self.builder.ins().store(MEM, info, addr, 0);
+        Ok(())
+    }
+
     /// Calls the function that an `asm!` block is assembled as: see [`asm`].
     fn inline_asm(&mut self, block: &hir_ty::mir::InlineAsm) -> Result<()> {
         use hir_ty::mir::AsmOperand;
+        let seh = self.is_seh_throw_info(block);
         let mut operands = Vec::with_capacity(block.operands.len());
         let mut syms = Vec::with_capacity(block.operands.len());
         for operand in &block.operands {
             syms.push(match operand {
-                AsmOperand::Sym(_) if !block.naked => unsupported!("`asm!` with a `sym`"),
+                AsmOperand::Sym(_) if !block.naked && !seh => unsupported!("`asm!` with a `sym`"),
                 AsmOperand::Sym(Operand { kind: OperandKind::Static(id), .. }) => {
                     if is_thread_local(self.cg.db, *id) {
                         unsupported!("inline assembly with a `sym` that is thread local");
@@ -11373,6 +11501,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 AsmOperand::Label => asm::Operand::Label,
             });
+        }
+        if seh {
+            let Some(asm::Operand::Const(size)) = operands.get(3) else {
+                unsupported!("the `asm!` of `throw_exception`");
+            };
+            return self.seh_throw_info(block, *size);
         }
         let arch = self.cg.target.arch;
         let features = self.body.and_then(|it| it.owner.as_function());
@@ -16827,6 +16961,93 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     let sum = self.builder.ins().smax(sum, least);
                     let sum = self.builder.ins().ireduce(types::I16, sum);
                     self.builder.ins().store(MEM, sum, dst, lane);
+                }
+            }
+            // `minps` and `maxps`: the second operand when either is a NaN, or both are equal.
+            (
+                "x86.sse.min.ps" | "x86.sse.max.ps" | "x86.avx.min.ps.256" | "x86.avx.max.ps.256"
+                | "x86.sse2.min.pd" | "x86.sse2.max.pd" | "x86.avx.min.pd.256"
+                | "x86.avx.max.pd.256",
+                [a, b],
+            ) => {
+                let (a, ty) = self.operand(a)?;
+                let (b, _) = self.operand(b)?;
+                let (lane, step) = if name.ends_with("pd") || name.contains(".pd.") {
+                    (types::F64, 8)
+                } else {
+                    (types::F32, 4)
+                };
+                let cond =
+                    if name.contains(".min.") { FloatCC::LessThan } else { FloatCC::GreaterThan };
+                for at in (0..self.layout(ty)?.size.bytes() as i32).step_by(step) {
+                    let l = self.builder.ins().load(lane, MEM, a, at);
+                    let r = self.builder.ins().load(lane, MEM, b, at);
+                    let first = self.builder.ins().fcmp(cond, l, r);
+                    let chosen = self.builder.ins().select(first, l, r);
+                    self.builder.ins().store(MEM, chosen, dst, at);
+                }
+            }
+            // `roundps` and `roundpd`: the mode is the low two bits of the immediate, or the
+            // processor's, which is to nearest (`4` and above).
+            (
+                "x86.sse41.round.ps"
+                | "x86.avx.round.ps.256"
+                | "x86.sse41.round.pd"
+                | "x86.avx.round.pd.256",
+                [a, mode],
+            ) => {
+                let (a, ty) = self.operand(a)?;
+                let Some(mode) = self.immediate(mode)? else {
+                    unsupported!("LLVM intrinsic `{name}` with a mode that is not a constant");
+                };
+                let (lane, step) = if name.ends_with("pd") || name.contains(".pd.") {
+                    (types::F64, 8)
+                } else {
+                    (types::F32, 4)
+                };
+                for at in (0..self.layout(ty)?.size.bytes() as i32).step_by(step) {
+                    let value = self.builder.ins().load(lane, MEM, a, at);
+                    let rounded = match if mode & 4 != 0 { 0 } else { mode & 3 } {
+                        0 => self.builder.ins().nearest(value),
+                        1 => self.builder.ins().floor(value),
+                        2 => self.builder.ins().ceil(value),
+                        _ => self.builder.ins().trunc(value),
+                    };
+                    self.builder.ins().store(MEM, rounded, dst, at);
+                }
+            }
+            // `cvttps2dq`: truncation, and the "integer indefinite" for what does not fit,
+            // which saturation gives for the negative side only.
+            ("x86.sse2.cvttps2dq" | "x86.avx.cvtt.ps2dq.256", [a]) => {
+                let (a, ty) = self.operand(a)?;
+                for at in (0..self.layout(ty)?.size.bytes() as i32).step_by(4) {
+                    let value = self.builder.ins().load(types::F32, MEM, a, at);
+                    let truncated = self.builder.ins().fcvt_to_sint_sat(types::I32, value);
+                    let limit = self.builder.ins().f32const(2147483648.0);
+                    let over = self.builder.ins().fcmp(
+                        FloatCC::UnorderedOrGreaterThanOrEqual,
+                        value,
+                        limit,
+                    );
+                    let indefinite = self.builder.ins().iconst(types::I32, i64::from(i32::MIN));
+                    let result = self.builder.ins().select(over, indefinite, truncated);
+                    self.builder.ins().store(MEM, result, dst, at);
+                }
+            }
+            // `psrlw` by one count for all the lanes: the low 64 bits of the second operand,
+            // and zero when it is above 15.
+            ("x86.sse2.psrl.w" | "x86.avx2.psrl.w", [a, count]) => {
+                let (a, ty) = self.operand(a)?;
+                let (count, _) = self.operand(count)?;
+                let count = self.builder.ins().load(types::I64, MEM, count, 0);
+                let over = self.builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, count, 15);
+                let count = self.builder.ins().ireduce(types::I16, count);
+                let zero = self.builder.ins().iconst(types::I16, 0);
+                for at in (0..self.layout(ty)?.size.bytes() as i32).step_by(2) {
+                    let word = self.builder.ins().load(types::I16, MEM, a, at);
+                    let shifted = self.builder.ins().ushr(word, count);
+                    let result = self.builder.ins().select(over, zero, shifted);
+                    self.builder.ins().store(MEM, result, dst, at);
                 }
             }
             // Lane by lane: the rounded average, the high half of the product and the shifts

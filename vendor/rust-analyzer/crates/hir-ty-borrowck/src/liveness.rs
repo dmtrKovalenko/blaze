@@ -3,21 +3,25 @@
 //! be initialized, for the regions dropping it uses.
 
 use hir_def::{AdtId, attrs::AttrFlags};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     ClauseKind, OutlivesPredicate, RegionKind,
     inherent::{
         AdtDef as _, GenericArgs as _, IntoKind, ParamEnv as _, Region as _, SliceLike as _,
     },
 };
+use salsa::SalsaValue;
 use smallvec::SmallVec;
 
 use hir_ty::{
+    db::HirDatabase,
     mir::{
         BasicBlockId, LocalId, MirBody, Operand, OperandKind, PlaceElem, Rvalue, StatementKind,
         TerminatorKind,
     },
-    next_solver::{Clause, DbInterner, GenericArgKind, Region, Ty, TyKind},
+    next_solver::{
+        Clause, DbInterner, GenericArgKind, GenericArgs, Region, StoredRegion, StoredTy, Ty, TyKind,
+    },
 };
 
 use super::{
@@ -303,7 +307,7 @@ pub(super) fn region_liveness<'db>(
         |it| &it.drops,
         // Dropping a local makes it live back to where it may be initialized only, as
         // rustc's `compute_drop_live_points_for` has it.
-        |block, successor, live| live.intersect(init_at_exit.at(block, successor)),
+        |block, successor, live| init_at_exit.restrict(block, successor, live),
     );
     // Where a local is use live, what dropping it uses is live already.
     let mut dropped = Vec::new();
@@ -330,11 +334,9 @@ pub(super) fn region_liveness<'db>(
     dropped.sort_by_key(|&local| {
         (drop_live[local].iter().map(|point| rank[point]).min().unwrap_or(usize::MAX), local)
     });
-    let mut cache = FxHashMap::default();
+    let mut components = DropComponents::new(ctx, regions);
     for local in dropped {
-        let mut rvs = Vec::new();
-        drop_components(ctx, regions, regions.local_tys[local], &mut rvs, &mut cache, 0);
-        for &rv in rvs.iter() {
+        for &rv in components.of(regions.local_tys[local]) {
             if rv < count {
                 values[rv].union(&drop_live[local]);
             }
@@ -346,11 +348,11 @@ pub(super) fn region_liveness<'db>(
 /// For each drop, the locals it drops that may be initialized there; and for each edge
 /// between blocks, the locals that may be initialized, if partly, leaving the first for the
 /// second.
-fn maybe_initialized_at_drops(
+fn maybe_initialized_at_drops<'m>(
     body: &MirBody<'_>,
     cfg: &Cfg,
-    moves: &MoveData,
-) -> (FxHashMap<usize, Vec<LocalId>>, InitAtExit) {
+    moves: &'m MoveData,
+) -> (FxHashMap<usize, Vec<LocalId>>, InitAtExit<'m>) {
     let paths = moves.paths.len();
     let blocks = body.basic_blocks.len();
     let mut entry: Vec<Option<BitSet>> = vec![None; blocks];
@@ -408,21 +410,10 @@ fn maybe_initialized_at_drops(
             }
         }
     }
-    let locals = body.locals.len();
-    // Every path of a local is below the local's own, so a local is initialized in part where
-    // one of its paths is.
-    let initialized = |state: &BitSet| {
-        let mut out = BitSet::new(locals);
-        for path in state.iter() {
-            out.insert(moves.paths[path].local.into_raw().into_u32() as usize);
-        }
-        out
-    };
-    let empty = BitSet::new(locals);
     let mut exits: Vec<Option<(BitSet, Option<(BasicBlockId, BitSet)>)>> = vec![None; blocks];
     let mut found: FxHashMap<usize, Vec<LocalId>> = FxHashMap::default();
     for &block in &cfg.order {
-        let Some(mut state) = entry[index(block)].clone() else { continue };
+        let Some(mut state) = entry[index(block)].take() else { continue };
         let data = &body.basic_blocks[block];
         for statement in 0..data.statements.len() {
             apply(Location { block, statement }, &mut state, false);
@@ -433,11 +424,11 @@ fn maybe_initialized_at_drops(
             Some(TerminatorKind::Call { target: Some(target), .. }) => {
                 let mut returned = exit.clone();
                 apply(Location { block, statement: data.statements.len() }, &mut returned, true);
-                Some((*target, initialized(&returned)))
+                Some((*target, returned))
             }
             _ => None,
         };
-        exits[index(block)] = Some((initialized(&exit), returned));
+        exits[index(block)] = Some((exit, returned));
         if let Some(TerminatorKind::Drop { place, .. }) =
             data.terminator.as_ref().map(|it| &it.kind)
             && place.projection.is_empty()
@@ -449,148 +440,303 @@ fn maybe_initialized_at_drops(
             }
         }
     }
-    (found, InitAtExit { exits, empty })
+    (found, InitAtExit { moves, exits })
 }
 
-/// The locals that may be initialized, if partly, leaving a block for a successor.
-struct InitAtExit {
+/// The paths that may be initialized leaving each block, and leaving a call's block for the
+/// call's return.
+struct InitAtExit<'m> {
+    moves: &'m MoveData,
     exits: Vec<Option<(BitSet, Option<(BasicBlockId, BitSet)>)>>,
-    empty: BitSet,
 }
 
-impl InitAtExit {
-    fn at(&self, block: BasicBlockId, successor: BasicBlockId) -> &BitSet {
-        match &self.exits[index(block)] {
+impl InitAtExit<'_> {
+    /// Keeps of `live` the locals that may be initialized, if partly, leaving `block` for
+    /// `successor`: every path of a local is below the local's own, so where one of its paths
+    /// is. Asked of the few locals live there rather than of every path that is initialized.
+    fn restrict(&self, block: BasicBlockId, successor: BasicBlockId, live: &mut BitSet) {
+        let state = match &self.exits[index(block)] {
             Some((_, Some((target, returned)))) if *target == successor => returned,
             Some((exit, _)) => exit,
-            None => &self.empty,
+            None => {
+                live.clear();
+                return;
+            }
+        };
+        let gone: SmallVec<[usize; 8]> = live
+            .iter()
+            .filter(|&local| {
+                let path = self
+                    .moves
+                    .local_path(LocalId::from_raw(la_arena::RawIdx::from_u32(local as u32)));
+                self.moves.find_in_descendants(path, &|it| state.contains(it)).is_none()
+            })
+            .collect();
+        for local in gone {
+            live.remove(local);
         }
     }
 }
 
-/// The regions dropping a value of type `ty` may use: rustc's dropck outlives constraints.
-fn drop_components<'db>(
-    ctx: &Ctx<'_, 'db>,
-    regions: &Regions<'db>,
-    ty: Ty<'db>,
-    out: &mut Vec<Rv>,
-    cache: &mut FxHashMap<Ty<'db>, Vec<Rv>>,
-    depth: usize,
-) {
-    if depth > 12 {
-        return;
+/// The regions dropping a value of a type may use: rustc's dropck outlives constraints, found
+/// over the graph of the types dropping it drops. A recursive type and the types it holds
+/// that hold it again are one strongly connected component of that graph with one answer, so
+/// each type is expanded once, as rustc's dropck keeps a set of the types it has seen; walking
+/// the tree of drops instead is exponential in a type like `Value(Vec<Value>, Box<Value>)`.
+struct DropComponents<'c, 'a, 'db> {
+    ctx: &'c Ctx<'a, 'db>,
+    regions: &'c Regions<'db>,
+    done: FxHashMap<Ty<'db>, Vec<Rv>>,
+    /// Tarjan's: each type on the stack, its number in the walk, and its place on the stack.
+    open: FxHashMap<Ty<'db>, (usize, usize)>,
+    stack: Vec<(Ty<'db>, Vec<Rv>)>,
+    next: usize,
+}
+
+/// How deep in the walk a type stops being expanded, which bounds types that grow as they
+/// recurse, `struct S<T>(Option<Box<S<(T, T)>>>)`.
+const DROP_DEPTH: usize = 12;
+
+impl<'c, 'a, 'db> DropComponents<'c, 'a, 'db> {
+    fn new(ctx: &'c Ctx<'a, 'db>, regions: &'c Regions<'db>) -> Self {
+        DropComponents {
+            ctx,
+            regions,
+            done: FxHashMap::default(),
+            open: FxHashMap::default(),
+            stack: Vec::new(),
+            next: 0,
+        }
     }
-    if let Some(it) = cache.get(&ty) {
-        out.extend_from_slice(it);
-        return;
+
+    fn of(&mut self, ty: Ty<'db>) -> &[Rv] {
+        self.visit(ty, 0);
+        self.done.get(&ty).map_or(&[], |it| it.as_slice())
     }
-    let mut found = Vec::new();
-    match ty.kind() {
-        // Dropping a `ManuallyDrop` drops nothing.
-        TyKind::Adt(def, _) if def.is_manually_drop() => (),
-        TyKind::Adt(def, args) => {
-            let adt = def.def_id();
-            if def.is_box() || def.is_phantom_data() {
-                if let Some(GenericArgKind::Type(inner)) = args.iter().next().map(|it| it.kind()) {
-                    drop_components(ctx, regions, inner, &mut found, cache, depth + 1);
-                }
-            } else {
-                if let Some(drop_impl) = hir_ty::drop::destructor(ctx.db, adt) {
-                    let dangling = may_dangle(ctx, *drop_impl, args.len());
-                    for (index, arg) in args.iter().enumerate() {
-                        let dangles = dangling.get(index).copied().unwrap_or(false);
-                        match arg.kind() {
-                            GenericArgKind::Type(arg) if dangles => {
-                                drop_components(ctx, regions, arg, &mut found, cache, depth + 1)
-                            }
-                            GenericArgKind::Type(arg) => regions_of(arg, &mut found),
-                            GenericArgKind::Lifetime(region) if !dangles => {
-                                found.extend(super::regions::rv_of(region))
-                            }
-                            _ => (),
-                        }
+
+    /// Walks `ty`: `Some(low)`, the lowest number it reaches, while its component is open.
+    fn visit(&mut self, ty: Ty<'db>, depth: usize) -> Option<usize> {
+        if depth > DROP_DEPTH || self.done.contains_key(&ty) {
+            return None;
+        }
+        if let Some(&(number, _)) = self.open.get(&ty) {
+            return Some(number);
+        }
+        let number = self.next;
+        self.next += 1;
+        let at = self.stack.len();
+        self.open.insert(ty, (number, at));
+        self.stack.push((ty, Vec::new()));
+        let mut found = Vec::new();
+        let mut children = Vec::new();
+        self.expand(ty, &mut found, &mut children);
+        let mut low = number;
+        for child in children {
+            match self.visit(child, depth + 1) {
+                Some(it) => low = low.min(it),
+                None => found.extend(self.done.get(&child).into_iter().flatten()),
+            }
+        }
+        if low < number {
+            self.stack[at].1 = found;
+            return Some(low);
+        }
+        let members: Vec<_> = self.stack.drain(at..).collect();
+        for (_, theirs) in &members {
+            found.extend_from_slice(theirs);
+        }
+        found.sort_unstable();
+        found.dedup();
+        for (member, _) in members {
+            self.open.remove(&member);
+            self.done.insert(member, found.clone());
+        }
+        None
+    }
+
+    /// The regions dropping a `ty` uses itself, and the types it drops.
+    fn expand(&self, ty: Ty<'db>, found: &mut Vec<Rv>, children: &mut Vec<Ty<'db>>) {
+        let ctx = self.ctx;
+        match ty.kind() {
+            // Dropping a `ManuallyDrop` drops nothing.
+            TyKind::Adt(def, _) if def.is_manually_drop() => (),
+            TyKind::Adt(def, args) => {
+                let adt = def.def_id();
+                if def.is_box() || def.is_phantom_data() {
+                    if let Some(GenericArgKind::Type(inner)) =
+                        args.iter().next().map(|it| it.kind())
+                    {
+                        children.push(inner);
                     }
+                    return;
                 }
-                let variants: Vec<hir_def::VariantId> = match adt {
-                    AdtId::StructId(it) => vec![it.into()],
-                    AdtId::UnionId(_) => Vec::new(),
-                    AdtId::EnumId(it) => it
-                        .enum_variants(ctx.db)
-                        .variants
-                        .values()
-                        .map(|&(it, _)| it.into())
-                        .collect(),
+                let interner = ctx.infcx.interner;
+                let constraint = drop_constraint(ctx.db, adt);
+                for region in &constraint.regions {
+                    let region = rustc_type_ir::EarlyBinder::bind(region.as_ref())
+                        .instantiate(interner, args)
+                        .skip_norm_wip();
+                    found.extend(super::regions::rv_of(region));
+                }
+                for whole in &constraint.whole {
+                    let whole = rustc_type_ir::EarlyBinder::bind(whole.as_ref())
+                        .instantiate(interner, args)
+                        .skip_norm_wip();
+                    regions_of(whole, found);
+                }
+                children.extend(constraint.tys.iter().map(|it| {
+                    rustc_type_ir::EarlyBinder::bind(it.as_ref())
+                        .instantiate(interner, args)
+                        .skip_norm_wip()
+                }));
+            }
+            TyKind::Array(inner, _) | TyKind::Slice(inner) => children.push(inner),
+            TyKind::Tuple(tys) => children.extend(tys.iter()),
+            TyKind::Closure(_, args) => children.push(args.as_closure().tupled_upvars_ty()),
+            // rustc's dropck drops what a coroutine captures too, all of it where what it keeps
+            // across an `await` needs dropping, which is not known here.
+            TyKind::CoroutineClosure(_, args) => {
+                children.push(args.as_coroutine_closure().tupled_upvars_ty())
+            }
+            TyKind::Coroutine(_, args) => children.push(args.as_coroutine().tupled_upvars_ty()),
+            TyKind::Dynamic(..) => regions_of(ty, found),
+            // A projection is what it normalizes to, `NoisyDrop<T>` of `<T as Associator>::As`;
+            // another alias holds what its bounds and captures let it, as for liveness.
+            TyKind::Alias(alias) => {
+                let normalized = match alias.kind {
+                    rustc_type_ir::AliasTyKind::Projection { .. } => {
+                        super::regions::normalize(ctx, ty)
+                            .filter(|it| !matches!(it.kind(), TyKind::Alias(_) | TyKind::Infer(_)))
+                    }
+                    _ => None,
                 };
-                for variant in variants {
-                    for (_, field) in ctx.db.field_types(variant).iter() {
-                        let field =
-                            field.ty().instantiate(ctx.infcx.interner, args).skip_norm_wip();
-                        drop_components(ctx, regions, field, &mut found, cache, depth + 1);
-                    }
+                match normalized {
+                    Some(it) => children.push(it),
+                    None => live_regions_of(ctx, self.regions, ty, found),
                 }
             }
+            _ => (),
+        }
+    }
+}
+
+/// What dropping a value of an ADT other than `Box`, `PhantomData` and `ManuallyDrop` uses, in
+/// its own generic parameters: rustc's `adt_dtorck_constraint`. Its fields are taken apart as
+/// far as their types tell without an instantiation, an ADT in them by its own constraint;
+/// what is left, parameters, aliases and the types an ADT in them leaves, is taken apart where
+/// the ADT is dropped, which is also what keeps two ADTs that hold each other from asking each
+/// other. Once per ADT, so a body that drops a `Value` instantiates what that leaves rather
+/// than every field of every variant.
+#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+struct DropConstraint {
+    /// The lifetimes its `Drop` impl uses.
+    regions: Vec<StoredRegion>,
+    /// Types all of whose regions dropping it uses: those its `Drop` impl uses, trait objects.
+    whole: Vec<StoredTy>,
+    /// The types dropping it drops, taken apart where it is dropped.
+    tys: Vec<StoredTy>,
+}
+
+#[salsa::tracked(returns(ref), cycle_result = drop_constraint_cycle)]
+fn drop_constraint(db: &dyn HirDatabase, adt: AdtId) -> DropConstraint {
+    let interner = DbInterner::new_no_crate(db);
+    let mut regions = Vec::new();
+    let mut whole = Vec::new();
+    let mut tys = Vec::new();
+    if let Some(drop_impl) = hir_ty::drop::destructor(db, adt) {
+        let args = GenericArgs::identity_for_item(interner, adt.into());
+        let dangling = may_dangle(db, *drop_impl, args.len());
+        for (index, arg) in args.iter().enumerate() {
+            let dangles = dangling.get(index).copied().unwrap_or(false);
+            match arg.kind() {
+                GenericArgKind::Type(arg) if dangles => tys.push(arg),
+                GenericArgKind::Type(arg) => whole.push(arg),
+                GenericArgKind::Lifetime(region) if !dangles => regions.push(region),
+                _ => (),
+            }
+        }
+    }
+    let variants: Vec<hir_def::VariantId> = match adt {
+        AdtId::StructId(it) => vec![it.into()],
+        AdtId::UnionId(_) => Vec::new(),
+        AdtId::EnumId(it) => {
+            it.enum_variants(db).variants.values().map(|&(it, _)| it.into()).collect()
+        }
+    };
+    for variant in variants {
+        for (_, field) in db.field_types(variant).iter() {
+            let field = field.ty().instantiate_identity().skip_norm_wip();
+            take_apart(db, interner, field, &mut regions, &mut whole, &mut tys);
+        }
+    }
+    let mut seen = FxHashSet::default();
+    tys.retain(|it| seen.insert(*it));
+    DropConstraint {
+        regions: regions.into_iter().map(|it| it.store()).collect(),
+        whole: whole.into_iter().map(|it| it.store()).collect(),
+        tys: tys.into_iter().map(|it| it.store()).collect(),
+    }
+}
+
+/// An ADT that holds itself by value has no size and no answer.
+fn drop_constraint_cycle(_db: &dyn HirDatabase, _: salsa::Id, _adt: AdtId) -> DropConstraint {
+    DropConstraint::default()
+}
+
+/// Takes `ty`, a field's type or part of one, apart for [`drop_constraint`].
+fn take_apart<'db>(
+    db: &'db dyn HirDatabase,
+    interner: DbInterner<'db>,
+    ty: Ty<'db>,
+    regions: &mut Vec<Region<'db>>,
+    whole: &mut Vec<Ty<'db>>,
+    tys: &mut Vec<Ty<'db>>,
+) {
+    match ty.kind() {
+        TyKind::Adt(def, _) if def.is_manually_drop() => (),
+        TyKind::Adt(def, args) if def.is_box() || def.is_phantom_data() => {
+            if let Some(GenericArgKind::Type(inner)) = args.iter().next().map(|it| it.kind()) {
+                tys.push(inner);
+            }
+        }
+        TyKind::Adt(def, args) => {
+            let constraint = drop_constraint(db, def.def_id());
+            let instantiate = |ty: &StoredTy| {
+                rustc_type_ir::EarlyBinder::bind(ty.as_ref())
+                    .instantiate(interner, args)
+                    .skip_norm_wip()
+            };
+            regions.extend(constraint.regions.iter().map(|it| {
+                rustc_type_ir::EarlyBinder::bind(it.as_ref())
+                    .instantiate(interner, args)
+                    .skip_norm_wip()
+            }));
+            whole.extend(constraint.whole.iter().map(instantiate));
+            tys.extend(constraint.tys.iter().map(instantiate));
         }
         TyKind::Array(inner, _) | TyKind::Slice(inner) => {
-            drop_components(ctx, regions, inner, &mut found, cache, depth + 1)
+            take_apart(db, interner, inner, regions, whole, tys)
         }
-        TyKind::Tuple(tys) => {
-            for it in tys.iter() {
-                drop_components(ctx, regions, it, &mut found, cache, depth + 1);
+        TyKind::Tuple(parts) => {
+            for it in parts.iter() {
+                take_apart(db, interner, it, regions, whole, tys);
             }
         }
-        TyKind::Closure(_, args) => drop_components(
-            ctx,
-            regions,
-            args.as_closure().tupled_upvars_ty(),
-            &mut found,
-            cache,
-            depth + 1,
-        ),
-        // rustc's dropck drops what a coroutine captures too, all of it where what it keeps
-        // across an `await` needs dropping, which is not known here.
-        TyKind::CoroutineClosure(_, args) => drop_components(
-            ctx,
-            regions,
-            args.as_coroutine_closure().tupled_upvars_ty(),
-            &mut found,
-            cache,
-            depth + 1,
-        ),
-        TyKind::Coroutine(_, args) => drop_components(
-            ctx,
-            regions,
-            args.as_coroutine().tupled_upvars_ty(),
-            &mut found,
-            cache,
-            depth + 1,
-        ),
-        TyKind::Dynamic(..) => regions_of(ty, &mut found),
-        // A projection is what it normalizes to, `NoisyDrop<T>` of `<T as Associator>::As`;
-        // another alias holds what its bounds and captures let it, as for liveness.
-        TyKind::Alias(alias) => {
-            let normalized = match alias.kind {
-                rustc_type_ir::AliasTyKind::Projection { .. } => super::regions::normalize(ctx, ty)
-                    .filter(|it| !matches!(it.kind(), TyKind::Alias(_) | TyKind::Infer(_))),
-                _ => None,
-            };
-            match normalized {
-                Some(it) => drop_components(ctx, regions, it, &mut found, cache, depth + 1),
-                None => live_regions_of(ctx, regions, ty, &mut found),
-            }
-        }
+        TyKind::Dynamic(..) => whole.push(ty),
+        TyKind::Param(_)
+        | TyKind::Alias(_)
+        | TyKind::Closure(..)
+        | TyKind::CoroutineClosure(..)
+        | TyKind::Coroutine(..) => tys.push(ty),
         _ => (),
     }
-    found.sort_unstable();
-    found.dedup();
-    out.extend_from_slice(&found);
-    cache.insert(ty, found);
 }
 
 /// Per generic argument of the type a `Drop` impl is for, whether the impl says
 /// `#[may_dangle]` of it: that dropping does not use it.
-fn may_dangle(ctx: &Ctx<'_, '_>, drop_impl: hir_def::ImplId, count: usize) -> Vec<bool> {
-    let (lifetimes, types) = AttrFlags::query_generic_params(ctx.db, drop_impl.into());
-    let self_ty = ctx.db.impl_self_ty(drop_impl).skip_binder();
+fn may_dangle(db: &dyn HirDatabase, drop_impl: hir_def::ImplId, count: usize) -> Vec<bool> {
+    let (lifetimes, types) = AttrFlags::query_generic_params(db, drop_impl.into());
+    let self_ty = db.impl_self_ty(drop_impl).skip_binder();
     let TyKind::Adt(_, args) = self_ty.kind() else { return vec![false; count] };
     args.iter()
         .map(|arg| match arg.kind() {

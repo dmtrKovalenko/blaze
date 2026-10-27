@@ -8,11 +8,14 @@
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
 
+mod described;
 mod listed;
 mod unsandboxed;
+mod wasm;
 mod wrap;
-pub use listed::{Own, is_listed, own_libraries_with, serve_listed_with};
+pub use listed::{Compiled, Own, is_listed, own_libraries_with, serve_listed_with};
 pub use unsandboxed::{Unsandboxed, unsandboxed_macros_with};
+pub use wasm::{LoadWasm, is_wasm, wasm_macros_with};
 pub use wrap::{Wrap, asked, wrap_expanders};
 
 use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
@@ -31,10 +34,8 @@ use ide_db::{
     prime_caches,
 };
 use itertools::Itertools;
-use proc_macro_api::{
-    MacroDylib, ProcMacroClient,
-    bidirectional_protocol::msg::{ParentSpan, SubRequest, SubResponse},
-};
+pub use proc_macro_api::bidirectional_protocol::msg::{SubRequest, SubResponse};
+use proc_macro_api::{MacroDylib, ProcMacroClient, bidirectional_protocol::msg::ParentSpan};
 use project_model::{CargoConfig, PackageRoot, ProjectManifest, ProjectWorkspace};
 use span::{Span, SpanAnchor, SyntaxContext};
 use tt::{TextRange, TextSize};
@@ -205,21 +206,49 @@ impl Loaded {
             members.push(ids.into_values().collect::<Vec<_>>());
             proc_macros.extend(paths);
         }
-        // A library rustc compiled is expanded with the one the caller has of it, if any.
-        let unlisted: Vec<AbsPathBuf> = match listed::server() {
-            Some(_) => proc_macros
-                .values()
-                .filter_map(|it| it.as_ref().ok())
-                .map(|(_, path)| path.clone())
-                .filter(|path| !is_listed(path))
-                .collect::<FxHashSet<_>>()
-                .into_iter()
-                .collect(),
-            None => Vec::new(),
+        // A library rustc compiled is expanded with what the caller has of it, if anything.
+        let unlisted: Vec<listed::Compiled> = match listed::owned() {
+            true => {
+                let libraries: FxHashMap<_, _> = proc_macros
+                    .iter()
+                    .filter_map(|(id, it)| Some((*id, it.as_ref().ok()?.1.clone())))
+                    .collect();
+                let mut seen = FxHashSet::default();
+                let mut unlisted = Vec::new();
+                for (id, it) in &proc_macros {
+                    let Ok((name, library)) = it else { continue };
+                    if is_listed(library) || is_wasm(library) || !seen.insert(library.clone()) {
+                        continue;
+                    }
+                    let sysroot = ws.sysroot.root();
+                    let description =
+                        described::description(&crate_graph, vfs, *id, &libraries, sysroot);
+                    unlisted.push(listed::Compiled {
+                        name: name.clone(),
+                        library: library.clone(),
+                        description,
+                    });
+                }
+                unlisted
+            }
+            false => Vec::new(),
         };
         let own: FxHashMap<AbsPathBuf, AbsPathBuf> = {
-            let found = listed::own(ws.sysroot.root(), &unlisted);
-            unlisted.into_iter().zip(found).filter_map(|(it, own)| Some((it, own?))).collect()
+            let found = listed::own(ws.sysroot.root(), ws.workspace_root(), &unlisted);
+            let mut own = FxHashMap::default();
+            let mut refused = Vec::new();
+            for (it, found) in unlisted.into_iter().zip(found) {
+                match found {
+                    Ok(Some(found)) => _ = own.insert(it.library, found),
+                    Ok(None) => {}
+                    Err(why) => refused.push(why),
+                }
+            }
+            if !refused.is_empty() {
+                refused.sort();
+                anyhow::bail!("{}", refused.join("\n"));
+            }
+            own
         };
         for (_, path) in proc_macros.values_mut().filter_map(|it| it.as_mut().ok()) {
             if let Some(own) = own.get(path) {
@@ -251,6 +280,7 @@ impl Loaded {
         // so a load whose proc macros are all listed starts none of the toolchain's.
         let wanted = |listed_one: bool, outside_one: bool| {
             proc_macros.values().any(|it| match it {
+                Ok((_, path)) if is_wasm(path) => false,
                 Ok((_, path)) => {
                     listed.contains(path) == listed_one && outside.contains(path) == outside_one
                 }
@@ -294,12 +324,22 @@ impl Loaded {
                 (running(&self.proc_macro_server), running(&self.listed_server));
             let [outside_server, outside_listed_server] =
                 [&self.unsandboxed_servers[0], &self.unsandboxed_servers[1]].map(running);
-            proc_macros
+            let mut refused = Vec::new();
+            let loaded: Vec<_> = proc_macros
                 .into_iter()
                 .map(|(crate_id, path)| {
                     (
                         crate_id,
-                        path.and_then(|(_, path)| {
+                        path.and_then(|(name, path)| {
+                            if is_wasm(&path) {
+                                let loaded = wasm::load(&path);
+                                if let Err(why) = &loaded {
+                                    refused.push(format!(
+                                        "the proc macro `{name}` cannot run as WebAssembly: {why}"
+                                    ));
+                                }
+                                return loaded;
+                            }
                             let server = match (listed.contains(&path), outside.contains(&path)) {
                                 (true, false) => &listed_server,
                                 (false, false) => &proc_macro_server,
@@ -312,7 +352,14 @@ impl Loaded {
                         }),
                     )
                 })
-                .collect()
+                .collect();
+            // A module that does not load fails the load: its macros are never expanded
+            // natively instead.
+            if !refused.is_empty() {
+                refused.sort();
+                anyhow::bail!("{}", refused.join("\n"));
+            }
+            loaded.into_iter().collect()
         };
 
         let was = self.file_sets.len();
@@ -811,7 +858,35 @@ impl ProcMacroExpander for Expander {
         mixed_site: Span,
         current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
-        let cb = |req| match req {
+        let cb = |req| Ok(answer(db, req));
+        match self.0.expand(
+            subtree.view(),
+            attrs.map(|attrs| attrs.view()),
+            env.clone().into(),
+            def_site,
+            call_site,
+            mixed_site,
+            current_dir,
+            Some(&cb),
+        ) {
+            Ok(Ok(subtree)) => Ok(subtree),
+            Ok(Err(err)) => Err(ProcMacroExpansionError::Panic(err)),
+            Err(err) => Err(ProcMacroExpansionError::System(err.to_string())),
+        }
+    }
+
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        (other as &dyn Any).downcast_ref::<Self>() == Some(self)
+    }
+}
+
+/// What a proc macro asks of the database while it expands, answered as the server's
+/// callback is: the one place that answers it, whichever server or runtime asked. It counts
+/// as having asked ([`asked`]).
+pub fn answer(db: &dyn SourceDatabase, req: SubRequest) -> SubResponse {
+    wrap::ask();
+    let answered = || -> Result<SubResponse, std::convert::Infallible> {
+        match req {
             SubRequest::LocalFilePath { file_id } => {
                 let file_id = FileId::from_raw(file_id);
                 let source_root_id = db.file_source_root(file_id).source_root_id(db);
@@ -959,28 +1034,10 @@ impl ProcMacroExpander for Expander {
             }
             // FIXME: implement this
             SubRequest::SpanJoin { .. } => Ok(SubResponse::SpanJoinResult { span: None }),
-        };
-        match self.0.expand(
-            subtree.view(),
-            attrs.map(|attrs| attrs.view()),
-            env.clone().into(),
-            def_site,
-            call_site,
-            mixed_site,
-            current_dir,
-            Some(&|req| {
-                wrap::ask();
-                cb(req)
-            }),
-        ) {
-            Ok(Ok(subtree)) => Ok(subtree),
-            Ok(Err(err)) => Err(ProcMacroExpansionError::Panic(err)),
-            Err(err) => Err(ProcMacroExpansionError::System(err.to_string())),
         }
-    }
-
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        (other as &dyn Any).downcast_ref::<Self>() == Some(self)
+    };
+    match answered() {
+        Ok(it) => it,
     }
 }
 

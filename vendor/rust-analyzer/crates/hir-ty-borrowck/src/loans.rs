@@ -239,8 +239,7 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
             {
                 let ty = body.locals[place.local].ty.as_ref();
                 if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
-                    && hir_ty::drop::has_drop_glue(&ctx.infcx, ty, ctx.env)
-                        == hir_ty::drop::DropGlue::None
+                    && ctx.drop_glue(ty) == hir_ty::drop::DropGlue::None
                 {
                     found.insert(place.local);
                 }
@@ -346,8 +345,7 @@ fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location
             {
                 let ty = body.locals[place.local].ty.as_ref();
                 if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
-                    && hir_ty::drop::has_drop_glue(&ctx.infcx, ty, ctx.env)
-                        == hir_ty::drop::DropGlue::None
+                    && ctx.drop_glue(ty) == hir_ty::drop::DropGlue::None
                 {
                     found.insert(Location { block, statement });
                 }
@@ -416,10 +414,9 @@ fn const_promotable(
                 _ => false,
             };
             // Not with an argument that needs dropping, `ManuallyDrop::new(String::new())`.
-            let dropped = args.iter().any(|&it| {
-                hir_ty::drop::has_drop_glue(&ctx.infcx, ctx.infer.expr_ty(it), ctx.env)
-                    != hir_ty::drop::DropGlue::None
-            });
+            let dropped = args
+                .iter()
+                .any(|&it| ctx.drop_glue(ctx.infer.expr_ty(it)) != hir_ty::drop::DropGlue::None);
             callable && !dropped && all(args.to_vec())
         }
         // `NAME.as_str()` of a `const NAME`, as tracing's `fieldset!` names its fields.
@@ -427,10 +424,9 @@ fn const_promotable(
             let callable = ctx.infer.method_resolution(expr).is_some_and(|(func, _)| {
                 hir_def::signatures::FunctionSignature::of(ctx.db, func).is_const()
             });
-            let dropped = std::iter::once(receiver).chain(args.iter()).any(|&it| {
-                hir_ty::drop::has_drop_glue(&ctx.infcx, ctx.infer.expr_ty(it), ctx.env)
-                    != hir_ty::drop::DropGlue::None
-            });
+            let dropped = std::iter::once(receiver)
+                .chain(args.iter())
+                .any(|&it| ctx.drop_glue(ctx.infer.expr_ty(it)) != hir_ty::drop::DropGlue::None);
             callable && !dropped && all(std::iter::once(*receiver).chain(args.to_vec()).collect())
         }
         // A block of items and a tail is its tail in MIR, where rustc promotes.

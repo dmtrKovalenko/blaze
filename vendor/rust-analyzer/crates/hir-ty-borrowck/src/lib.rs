@@ -331,11 +331,8 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
         place.projection.as_slice().is_empty()
             && place.local != return_slot()
             && !moved.contains(&place.local)
-            && hir_ty::drop::has_drop_glue(
-                &ctx.infcx,
-                body.locals[place.local].ty.as_ref(),
-                ctx.env,
-            ) == hir_ty::drop::DropGlue::HasDropGlue
+            && ctx.drop_glue(body.locals[place.local].ty.as_ref())
+                == hir_ty::drop::DropGlue::HasDropGlue
     })
 }
 
@@ -473,6 +470,7 @@ pub(crate) struct Ctx<'a, 'db> {
     /// report: rustc does not borrow check a body whose type check fails.
     pub(crate) tainted: std::cell::Cell<bool>,
     copy: std::cell::RefCell<FxHashMap<Ty<'db>, bool>>,
+    glue: std::cell::RefCell<FxHashMap<Ty<'db>, hir_ty::drop::DropGlue>>,
 }
 
 fn guard_bindings(store: &ExpressionStore) -> FxHashMap<ExprId, Vec<BindingId>> {
@@ -569,6 +567,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
             guard_bindings: guard_bindings(store),
             tainted: std::cell::Cell::new(false),
             copy: Default::default(),
+            glue: Default::default(),
         }
     }
 
@@ -618,8 +617,35 @@ impl<'a, 'db> Ctx<'a, 'db> {
     /// Whether a value of `ty` neither needs dropping nor has interior mutability, which a
     /// constant must to be promoted.
     pub(crate) fn is_plain(&self, ty: Ty<'db>) -> bool {
-        hir_ty::drop::has_drop_glue(&self.infcx, ty, self.env) == hir_ty::drop::DropGlue::None
+        self.drop_glue(ty) == hir_ty::drop::DropGlue::None
             && hir_ty::drop::is_freeze(&self.infcx, ty, self.env)
+    }
+
+    /// Whether dropping a value of `ty` runs code, as [`Self::is_copy`] asks once per type
+    /// modulo regions, which drop glue does not depend on.
+    pub(crate) fn drop_glue(&self, ty: Ty<'db>) -> hir_ty::drop::DropGlue {
+        use hir_ty::drop::DropGlue;
+        use rustc_type_ir::{TypeVisitableExt as _, inherent::Region as _};
+        let interner = self.infcx.interner;
+        let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        if let Some(&known) = self.glue.borrow().get(&ty) {
+            return known;
+        }
+        let known = if ty.has_non_region_infer() {
+            hir_ty::drop::has_drop_glue(&self.infcx, ty, self.env)
+        } else {
+            match *drop_glue_query(
+                self.db,
+                hir_ty::ParamEnvAndCrate { param_env: self.env, krate: self.krate }.store(),
+                ty.store(),
+            ) {
+                0 => DropGlue::None,
+                1 => DropGlue::DependOnParams,
+                _ => DropGlue::HasDropGlue,
+            }
+        };
+        self.glue.borrow_mut().insert(ty, known);
+        known
     }
 
     pub(crate) fn has_destructor(&self, adt: hir_def::AdtId) -> bool {
@@ -688,6 +714,20 @@ fn is_copy_query(
     let interner = DbInterner::new_with(db, env.krate).with_regions();
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
     infcx.type_is_copy_modulo_regions(env.param_env, ty.as_ref())
+}
+
+/// [`hir_ty::drop::has_drop_glue`] of `ty`, its regions `'static`, in `env`, as the order of
+/// its variants: a query as [`is_copy_query`] is.
+#[salsa::tracked]
+fn drop_glue_query(
+    db: &dyn HirDatabase,
+    env: hir_ty::traits::StoredParamEnvAndCrate,
+    ty: hir_ty::next_solver::StoredTy,
+) -> u8 {
+    let env = env.as_ref(db);
+    let interner = DbInterner::new_with(db, env.krate).with_regions();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    hir_ty::drop::has_drop_glue(&infcx, ty.as_ref(), env.param_env) as u8
 }
 
 /// `env` with the projections in its where clauses that name no parameter normalized, as

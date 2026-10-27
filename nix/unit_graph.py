@@ -145,6 +145,13 @@ def build_system(system: str, graph: dict, packages: dict[str, dict], triple: st
         if pkg not in packages:
             raise StepError(f"step 'nix': unit package {u['pkg_id']} is not in cargo metadata")
         keys.append(unit_key(pkg, u))
+    # A package built for normal dependencies and for build dependencies with different features
+    # (resolver 2) has two build scripts, both on the host: only those keys name their features.
+    named = [k for k in keys if keys.count(k) > 1]
+    keys = [
+        f"{k} features={','.join(sorted(u['features'])) or '-'}" if k in named else k
+        for k, u in zip(keys, graph["units"])
+    ]
     if len(set(keys)) != len(keys):
         twice = sorted({k for k in keys if keys.count(k) > 1})
         raise StepError(f"step 'nix {system}': two units are both named {twice}; unit_key needs to tell them apart")

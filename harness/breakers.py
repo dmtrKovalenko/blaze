@@ -30,7 +30,7 @@ LEFT = {"caller_in_constant", "empty_array_by_impl", "macro_reads_its_spelling",
 # Crates reduced and not fixed, where ra-jit says so: a function of these is left to rustc.
 LEFT_CRATES = []
 # Cases about the code around a function ra-jit has to leave to rustc: that one is meant to be.
-AROUND_LEFT = {"await_left_in_generic", "provided_method_static::rustcs"}
+AROUND_LEFT = {"await_left_in_generic", "provided_method_static::rustcs", "neon_fma_lanes"}
 
 
 def main():

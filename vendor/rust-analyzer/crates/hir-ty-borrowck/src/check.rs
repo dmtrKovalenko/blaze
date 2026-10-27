@@ -971,11 +971,8 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             TerminatorKind::Drop { place, .. }
                 if self.body.basic_blocks[location.block].is_cleanup
                     && place.projection.as_slice().is_empty()
-                    && hir_ty::drop::has_drop_glue(
-                        &self.ctx.infcx,
-                        self.body.locals[place.local].ty.as_ref(),
-                        self.ctx.env,
-                    ) == hir_ty::drop::DropGlue::None =>
+                    && self.ctx.drop_glue(self.body.locals[place.local].ty.as_ref())
+                        == hir_ty::drop::DropGlue::None =>
             {
                 // rustc's unwind paths drop only what has drop glue and end no storage, so a
                 // borrow of a `MetricsCounter` stays valid while the callbacks holding it drop.

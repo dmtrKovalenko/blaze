@@ -427,7 +427,13 @@ fn sections_written(data: &[u8]) -> Vec<bool> {
 /// export it (bun's `-exported_symbols_list` names its `napi_*` for the addons it loads), and
 /// Apple's linker exports no private one. The names of Rust's and of ra-jit's are private.
 pub(crate) fn ours(data: &mut [u8]) {
-    let has_main = defined(data).iter().any(|it| it == b"_main");
+    // Kept, no name is made anything: the object, gigabytes of a large program's, is not
+    // copied to be read.
+    let mut has_main = false;
+    weaken_but(data, |name| {
+        has_main |= name == b"_main";
+        Made::Kept
+    });
     weaken_but(data, |name| {
         let name = name.strip_prefix(b"_").unwrap_or(name);
         let stays = name == b"main"
@@ -447,17 +453,6 @@ fn of_rust(name: &[u8]) -> bool {
         .and_then(|it| it.first())
         .is_some_and(|it| it.is_ascii_alphanumeric());
     name.starts_with(b"_ZN") || v0 || name.starts_with(b"ra-jit.")
-}
-
-/// The names an object defines and other objects can see.
-fn defined(data: &[u8]) -> Vec<Vec<u8>> {
-    let mut data = data.to_vec();
-    let mut names = Vec::new();
-    weaken_but(&mut data, |name| {
-        names.push(name.to_vec());
-        Made::Kept
-    });
-    names
 }
 
 fn weaken_but(data: &mut [u8], mut made: impl FnMut(&[u8]) -> Made) {

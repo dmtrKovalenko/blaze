@@ -410,10 +410,19 @@ impl<'db> Resolver<'db> {
         let tmp = Name::new_symbol_root(sym::self_);
         let first_name = if path.is_self() { &tmp } else { path.segments().first()? };
         let skip_to_mod = path.kind != PathKind::Plain && !path.is_self();
-        if skip_to_mod {
-            return self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path));
-        }
         let path_hygiene = hygiene_id;
+        if skip_to_mod {
+            // A `macro` names the modules of where it is defined, private ones too: its
+            // `crate::` path is looked up there when it is not visible where the macro is used,
+            // as a plain path is below.
+            return self.skip_to_mod(|scope| scope.resolve_path_in_value_ns(db, path)).or_else(
+                || {
+                    macro_def_site(db, path_hygiene).and_then(|module| {
+                        module.resolver(db).module_scope.resolve_path_in_value_ns(db, path)
+                    })
+                },
+            );
+        }
 
         if n_segments <= 1 {
             let mut hygiene_info = hygiene_info(db, hygiene_id);

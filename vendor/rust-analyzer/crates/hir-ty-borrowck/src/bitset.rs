@@ -43,6 +43,10 @@ impl BitSet {
         }
     }
 
+    pub(super) fn clear(&mut self) {
+        self.words.fill(0);
+    }
+
     pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.words.iter().enumerate().flat_map(|(index, &word)| {
             let mut word = word;

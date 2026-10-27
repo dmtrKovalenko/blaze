@@ -707,8 +707,16 @@ fn defined_symbols(path: &Path) -> anyhow::Result<FxHashSet<String>> {
             object::File::parse(bytes).with_context(|| format!("parsing {}", path.display()))?;
         // A hidden one stands in for a function ra-jit could not compile, which a program
         // compiles itself to be told why. A thread-local is not a "definition" to `object`.
-        let defined =
-            file.symbols().filter(|it| !it.is_undefined() && it.scope() == SymbolScope::Dynamic);
+        // A COFF external symbol is `SymbolScope::Linkage` in `object` (`Dynamic` is for a DLL's
+        // exports), and COFF has no hidden symbols to tell apart: all of them count, or the
+        // prebuilt standard library defines nothing on Windows and a program compiles std's
+        // startup itself, up to the first writable static (`CLEANUP`).
+        let coff = matches!(file.format(), object::BinaryFormat::Coff | object::BinaryFormat::Pe);
+        let defined = file.symbols().filter(|it| {
+            !it.is_undefined()
+                && (it.scope() == SymbolScope::Dynamic
+                    || coff && it.scope() == SymbolScope::Linkage)
+        });
         // Mach-O spells every name with an underscore in front, which the names looked up
         // ([`Resolver::in_prebuilt`]) don't have: with it kept, no function or static of the
         // prebuilt std was found on macOS, a build script compiled std's itself and stopped
@@ -3902,10 +3910,17 @@ fn harnesses<'a>(
                 if !data.target_kind.is_proc_macro() {
                     continue;
                 }
-                let module = hir::attach_db(db, || macro_list::module(db, krate));
+                let wasm =
+                    args.selection.target.as_deref().is_some_and(|it| it.starts_with("wasm"));
+                let module = hir::attach_db(db, || macro_list::module(db, krate, wasm));
                 let wanted = format!("{}{module}", test_harness::without(&text));
                 if *text != *wanted {
                     texts.push((file, wanted));
+                }
+                if let Some((file, shim)) = wasm.then(|| macro_list::shim(db, krate)).flatten()
+                    && **db.file_text(file).text(db) != *shim
+                {
+                    texts.push((file, shim));
                 }
                 continue;
             }
@@ -4862,6 +4877,7 @@ fn link_executable(
         Ok(exports)
     });
     let exports = exports.transpose()?;
+    ra_jit_macro_wasm::flush();
     let took = link::executable(
         db,
         &program,
@@ -4881,7 +4897,10 @@ fn link_executable(
     );
     // What the link kept of the stand-ins is what the program can reach, the standard
     // library's unit's among them, each saying why its unit refused it.
-    if !stand_ins.is_empty() {
+    // COFF keeps every stand-in in one section (the objects have no COMDAT sections for
+    // `/OPT:REF` to take out what nothing reaches), so on Windows the stand-ins in the
+    // executable are not the ones the program reaches: one that is called says so when it runs.
+    if !stand_ins.is_empty() && !cfg!(windows) {
         let said = stand_ins.iter().map(|it| {
             let it = it.trim().trim_start_matches(hir_ty_codegen::STAND_IN_SAYS);
             cargo::whole::without_hashes(it)
@@ -7928,6 +7947,12 @@ fn main() -> anyhow::Result<()> {
     if let Some(replayed) = doctest::replay() {
         return replayed;
     }
+    // A build script's name, linked to this executable, comes before the commands: cargo runs
+    // it with no arguments, which are the help.
+    #[cfg(windows)]
+    if let Some(script) = cargo::script::stood_in_front_of() {
+        return cargo::script::run_as_cargo_does(script, std::env::args_os().skip(1));
+    }
     match std::env::args().nth(1).as_deref() {
         _ if stands_in_for_rustc => {}
         None | Some("--help" | "-h" | "help") => {
@@ -7950,10 +7975,6 @@ fn main() -> anyhow::Result<()> {
             return cargo::closure::command(std::env::args().skip(2));
         }
         _ => {}
-    }
-    #[cfg(windows)]
-    if let Some(script) = cargo::script::stood_in_front_of() {
-        return cargo::script::run_as_cargo_does(script, std::env::args_os().skip(1));
     }
     // A build script runs with the variables of the cargo that runs it, the wrapper's too.
     if std::env::args().nth(1).as_deref() == Some("build-script") {
@@ -7981,6 +8002,12 @@ fn main() -> anyhow::Result<()> {
             std::io::stdout().write_all(&output.stdout)?;
             std::io::stderr().write_all(&output.stderr)?;
             std::process::exit(output.status.code().unwrap_or(101));
+        }
+        // `proc-macro-wasm <module.wasm> --macro <name> --input <file> ...`: one macro of a
+        // module compiled to WebAssembly expanded and timed (`ra-jit-macro-wasm/src/bench.rs`).
+        Some("proc-macro-wasm") => {
+            return ra_jit_macro_wasm::bench::command(std::env::args().skip(2))
+                .map_err(anyhow::Error::msg);
         }
         Some(cargo::own_macro::COMMAND) => {
             return cargo::own_macro::command(std::env::args_os().skip(2));
@@ -8688,13 +8715,26 @@ fn process_wide() {
     let server = cargo::own_macro::server();
     if let Some(Ok(server)) = server.and_then(Path::to_str).map(AbsPathBuf::try_from) {
         load_cargo::serve_listed_with(server);
-        // A proc macro rustc compiled, as cargo's builds do, is expanded with ra-jit's.
-        load_cargo::own_libraries_with(Box::new(|sysroot, libraries| {
-            let libraries: Vec<PathBuf> = libraries.iter().map(|it| it.clone().into()).collect();
+    }
+    // A proc macro rustc compiled, as cargo's builds do, is expanded with ra-jit's module or
+    // library of it.
+    if server.is_some() || cargo::own_macro::wasm() {
+        load_cargo::own_libraries_with(Box::new(|sysroot, workspace, libraries| {
+            let libraries: Vec<_> = libraries
+                .iter()
+                .map(|it| cargo::own_macro::Compiled {
+                    name: it.name.clone(),
+                    library: it.library.clone().into(),
+                    description: it.description.clone(),
+                })
+                .collect();
             let sysroot = sysroot.map(AsRef::<Path>::as_ref);
-            let made = cargo::own_macro::libraries_of(sysroot, &libraries);
-            let made = made.into_iter().map(|it| it?.to_str().map(AbsPathBuf::try_from)?.ok());
-            made.collect()
+            let made = cargo::own_macro::libraries_of(sysroot, workspace.as_ref(), &libraries);
+            let path = |it: PathBuf| match it.to_str().map(AbsPathBuf::try_from) {
+                Some(Ok(it)) => Ok(it),
+                _ => Err(format!("ra-jit made {} where a path is not text", it.display())),
+            };
+            made.into_iter().map(|it| it?.map(path).transpose()).collect()
         }));
     }
 }
@@ -8705,6 +8745,7 @@ fn held_wide() {
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     ra_jit_expand::install();
+    load_cargo::wasm_macros_with(Box::new(ra_jit_macro_wasm::load));
     // Every proc-macro server is started in the sandbox.
     macro_sandbox::install();
 }
@@ -11368,6 +11409,83 @@ fn main() {}
             assert_eq!(crates_of(&within(&[example]), shared), [example]);
             assert_eq!(crates_of(&within(&[app]), shared), [app]);
             assert_eq!(crates_of(&within(&[example]), main), [app]);
+        });
+    }
+
+    /// A COFF object has no hidden symbols to tell apart from the others, and `object` calls
+    /// the external ones `Linkage`, not `Dynamic`: they are what the object defines for others
+    /// to link to, as an ELF object's default ones are.
+    #[test]
+    fn the_external_symbols_of_a_coff_object_are_the_ones_it_defines() {
+        use object::write::{Object, Symbol, SymbolSection};
+        let mut object = Object::new(
+            object::BinaryFormat::Coff,
+            object::Architecture::X86_64,
+            object::Endianness::Little,
+        );
+        let section = object.section_id(object::write::StandardSection::Text);
+        for (name, scope) in [
+            ("external", object::SymbolScope::Linkage),
+            ("local", object::SymbolScope::Compilation),
+        ] {
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0,
+                size: 0,
+                kind: object::SymbolKind::Text,
+                scope,
+                weak: false,
+                section: SymbolSection::Section(section),
+                flags: object::SymbolFlags::None,
+            });
+        }
+        object.append_section_data(section, &[0x90], 1);
+        let path = std::env::temp_dir().join(format!("ra-jit-coff-{}.obj", std::process::id()));
+        std::fs::write(&path, object.write().unwrap()).unwrap();
+        let defined = defined_symbols(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(defined.contains("external"));
+        assert!(!defined.contains("local"));
+    }
+
+    /// A `macro` names the modules of where it is defined, and a module private to the one it
+    /// is in is not visible where the macro is used: std's `utf16!` writes
+    /// `crate::sys::pal::windows::api::utf16_len` for `sys::path::windows`, from where `windows`
+    /// is private. The path is looked up where the macro is defined.
+    #[test]
+    fn a_macro_names_the_private_modules_of_where_it_is_defined() {
+        use test_fixture::WithFixture;
+        let (db, file) = RootDatabase::with_single_file(
+            r#"
+#![feature(decl_macro)]
+mod outer {
+    mod private {
+        pub const fn three() -> usize { 3 }
+        pub macro size() { crate::outer::private::three() }
+    }
+    pub use self::private::size;
+}
+mod user {
+    pub const N: usize = crate::outer::size!();
+}
+"#,
+        );
+        hir::attach_db(&db, || {
+            let sema = hir::Semantics::new(&db);
+            let root = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
+            let user =
+                root.children(&db).find(|it| it.name(&db).is_some_and(|it| it.as_str() == "user"));
+            let hir::ModuleDef::Const(n) = user
+                .unwrap()
+                .declarations(&db)
+                .into_iter()
+                .find(|it| matches!(it, hir::ModuleDef::Const(_)))
+                .unwrap()
+            else {
+                unreachable!()
+            };
+            let value = n.eval(&db).expect("the constant is evaluated");
+            assert_eq!(value.render_debug(&db).unwrap(), "3");
         });
     }
 

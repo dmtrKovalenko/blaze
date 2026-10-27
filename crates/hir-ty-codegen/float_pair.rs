@@ -1,34 +1,22 @@
-//! Two floats returned in registers by a convention Cranelift returns one float in.
+//! Two floats returned by a convention Cranelift returns one float in.
 //!
-//! rustc returns a pair of floats in `xmm0` and `xmm1` whatever the convention, and
-//! Cranelift's `windows_fastcall` has `xmm0` alone. Before Cranelift compiles a function,
-//! every such return and every call of such a function is made one of a single float, and
-//! two functions of the object carry the second. [`asm::join_floats`] takes the pair as its
-//! arguments, which are in those registers, and returns. [`asm::split_floats`] answers
-//! what is in the registers as two integers.
-//!
-//! Cranelift does not know the second register holds anything. Nothing may be between a
-//! call and the call that splits what it returned, which [`Lowered::hold`] checks in the
-//! code; a function it does not hold for is not compiled. After the pair is joined comes
-//! only what restores the registers the caller owns, of which `xmm1` is none.
+//! Cranelift's `windows_fastcall` returns one float, in `xmm0`. A function that returns two
+//! (a scalar pair, `Pos2` or a `PhysicalSize<f64>`) returns them as two integers of the same
+//! widths, in `rax` and `rdx`, and a call of one bitcasts what it gets back. rustc returns
+//! the pair in `xmm0` and `xmm1`, which only a program that links rustc's objects would need.
 
 use cranelift_codegen::{
     cursor::{Cursor, FuncCursor},
     ir::{self, InstBuilder, MemFlagsData, Opcode, Signature, types},
     isa::CallConv,
 };
-use cranelift_module::{FuncId, ModuleRelocTarget};
 
-use super::{
-    CodegenError, Result, asm,
-    fragment::{Code, Recorder},
-};
+use super::{Result, fragment::Code};
 
 /// What [`lower`] changed of a function, to check and put back in its code.
 pub(super) struct Lowered {
     /// The signature the callers of the function know.
     signature: Signature,
-    split: Option<FuncId>,
 }
 
 /// The types of the pair `signature` returns, if Cranelift cannot return it.
@@ -39,9 +27,19 @@ fn pair(signature: &Signature) -> Option<[ir::Type; 2]> {
         .then_some([a.value_type, b.value_type])
 }
 
-/// Has `func` return and be returned one float where it is two. `None` when it has neither,
-/// or is returned two by what is not a plain call, which is left for Cranelift to refuse.
-pub(super) fn lower(recorder: &mut Recorder<'_>, func: &mut ir::Function) -> Option<Lowered> {
+/// The integer type that holds as many bits as the float `ty`.
+fn bits_of(ty: ir::Type) -> ir::Type {
+    ty.as_int()
+}
+
+/// Has `func` return the pair of floats it returns, and be returned the pairs it calls return,
+/// as two integers of the same widths, which `windows_fastcall` returns in `rax` and `rdx`.
+/// `None` when it has neither, or is returned a pair by what is not a plain call, which is
+/// left for Cranelift to refuse.
+///
+/// This is not where rustc returns a pair of floats (`xmm0` and `xmm1`), which a program that
+/// links rustc's objects needs; a build with nothing of rustc's has no code that tells.
+pub(super) fn lower(func: &mut ir::Function) -> Option<Lowered> {
     let returned = pair(&func.signature);
     let pairs: Vec<(ir::SigRef, [ir::Type; 2])> =
         func.dfg.signatures.iter().filter_map(|(id, it)| Some((id, pair(it)?))).collect();
@@ -58,57 +56,39 @@ pub(super) fn lower(recorder: &mut Recorder<'_>, func: &mut ir::Function) -> Opt
     if insts.iter().any(|&it| called(func, it).is_some() && !plain(func.dfg.insts[it].opcode())) {
         return None;
     }
-    let mut lowered = Lowered { signature: func.signature.clone(), split: None };
-    let convention = func.signature.call_conv;
-    for &(signature, _) in &pairs {
-        func.dfg.signatures[signature].returns.truncate(1);
+    let lowered = Lowered { signature: func.signature.clone() };
+    let integers =
+        |[a, b]: [ir::Type; 2]| [ir::AbiParam::new(bits_of(a)), ir::AbiParam::new(bits_of(b))];
+    for &(signature, types) in &pairs {
+        func.dfg.signatures[signature].returns = integers(types).to_vec();
     }
-    if returned.is_some() {
-        func.signature.returns.truncate(1);
+    if let Some(types) = returned {
+        func.signature.returns = integers(types).to_vec();
     }
     for inst in insts {
         if let Some([a, b]) = called(func, inst) {
-            let mut split = Signature::new(convention);
-            split.params.push(ir::AbiParam::new(a));
-            split.returns.extend([ir::AbiParam::new(types::I64); 2]);
-            let id = recorder.assembly(asm::split_floats(), &split);
-            lowered.split = Some(id);
-            let split = recorder.declare_func_in_func(id, func);
-
             let &[first, second] = func.dfg.inst_results(inst) else {
                 unreachable!("the signature has two results")
             };
             func.dfg.clear_results(inst);
             func.dfg.make_inst_results(inst, types::INVALID);
-            let whole = func.dfg.first_result(inst);
-            let mut cursor = FuncCursor::new(func).after_inst(inst);
-            let halves = cursor.ins().call(split, &[whole]);
-            let &[low, high] = cursor.func.dfg.inst_results(halves) else {
+            let &[low, high] = func.dfg.inst_results(inst) else {
                 unreachable!("the signature has two results")
             };
+            let mut cursor = FuncCursor::new(func).after_inst(inst);
             for (was, bits, ty) in [(first, low, a), (second, high, b)] {
-                let bits = match ty {
-                    types::F64 => bits,
-                    _ => cursor.ins().ireduce(ty.as_int(), bits),
-                };
                 let float = cursor.ins().bitcast(ty, MemFlagsData::new(), bits);
                 cursor.func.dfg.change_to_alias(was, float);
             }
-        } else if let Some([a, b]) = returned
-            && func.dfg.insts[inst].opcode() == Opcode::Return
-        {
+        } else if returned.is_some() && func.dfg.insts[inst].opcode() == Opcode::Return {
             let &[first, second] = func.dfg.inst_args(inst) else {
                 unreachable!("the signature has two results")
             };
-            let mut join = Signature::new(convention);
-            join.params.extend([ir::AbiParam::new(a), ir::AbiParam::new(b)]);
-            join.returns.push(ir::AbiParam::new(a));
-            let join = recorder.assembly(asm::join_floats(), &join);
-            let join = recorder.declare_func_in_func(join, func);
+            let Some([a, b]) = returned else { continue };
             let mut cursor = FuncCursor::new(func).at_inst(inst);
-            let call = cursor.ins().call(join, &[first, second]);
-            let whole = cursor.func.dfg.first_result(call);
-            cursor.ins().return_(&[whole]);
+            let first = cursor.ins().bitcast(bits_of(a), MemFlagsData::new(), first);
+            let second = cursor.ins().bitcast(bits_of(b), MemFlagsData::new(), second);
+            cursor.ins().return_(&[first, second]);
             cursor.remove_inst();
         }
     }
@@ -116,26 +96,70 @@ pub(super) fn lower(recorder: &mut Recorder<'_>, func: &mut ir::Function) -> Opt
 }
 
 impl Lowered {
-    /// Gives `code` the signature its callers know, once nothing in it is between a call and
-    /// the call that reads the pair it returned.
-    pub(super) fn hold(self, context: &cranelift_codegen::Context, code: &mut Code) -> Result<()> {
-        /// `call rel32`, which is how a function of the same image is called.
-        const CALL: u8 = 0xe8;
+    /// Gives `code` the signature its callers know.
+    pub(super) fn hold(self, _: &cranelift_codegen::Context, code: &mut Code) -> Result<()> {
         code.signature = self.signature;
-        let Some(split) = self.split else { return Ok(()) };
-        let Some(compiled) = context.compiled_code() else { return Ok(()) };
-        for reloc in &code.relocs {
-            let ModuleRelocTarget::User { namespace: 0, index } = reloc.name else { continue };
-            if index != split.as_u32() {
-                continue;
-            }
-            let call = reloc.offset.checked_sub(1).filter(|&at| code.bytes[at as usize] == CALL);
-            if !compiled.buffer.call_sites().any(|site| Some(site.ret_addr) == call) {
-                return Err(CodegenError::Unsupported(
-                    "two floats returned by a call that something follows".to_owned(),
-                ));
-            }
-        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cranelift_codegen::{
+        ir::{AbiParam, ExtFuncData, ExternalName, Function, UserFuncName},
+        settings::{self, Configurable},
+        verify_function,
+    };
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    use super::*;
+
+    /// A function `(f32) -> (f32, f32)` that calls one of its own signature and returns the pair
+    /// swapped: both ends of the pair become two integers, what the call returns is bitcast back,
+    /// and the function still verifies.
+    #[test]
+    fn a_pair_of_floats_is_returned_and_read_as_two_integers_of_the_same_widths() {
+        let mut signature = Signature::new(CallConv::WindowsFastcall);
+        signature.params.push(AbiParam::new(types::F32));
+        signature.returns.extend([AbiParam::new(types::F32), AbiParam::new(types::F32)]);
+        let mut func = Function::with_name_signature(UserFuncName::default(), signature.clone());
+        let mut context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut context);
+        let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
+        builder.switch_to_block(block);
+        let [arg] = *builder.block_params(block) else { unreachable!() };
+        let imported = builder.import_signature(signature);
+        let callee = builder.import_function(ExtFuncData {
+            name: ExternalName::user(ir::UserExternalNameRef::from_u32(0)),
+            signature: imported,
+            colocated: true,
+            patchable: false,
+        });
+        let call = builder.ins().call(callee, &[arg]);
+        let [first, second] = *builder.inst_results(call) else { unreachable!() };
+        builder.ins().return_(&[second, first]);
+        builder.seal_all_blocks();
+        let isa = cranelift_codegen::isa::lookup(target_lexicon::triple!("x86_64-pc-windows-msvc"))
+            .unwrap()
+            .finish(settings::Flags::new(settings::builder()))
+            .unwrap();
+        builder.finalize(isa.frontend_config());
+
+        let lowered = lower(&mut func).expect("a function that returns and calls a pair");
+        let integers = [AbiParam::new(types::I32), AbiParam::new(types::I32)];
+        assert_eq!(func.signature.returns, integers);
+        assert_eq!(func.dfg.signatures.iter().next().unwrap().1.returns, integers);
+        let mut flags = settings::builder();
+        flags.enable("enable_verifier").unwrap();
+        verify_function(&func, &settings::Flags::new(flags)).unwrap();
+        // What its callers know of it is what it was.
+        let floats = [AbiParam::new(types::F32), AbiParam::new(types::F32)];
+        assert_eq!(lowered.signature.returns, floats);
+        // Another convention is left alone.
+        let mut elsewhere = Function::new();
+        elsewhere.signature = Signature::new(CallConv::SystemV);
+        elsewhere.signature.returns.extend(floats);
+        assert!(lower(&mut elsewhere).is_none());
     }
 }
