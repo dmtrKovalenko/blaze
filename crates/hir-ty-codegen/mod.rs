@@ -17135,6 +17135,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             // A hint to the cache, which the program behaves the same without.
             ("prefetch.p0", [_address, _write, _locality, _cache]) => {}
             _ if self.cg.target.arch == Arch::Aarch64
+                && let Some((mut lowered, max_shift)) = neon::narrowing_shift(name) =>
+            {
+                let [value, shift] = args else {
+                    unsupported!("`{name}` with {} arguments", args.len());
+                };
+                let Some(shift) =
+                    self.immediate(shift)?.filter(|it| (1..=u128::from(max_shift)).contains(it))
+                else {
+                    unsupported!("`{name}` with a shift that is not a constant in 1..={max_shift}");
+                };
+                lowered.text = lowered.text.replace("{shift}", &shift.to_string());
+                self.neon_assembly(
+                    &format!("llvm.{name}"),
+                    &lowered,
+                    std::slice::from_ref(value),
+                    dst,
+                    dst_ty,
+                )?;
+            }
+            _ if self.cg.target.arch == Arch::Aarch64
                 && let Some(lowered) = neon::lower(name) =>
             {
                 self.neon_assembly(&format!("llvm.{name}"), &lowered, args, dst, dst_ty)?
