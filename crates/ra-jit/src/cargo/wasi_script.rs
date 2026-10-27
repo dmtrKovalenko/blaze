@@ -345,9 +345,12 @@ mod running {
             Plan::Sandboxed { link_dirs, .. } => link_dirs.clone(),
             Plan::Outside(..) => Vec::new(),
         };
+        let env: Vec<(String, String)> =
+            plan.env().iter().filter(|it| documented(&it.0)).cloned().collect();
         let directives = directives::Ran {
             package_dir: script.cwd,
             out_dir: script.out_dir,
+            env: &env,
             link_dirs: &link_dirs,
         };
         let refused = directives::refused(&ran.stdout, &directives);

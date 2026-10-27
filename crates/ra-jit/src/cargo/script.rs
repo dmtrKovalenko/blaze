@@ -208,8 +208,12 @@ pub(crate) fn run_as_cargo_does(
             true => script_sandbox::not_given(&output.stdout, &ran.env, &plan),
             false => Vec::new(),
         };
-        let directives =
-            directives::Ran { package_dir: &cwd, out_dir: &out_dir, link_dirs: &link_dirs };
+        let directives = directives::Ran {
+            package_dir: &cwd,
+            out_dir: &out_dir,
+            env: plan.env(),
+            link_dirs: &link_dirs,
+        };
         let refused = directives::refused(&output.stdout, &directives);
         if unset.is_empty() {
             std::io::stdout().write_all(&output.stdout)?;
