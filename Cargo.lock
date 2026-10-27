@@ -2872,6 +2872,7 @@ name = "load-cargo"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "cfg",
  "crossbeam-channel",
  "hir-expand",
  "ide-db",
@@ -2879,6 +2880,7 @@ dependencies = [
  "itertools 0.15.0",
  "proc-macro-api",
  "project-model",
+ "serde_json",
  "span",
  "tracing",
  "triomphe",
@@ -3733,6 +3735,7 @@ dependencies = [
  "ra-jit-cache",
  "ra-jit-expand",
  "ra-jit-live",
+ "ra-jit-macro-wasm",
  "ra-jit-store",
  "rustc-demangle",
  "rustc-hash 2.1.2",
@@ -3816,6 +3819,25 @@ version = "0.1.0"
 [[package]]
 name = "ra-jit-live"
 version = "0.1.0"
+
+[[package]]
+name = "ra-jit-macro-wasm"
+version = "0.1.0"
+dependencies = [
+ "base-db",
+ "hir-expand",
+ "intern",
+ "load-cargo",
+ "paths",
+ "proc-macro-api",
+ "ra-ap-rustc_lexer",
+ "ra-jit-store",
+ "rustc-hash 2.1.2",
+ "sha2 0.10.9",
+ "span",
+ "tt",
+ "wasmtime",
+]
 
 [[package]]
 name = "ra-jit-store"

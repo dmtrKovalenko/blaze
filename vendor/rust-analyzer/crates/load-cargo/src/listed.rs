@@ -11,23 +11,43 @@ const LIST: &[u8] = b"RA_JIT_PROC_MACROS";
 
 static SERVER: OnceLock<AbsPathBuf> = OnceLock::new();
 
-/// For the sysroot of a workspace and libraries rustc compiled, the library that lists its
-/// macros a caller has of each, where it has one.
-pub type Own = dyn Fn(Option<&AbsPath>, &[AbsPathBuf]) -> Vec<Option<AbsPathBuf>> + Send + Sync;
+/// A library rustc compiled of a proc macro: the name of its crate, where it is, and the
+/// `rust-project.json` of the crate and what it depends on, when the load can say it.
+pub struct Compiled {
+    pub name: String,
+    pub library: AbsPathBuf,
+    pub description: Option<String>,
+}
+
+/// For the sysroot and root of a workspace and libraries rustc compiled, what a caller has of
+/// each: a library that lists its macros or a WebAssembly module, `None` to expand with
+/// rustc's, or why it has none and the load is to fail.
+pub type Own = dyn Fn(Option<&AbsPath>, &AbsPath, &[Compiled]) -> Vec<Result<Option<AbsPathBuf>, String>>
+    + Send
+    + Sync;
 
 static OWN: OnceLock<Box<Own>> = OnceLock::new();
 
-/// Has each library a load names that does not list its macros expanded with the one `own`
-/// has of it, by the server [`serve_listed_with`] named. The first call is the one kept.
+/// Has each library a load names that does not list its macros expanded with what `own` has
+/// of it. The first call is the one kept.
 pub fn own_libraries_with(own: Box<Own>) {
     _ = OWN.set(own);
 }
 
-/// The library listing its macros that stands for each of `libraries`, where there is one.
-pub(crate) fn own(sysroot: Option<&AbsPath>, libraries: &[AbsPathBuf]) -> Vec<Option<AbsPathBuf>> {
-    match (OWN.get(), server()) {
-        (Some(own), Some(_)) if !libraries.is_empty() => own(sysroot, libraries),
-        _ => vec![None; libraries.len()],
+/// Whether a caller has its own of the libraries rustc compiled.
+pub(crate) fn owned() -> bool {
+    OWN.get().is_some()
+}
+
+/// What stands for each of `libraries` ([`Own`]).
+pub(crate) fn own(
+    sysroot: Option<&AbsPath>,
+    workspace: &AbsPath,
+    libraries: &[Compiled],
+) -> Vec<Result<Option<AbsPathBuf>, String>> {
+    match OWN.get() {
+        Some(own) if !libraries.is_empty() => own(sysroot, workspace, libraries),
+        _ => vec![Ok(None); libraries.len()],
     }
 }
 

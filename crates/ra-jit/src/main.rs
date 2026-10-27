@@ -3902,10 +3902,17 @@ fn harnesses<'a>(
                 if !data.target_kind.is_proc_macro() {
                     continue;
                 }
-                let module = hir::attach_db(db, || macro_list::module(db, krate));
+                let wasm =
+                    args.selection.target.as_deref().is_some_and(|it| it.starts_with("wasm"));
+                let module = hir::attach_db(db, || macro_list::module(db, krate, wasm));
                 let wanted = format!("{}{module}", test_harness::without(&text));
                 if *text != *wanted {
                     texts.push((file, wanted));
+                }
+                if let Some((file, shim)) = wasm.then(|| macro_list::shim(db, krate)).flatten()
+                    && **db.file_text(file).text(db) != *shim
+                {
+                    texts.push((file, shim));
                 }
                 continue;
             }
@@ -4862,6 +4869,7 @@ fn link_executable(
         Ok(exports)
     });
     let exports = exports.transpose()?;
+    ra_jit_macro_wasm::flush();
     let took = link::executable(
         db,
         &program,
@@ -7982,6 +7990,12 @@ fn main() -> anyhow::Result<()> {
             std::io::stderr().write_all(&output.stderr)?;
             std::process::exit(output.status.code().unwrap_or(101));
         }
+        // `proc-macro-wasm <module.wasm> --macro <name> --input <file> ...`: one macro of a
+        // module compiled to WebAssembly expanded and timed (`ra-jit-macro-wasm/src/bench.rs`).
+        Some("proc-macro-wasm") => {
+            return ra_jit_macro_wasm::bench::command(std::env::args().skip(2))
+                .map_err(anyhow::Error::msg);
+        }
         Some(cargo::own_macro::COMMAND) => {
             return cargo::own_macro::command(std::env::args_os().skip(2));
         }
@@ -8688,13 +8702,26 @@ fn process_wide() {
     let server = cargo::own_macro::server();
     if let Some(Ok(server)) = server.and_then(Path::to_str).map(AbsPathBuf::try_from) {
         load_cargo::serve_listed_with(server);
-        // A proc macro rustc compiled, as cargo's builds do, is expanded with ra-jit's.
-        load_cargo::own_libraries_with(Box::new(|sysroot, libraries| {
-            let libraries: Vec<PathBuf> = libraries.iter().map(|it| it.clone().into()).collect();
+    }
+    // A proc macro rustc compiled, as cargo's builds do, is expanded with ra-jit's module or
+    // library of it.
+    if server.is_some() || cargo::own_macro::wasm() {
+        load_cargo::own_libraries_with(Box::new(|sysroot, workspace, libraries| {
+            let libraries: Vec<_> = libraries
+                .iter()
+                .map(|it| cargo::own_macro::Compiled {
+                    name: it.name.clone(),
+                    library: it.library.clone().into(),
+                    description: it.description.clone(),
+                })
+                .collect();
             let sysroot = sysroot.map(AsRef::<Path>::as_ref);
-            let made = cargo::own_macro::libraries_of(sysroot, &libraries);
-            let made = made.into_iter().map(|it| it?.to_str().map(AbsPathBuf::try_from)?.ok());
-            made.collect()
+            let made = cargo::own_macro::libraries_of(sysroot, workspace.as_ref(), &libraries);
+            let path = |it: PathBuf| match it.to_str().map(AbsPathBuf::try_from) {
+                Some(Ok(it)) => Ok(it),
+                _ => Err(format!("ra-jit made {} where a path is not text", it.display())),
+            };
+            made.into_iter().map(|it| it?.map(path).transpose()).collect()
         }));
     }
 }
@@ -8705,6 +8732,7 @@ fn held_wide() {
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     ra_jit_expand::install();
+    load_cargo::wasm_macros_with(Box::new(ra_jit_macro_wasm::load));
     // Every proc-macro server is started in the sandbox.
     macro_sandbox::install();
 }

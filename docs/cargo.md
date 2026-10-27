@@ -530,6 +530,62 @@ printed and wrote is set aside in `ra-jit-wasi/` beside `OUT_DIR`, then the nati
 runs for cargo. `harness/bswasi.py` compares the two over the bench corpus;
 [the report](reports/BSWASI.md) has which scripts run unchanged and why the others don't.
 
+### Proc macros run as WebAssembly
+
+By default every proc macro of a load is built by blaze, from its source, as a WebAssembly
+module (`wasm32-wasip1`, a WASI reactor), and blaze expands with it in its own process under
+Wasmtime and Cranelift (`crates/ra-jit-macro-wasm`): no rustc-built code runs, and no
+proc-macro server is started for it. In ra-jit's own target directory the module is built
+from cargo's unit graph, with the build scripts (`cargo/compile_time.rs`). Elsewhere it is
+built from the load's own description of the macro's crate and what it depends on
+(`load_cargo::described`), whoever compiled the macro's library. Either build is kept in the
+store like a build script's. The macro's `proc_macro` crate is a shim
+(`crates/ra-jit-macro-wasm/guest/proc_macro.rs`) whose handles go to the host by imports, so
+`syn`, `quote` and `proc-macro2` build unchanged. A module is linked with the wasi-libc of
+the toolchain's `wasm32-wasip1` target. When the toolchain does not have that target, blaze
+runs `rustup target add wasm32-wasip1` for it, once.
+
+A module sees only what cargo documents for a proc macro:
+
+- Its package's directory, read-only, at `/blaze/package`: `CARGO_MANIFEST_DIR` names it, and
+  `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), ..))` or a `std::fs` read below it
+  works. Nothing else of the machine is there. A write fails with `EROFS`, a path out of the
+  package with `ENOTCAPABLE`.
+- The variables cargo sets for a crate (`CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`,
+  `CARGO_PKG_*`, `CARGO_CRATE_NAME`, `CARGO_PRIMARY_PACKAGE`, `CARGO_BIN_NAME`, `OUT_DIR`), never
+  the environment of the shell or the daemon.
+- A clock that reads 0 and random bytes that are the same on every run.
+
+Each expansion is kept in the store. Its first key is what the module was built of (two
+builds of one source are not the same bytes), the macro, its input and the variables. Its
+second key adds the file reads the host recorded: each path, relative to the package, and
+what that file held. A later expansion is found only while each of those reads holds the
+same as before; the format is `cargo/keyed.rs`'s. The expansion's own keys hold no absolute
+path and no host triple. But what a module was built of names the checkout's paths, so for
+now only the same checkout finds it. An expansion that asked the compiler about a span (its
+source text, file, line or a join) is not kept. A module's machine code is kept too, for
+the machine that compiled it: a new process loads it in about 3 ms rather than compiling it
+again (4 to 11 s for the corpus's macros). The list of a module's macros is kept in a
+`.macros` file beside it, so a load compiles nothing; a module is compiled, or loaded from
+the store, when one of its macros first expands.
+
+A proc macro that can't be built or loaded as a module fails the load, naming it:
+
+    error: the proc macro `my_derive` cannot run as WebAssembly: ...
+      name its package in `native-proc-macros` under [workspace.metadata.blaze] in /home/me/ws/Cargo.toml to expand it natively, or set RA_JIT_PROC_MACRO_WASM=0 for every proc macro
+
+It is never expanded natively instead. The ways out, in the workspace's root manifest:
+
+```toml
+[workspace.metadata.blaze]
+native-proc-macros = ["sqlx-macros"]   # by package name
+```
+
+A package listed there, and every proc macro under `RA_JIT_PROC_MACRO_WASM=0`, is expanded
+as before: rustc's library, by the toolchain's proc-macro server in the sandbox
+([above](#build-scripts-and-proc-macros-run-in-a-sandbox)). A value that is not a list of
+names is an error.
+
 ### Running only the tests that have not passed
 
 With `RA_JIT_TESTS=affected`, `cargo ra-jit test` runs, of each test executable the daemon
@@ -818,6 +874,7 @@ build a command line is, so changing one starts from a cargo build again.
 | `RA_JIT_EMIT` | LLVM instruction selection: `optimized` or `fast` | `optimized`; `fast` at level 0 |
 | `RA_JIT_INLINE` | With LLVM at level 2 or 3, a program built whole (`runbench.py`'s builds) has the functions it calls in any crate built into it or shown to LLVM, as a release build does; the standard library's only when they are generic or `#[inline]`, as rustc does across crates. `crate` keeps that to the function's own crate, `0` builds nothing in, `all` does it in other builds with LLVM at level 2 or 3 too (never the daemon's, whose store keeps each function by its own code alone) | across crates in a whole program, the function's own crate otherwise |
 | `RA_JIT_SPLICE` | `0` links in full after every edit instead of splicing | splice |
+| `RA_JIT_PROC_MACRO_WASM` | `0` expands proc macros natively, with rustc's libraries, rather than as WebAssembly ([above](#proc-macros-run-as-webassembly)) | WebAssembly |
 | `RA_JIT_OTHER_TOOLCHAIN` | `1` builds with the project's toolchain when it is not the pinned nightly, rather than with the pinned nightly, for a project pinned to a nightly near it; nothing checks that it agrees ([support.md](support.md#toolchain)) | not set |
 
 `RA_JIT_BUILD_SCRIPTS` (`wasi`, `wasi-compare`, `native`) is read by the wrapper and by each

@@ -84,6 +84,7 @@ const BUILD_ENV: &[&str] = &[
     "RA_JIT_LLVM_INLINE_THRESHOLD",
     "RA_JIT_OTHER_TOOLCHAIN",
     super::own_macro::SERVER,
+    super::own_macro::WASM,
 ];
 
 /// The variables a worker is started with: the ones that pick its toolchain and its backend,
@@ -109,6 +110,7 @@ const WORKER_ENV: &[&str] = &[
     "RA_JIT_LLVM_INLINE_THRESHOLD",
     "RA_JIT_RUSTC_BASE",
     super::own_macro::SERVER,
+    super::own_macro::WASM,
 ];
 
 /// The variables of [`WORKER_ENV`] a worker has only as its build has them: unset there, they
@@ -124,6 +126,7 @@ const WORKER_ENV_EXACT: &[&str] = &[
     "CARGO_BUILD_",
     "CARGO_PROFILE_",
     super::own_macro::SERVER,
+    super::own_macro::WASM,
 ];
 
 /// `CARGO_TARGET_<triple>_RUSTFLAGS`, which cargo reads as `[target.<triple>] rustflags`.
