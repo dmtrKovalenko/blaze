@@ -43,6 +43,7 @@ cases![
     whole_vectors,
     const_bytes_match,
     link_name_macro,
+    promoted_closure_table,
     const_pattern,
     cfg_variant_match,
     powi,
@@ -198,5 +199,6 @@ cases![
     trait_method_of_closure,
     const_float_min_max,
     guard_nested_guard,
+    self_projection_enum_pat,
     rpit_recursive_method,
 ];

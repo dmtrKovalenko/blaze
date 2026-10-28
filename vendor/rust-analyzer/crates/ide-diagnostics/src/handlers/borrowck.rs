@@ -607,4 +607,34 @@ impl S {
 "#,
         );
     }
+
+    #[test]
+    fn async_bodys_tail_temporaries_drop_before_its_parameters_2021() {
+        check_diagnostics(
+            r#"
+//- minicore: future, option, drop, async_fn
+//- /main.rs edition:2021
+struct Guard<'a>(&'a u32);
+impl Drop for Guard<'_> { fn drop(&mut self) {} }
+struct Memory(u32);
+impl Memory { fn lock(&self) -> Option<Guard<'_>> { Some(Guard(&self.0)) } }
+async fn param(memory: Memory) {
+    if let Some(_g) = memory.lock() {}
+}
+async fn pattern((memory, _): (Memory, u32)) {
+    if let Some(_g) = memory.lock() {}
+}
+fn closure() {
+    let _ = async |memory: Memory| {
+        if let Some(_g) = memory.lock() {}
+    };
+}
+async fn local() {
+    let memory = Memory(0);
+    if let Some(_g) = memory.lock() {}
+                    //^^^^^^ error: `memory` does not live long enough
+}
+"#,
+        );
+    }
 }

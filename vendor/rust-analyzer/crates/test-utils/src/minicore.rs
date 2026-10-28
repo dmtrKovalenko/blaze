@@ -1800,6 +1800,7 @@ pub mod task {
         Pending,
     }
 
+    #[lang = "Context"]
     pub struct Context<'a> {
         waker: &'a (),
     }

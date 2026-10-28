@@ -1396,6 +1396,22 @@ fn toolchain_identity(vfs: &vfs::Vfs, symbol_files: &[PathBuf]) -> Option<String
     (!identity.is_empty()).then(|| identity.join(" "))
 }
 
+/// What [`toolchain_identity`] will say of a build with nothing of rustc's in the checkout at
+/// `project`, before it is loaded: the toolchain the load finds, as it finds it.
+fn toolchain_ahead(project: &Path, cargo_config: &CargoConfig) -> Option<String> {
+    let root = match &cargo_config.sysroot {
+        Some(RustLibSource::Path(toolchain)) => toolchain.clone(),
+        _ => {
+            let dir = AbsPathBuf::assert_utf8(std::env::current_dir().ok()?.join(project));
+            let sysroot = project_model::Sysroot::discover(&dir, &cargo_config.extra_env);
+            sysroot.root()?.to_owned()
+        }
+    };
+    let mut identity = installed_identity(&format!("{root}/"));
+    identity.sort_unstable();
+    (!identity.is_empty()).then(|| identity.join(" "))
+}
+
 /// The rlibs of the standard library whose metadata [`toolchain_identity`] reads. rustc's link
 /// line has all of them, and a build told ahead of cargo's finds the same in the toolchain
 /// ([`built_library`]): one toolchain is then one identity whichever way a daemon starts, and
@@ -4289,11 +4305,18 @@ fn start_from_rustc(
     }
     std::fs::write(patch, &empty)?;
     // Another name for it at once, for a client to install: the copy a splice writes is
-    // made while the daemon waits for the first edit.
-    let _ = std::fs::remove_file(binary);
-    if std::fs::hard_link(rustcs, binary).is_err() {
-        std::fs::copy(rustcs, binary)?;
+    // made while the daemon waits for the first edit. Renamed into place, so that a client
+    // never finds no file there.
+    let mut new = binary.as_os_str().to_owned();
+    new.push(format!(".{}.new", std::process::id()));
+    let new = PathBuf::from(new);
+    let _ = std::fs::remove_file(&new);
+    if std::fs::hard_link(rustcs, &new).is_err() {
+        std::fs::copy(rustcs, &new)?;
     }
+    std::fs::rename(&new, binary)?;
+    // A rename onto another name of the same file leaves both names.
+    let _ = std::fs::remove_file(&new);
     let linked = Linked::read_rustcs(binary.to_owned(), patch, &args.out);
     lock(&LINKED).insert(binary.to_owned(), Executable::Linked(linked));
     lock(&RUSTC_LINKED).insert(binary.to_owned());
@@ -5942,10 +5965,10 @@ fn link(
     let reached = cargo::plan::reached_only(cmd);
     let cmd = match reached.as_deref() {
         Some(reached) if lock(&REACHED_ONLY).contains(cmd) => {
-            run_link(reached, start, &declined)?;
+            run_link(reached, splice, start, &declined)?;
             reached
         }
-        _ => match (run_link(cmd, start, &declined), reached.as_deref()) {
+        _ => match (run_link(cmd, splice, start, &declined), reached.as_deref()) {
             (Err(why), Some(reached))
                 if why
                     .downcast_ref::<LinkFailed>()
@@ -5953,7 +5976,7 @@ fn link(
             {
                 lock(&REACHED_ONLY).insert(cmd.to_owned());
                 let again = "; again without the code nothing reaches, as rustc's line has it: some of it uses what nothing defines";
-                run_link(reached, Instant::now(), again)?;
+                run_link(reached, splice, Instant::now(), again)?;
                 reached
             }
             (linked, _) => {
@@ -5967,7 +5990,7 @@ fn link(
     {
         cargo::plan::write_headerpad(binary, pad)?;
         let again = format!("; again with -Wl,-headerpad,{pad:#x}, for the splices to fit");
-        run_link(cmd, Instant::now(), &again)?;
+        run_link(cmd, splice, Instant::now(), &again)?;
     }
     drop(reading);
     if let (Some(binary), Some(patch), true) = (splice, patch, relinked) {
@@ -6009,9 +6032,25 @@ fn packs_whole(args: &Args) -> bool {
 }
 
 /// Runs the link command `cmd` and says how long it took since `start` and how it ended, with
-/// `note` after.
-fn run_link(cmd: &str, start: Instant, note: &str) -> anyhow::Result<()> {
-    let linked = shell(cmd).output()?;
+/// `note` after. The executable `binary` it writes is linked under a directory of its own
+/// beside it and renamed into place: lld moves the file there aside as it starts to write, and
+/// GNU ld removes it, so a client that installs the last build's while another client's
+/// request links it again would find none.
+fn run_link(cmd: &str, binary: Option<&Path>, start: Instant, note: &str) -> anyhow::Result<()> {
+    let aside = binary.and_then(|binary| Some((binary, linked_aside(cmd, binary)?)));
+    let line = aside.as_ref().map_or(cmd, |(_, (line, _))| line);
+    let linked = shell(line).output();
+    let placed = match (&aside, &linked) {
+        (Some((binary, (_, at))), Ok(linked)) if linked.status.success() => {
+            std::fs::rename(at, binary)
+                .with_context(|| format!("putting the executable linked at {}", binary.display()))
+        }
+        _ => Ok(()),
+    };
+    if let Some(dir) = aside.as_ref().and_then(|(_, (_, at))| at.parent()) {
+        _ = std::fs::remove_dir_all(dir);
+    }
+    let linked = linked?;
     let status = linked.status;
     let said = String::from_utf8_lossy(&linked.stderr).into_owned();
     eprint!("{}{said}", String::from_utf8_lossy(&linked.stdout));
@@ -6019,7 +6058,29 @@ fn run_link(cmd: &str, start: Instant, note: &str) -> anyhow::Result<()> {
     if !status.success() {
         return Err(LinkFailed { status, said }.into());
     }
-    Ok(())
+    placed
+}
+
+/// The link line `cmd` with the executable it names after `-o`, `binary`, written in a
+/// directory of its own beside it under the same name (which Apple's linker signs it by), and
+/// where that is. `None` when the line names `binary` otherwise, or not once.
+fn linked_aside(cmd: &str, binary: &Path) -> Option<(String, PathBuf)> {
+    if cfg!(windows) {
+        return None;
+    }
+    let mut args = shlex::split(cmd)?;
+    let named = binary.to_str()?;
+    let mut found = args.windows(2).enumerate().filter(|(_, it)| it[0] == "-o" && it[1] == named);
+    let at = found.next().filter(|_| found.next().is_none())?.0;
+    let mut dir = binary.as_os_str().to_owned();
+    dir.push(format!(".linking.{}", std::process::id()));
+    let dir = PathBuf::from(dir);
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).ok()?;
+    let aside = dir.join(binary.file_name()?);
+    args[at + 1] = aside.to_str()?.to_owned();
+    let line = shlex::try_join(args.iter().map(String::as_str)).ok()?;
+    Some((line, aside))
 }
 
 /// The link commands whose executables are linked without the code nothing reaches
@@ -8932,6 +8993,18 @@ fn run_holding(
         Ok::<_, anyhow::Error>((table, whole))
     });
 
+    // The store keeps the first toolchain it is told of, and the build scripts the load runs
+    // in this process tell it a name of their own: a build with nothing of rustc's tells it
+    // the toolchain whose library it loads before then, or its store is not that toolchain's
+    // and the standard library a release ships is never found (#775).
+    let cargo_config = cargo_config(&args);
+    if !ahead
+        && args.symbol_files.is_empty()
+        && let Some(toolchain) = toolchain_ahead(&args.project, &cargo_config)
+    {
+        ra_jit_store::compiles_against(&toolchain);
+    }
+
     // What other machines compiled is fetched next to the workspace too.
     let shared = std::thread::spawn(|| {
         let shared = remote::Shared::from_env()?;
@@ -8942,7 +9015,6 @@ fn run_holding(
     });
 
     let start = Instant::now();
-    let cargo_config = cargo_config(&args);
     let selection = args.selection.clone();
     ra_jit_store::identify_ahead();
     let projects: Vec<&Path> =
@@ -8989,15 +9061,18 @@ fn run_holding(
     match toolchain_identity(&vfs, library.as_ref().unwrap_or(&args.symbol_files)) {
         Some(toolchain) => {
             ra_jit_store::compiles_against(&toolchain);
+            if let Some(told) = ra_jit_store::toolchain().filter(|it| *it != toolchain) {
+                eprintln!("store: of `{told}`, not of the toolchain loaded, `{toolchain}`");
+            }
             std::thread::spawn(ra_jit_store::check_packs);
         }
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
     // A build with nothing of rustc's starts from the standard library, which a release ships.
     let nothing_of_rustc = library.is_none() && args.symbol_files.is_empty();
-    let shipped = (nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args))
-        .then(|| shipped::fetch_ahead(emits.triple()))
-        .flatten();
+    if nothing_of_rustc && args.prebuilt.is_none() && !patches_its_library(&args) {
+        shipped::fetch_ahead(emits.triple(), &args.project)?;
+    }
     let following_at = start.elapsed();
     let built = follow_cargo(&mut db, &mut vfs, &mut checkouts, &args, &listed)?;
     if std::env::var_os("RA_JIT_STATS").is_some() {
@@ -9047,10 +9122,9 @@ fn run_holding(
     if checkouts.lto(&args.project)? {
         linked_from_libraries(&db, &args)?;
     }
-    // The store reads its packs when first opened, which serving does: what is fetched after
-    // that is not in it for this build.
+    // The store reads its packs when first opened, which serving does: what the remote's pull
+    // brings after that is not in it for this build.
     let shared = shared.join().map_err(|_| anyhow::anyhow!("fetching the store panicked"))??;
-    shipped::fetched(shipped);
     let built = built_crates(&db, &args)?;
     let mut served = frozen::serve(&mut db, &built);
     // What is frozen names the files its `include!`s read: those not loaded yet are, and
@@ -11458,6 +11532,27 @@ mod tests {
             crate_place(inside, Some(Path::new("app/src/main.rs")), None),
             "app/src/main.rs"
         );
+    }
+
+    /// A link writes the executable beside its place under the same name, for it to be renamed
+    /// there: a client that reads it meanwhile finds the last one, never none.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_writes_the_executable_aside_under_its_name() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-aside-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("my app");
+        let line = format!("cc -B/x -fuse-ld=lld a.o -o '{}' -lc", binary.display());
+        let (aside, at) = linked_aside(&line, &binary).unwrap();
+        assert_eq!(at.file_name(), binary.file_name());
+        assert_eq!(at.parent().unwrap().parent(), Some(&*dir));
+        assert!(at.parent().unwrap().is_dir());
+        let args = shlex::split(&aside).unwrap();
+        assert_eq!(args[args.len() - 3..], ["-o", at.to_str().unwrap(), "-lc"]);
+        assert!(linked_aside("cc a.o -o elsewhere", &binary).is_none());
+        let twice = format!("{line} -o '{}'", binary.display());
+        assert!(linked_aside(&twice, &binary).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An rlib whose `lib.rmeta` is `metadata`, as an archive of one member.

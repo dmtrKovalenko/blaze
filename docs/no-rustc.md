@@ -1463,9 +1463,11 @@ paid once, by the release, instead of on a user's machine (`crates/ra-jit/src/sh
   attaches the remote's files to the release with `.` for `/` (`manifests.std-…`, `packs.….pack.zst`,
   `keys.…`). A remote can be a plain `https://` address now (`remote/https.rs`): read-only,
   flat, redirects followed, which is what a release's download URL is.
-- A build with nothing of rustc's, before it first reads the store, fetches that project once
-  per store: from `RA_JIT_STD_FROM` when set (`off` for nowhere), otherwise from its own
-  release when it is one (`RA_JIT_RELEASE`, set by the workflow on a tag). Builds that start
+- A build with nothing of rustc's fetches that project once per store, beside the build and
+  never waited for (the store reads it when it is in, [cache.md](cache.md#the-standard-library)):
+  from `RA_JIT_STD_FROM` when set (`off` for nowhere), otherwise from its own release when it
+  is one (`RA_JIT_RELEASE`, set by the workflow on a tag) and the root manifest does not say
+  `fetch-public = false` under `[workspace.metadata.blaze]`. Builds that start
   together take a lock and fetch once; `fetched-<project>` in the store dir records that it is
   done, and a failure is retried an hour later. A pack is used only once its bytes hash to the
   name the manifest lists, as with any remote.

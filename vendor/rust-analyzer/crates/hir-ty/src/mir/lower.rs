@@ -165,6 +165,11 @@ struct MirLowerCtx<'a, 'db> {
     /// tail of a block. The operands of such an expression are in one scope with its
     /// temporaries, where those of any other expression are in a scope inside it.
     ends_temporaries: FxHashSet<ExprId>,
+    /// The tails rustc wraps in `DropTemps`, whose temporaries are dropped where they end, in
+    /// any edition: the body of an `async fn` or `async` closure, so that its temporaries are
+    /// dropped before the parameters it was given (rustc's
+    /// `lower_coroutine_body_with_moved_arguments`).
+    drop_temps: FxHashSet<ExprId>,
     /// The bindings of the body that have no local yet. rustc declares a binding where its
     /// pattern is lowered (a `let` before its initializer), so locals are numbered in that
     /// order, which decides the order of what an `async` block keeps in its future.
@@ -380,6 +385,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             super_let: None,
             inline_consts: 0,
             ends_temporaries: FxHashSet::default(),
+            drop_temps: FxHashSet::default(),
             undeclared: FxHashSet::default(),
             unwind_nodes: FxHashMap::default(),
             unwind_resume: None,
@@ -2787,6 +2793,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
                 Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
             ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
+            // A closure that captures nothing, as a function pointer, is a constant: rustc's
+            // `promote_consts::Validator` promotes the cast of a closure aggregate with no
+            // upvars. minijinja's `type_erase!` builds `DynObject`'s vtable of such closures by
+            // reference in a generic function; not promoted, the vtable was a slot of the frame
+            // the function returned a reference to, and the borrow checker refused it (E0515).
+            [Adjustment { kind: Adjust::Pointer(PointerCast::ClosureFnPointer(_)), .. }] => {
+                matches!(self.store[expr], Expr::Closure { closure_kind: ClosureKind::Closure, .. })
+                    && self
+                        .infer
+                        .closures_data
+                        .get(&expr)
+                        .is_some_and(|it| it.min_captures.values().flatten().next().is_none())
+            }
             // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
             // rustc's `promote_consts::Validator::validate_rvalue`.
             [
@@ -3626,11 +3645,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             {
                 scope.tail = Some(declared);
             }
+            let drop_temps = self.drop_temps.contains(&tail).then(|| self.push_drop_scope());
             let Some(c) = self.lower_expr_to_place(tail, place, current)? else {
+                if let Some(drop_temps) = drop_temps {
+                    drop_temps.pop_assume_dropped(self);
+                }
                 scope.pop_assume_dropped(self);
                 return Ok(None);
             };
-            current = c;
+            current = match drop_temps {
+                Some(drop_temps) => drop_temps.pop_and_drop(self, c, tail.into()),
+                None => c,
+            };
             if !edition.at_least_2024() {
                 self.outlive_block(declared);
             }
@@ -4640,7 +4666,7 @@ fn lower_closure_body<'db>(
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
     check_expansions(db, body_owner)?;
-    let Expr::Closure { args, body: root, .. } = &store[expr] else {
+    let Expr::Closure { args, body: root, closure_kind, .. } = &store[expr] else {
         implementation_error!("closure expression is not closure");
     };
     let Some(closure_data) = infer.closures_data.get(&expr) else {
@@ -4798,6 +4824,12 @@ fn lower_closure_body<'db>(
 
     ctx.resolver.reset_to_guard(resolver_guard);
     ctx.ends_temporaries.insert(*root);
+    if let ClosureKind::Coroutine { source: CoroutineSource::Fn | CoroutineSource::Closure, .. } =
+        closure_kind
+        && let Expr::Block { tail: Some(body), .. } = &store[*root]
+    {
+        ctx.drop_temps.insert(*body);
+    }
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root.into())?;
         ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(*root).end());

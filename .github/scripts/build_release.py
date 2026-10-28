@@ -241,7 +241,13 @@ def train(target, out):
     work = Path(tempfile.mkdtemp(prefix="rjpgo-", dir="/tmp"))
     raw = work / "raw"
     raw.mkdir()
-    built, _ = build(target, ROOT / "target" / "pgo-instrumented", f"-Cprofile-generate={raw}", "-fno-profile-generate")
+    # On AArch64 a direct call reaches 128 MiB, and the instrumented ra-jit is larger: its calls
+    # to the value-profiling runtime (`__llvm_profile_instrument_memop`, `_target`) do not link
+    # (R_AARCH64_CALL26 truncated). Counters are inline, so only value profiling is left out.
+    rustflags = f"-Cprofile-generate={raw}"
+    if target.startswith("aarch64-unknown-linux"):
+        rustflags += " -Cllvm-args=-disable-vp"
+    built, _ = build(target, ROOT / "target" / "pgo-instrumented", rustflags, "-fno-profile-generate")
     binaries, crate = built[0].parent, crate_hash(built)
 
     # Each process of the instrumented ra-jit writes its counters to a file of its own as it exits.

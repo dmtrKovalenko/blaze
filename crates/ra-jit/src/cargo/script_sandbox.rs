@@ -53,8 +53,18 @@ use std::{
 
 use anyhow::Context as _;
 
-use super::{hermetic, sandboxed};
+#[cfg(unix)]
+use super::hermetic;
+#[cfg(unix)]
+pub(crate) use super::hermetic::InView;
+use super::sandboxed;
 use crate::sandbox::{self, Line, Reached, Spec};
+
+/// A run in its closure alone, which Windows has none of: `hermetic` is the closure's, and
+/// the closure is Linux's.
+#[cfg(not(unix))]
+#[derive(Clone, Debug)]
+pub(crate) enum InView {}
 
 /// The file beside a script's `OUT_DIR` with what its last run of cargo's read, when that is
 /// what decides whether it runs again ([`reads_unchanged`]): a first line [`READS_HEAD`], then
@@ -108,9 +118,9 @@ pub(crate) enum Plan {
         /// The system directories its `rustc-link-search` may name besides those it always may
         /// (`directives.rs`): `build-script-link-dirs` of the root manifest.
         link_dirs: Vec<PathBuf>,
-        /// The closure it sees alone, when it does ([`hermetic::VAR`]): then its run is kept by
-        /// what it is made of, and not by what it was seen reading.
-        in_view: Option<hermetic::InView>,
+        /// The closure it sees alone, when it does (`RA_JIT_SCRIPT_VIEW`): then its run is kept
+        /// by what it is made of, and not by what it was seen reading.
+        in_view: Option<InView>,
     },
 }
 
@@ -271,6 +281,7 @@ pub(crate) fn plan(script: &Script<'_>) -> anyhow::Result<Plan> {
     let mut not_inputs = vec![script.real.to_owned()];
     not_inputs.extend(std::fs::canonicalize(script.real).ok());
     let root_manifest = root.as_ref().map(|it| it.join("Cargo.toml"));
+    #[cfg(unix)]
     if hermetic::wanted(script.env) && cfg!(target_os = "linux") {
         let overrides = match &root_manifest {
             Some(manifest) => hermetic::system_deps(manifest)?,
@@ -573,8 +584,7 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
     } else if !output.status.success()
         && let Some(in_view) = in_view
     {
-        let root = root_manifest.as_deref();
-        let note = hermetic::failed_note(package, &in_view.closure, &output.stderr, root);
+        let note = failed_note(package, in_view, &output.stderr, root_manifest.as_deref());
         output.stderr.extend(format!("note: {note}\n").into_bytes());
     }
     if in_view.is_some() {
@@ -583,6 +593,18 @@ pub(crate) fn run(script: &Script<'_>, plan: &Plan, stdin: Stdio) -> anyhow::Res
     let reads = lines.filter(|it| it.iter().all(|it| it.reached != Reached::Incomplete));
     let reads = reads.map(|lines| inputs(&lines, script, spec));
     Ok(Ran { output, reads })
+}
+
+/// What a run of `package` in its closure that failed with `stderr` is told
+/// ([`hermetic::failed_note`]).
+#[cfg(unix)]
+fn failed_note(package: &str, in_view: &InView, stderr: &[u8], root: Option<&Path>) -> String {
+    hermetic::failed_note(package, &in_view.closure, stderr, root)
+}
+
+#[cfg(not(unix))]
+fn failed_note(_: &str, in_view: &InView, _: &[u8], _: Option<&Path>) -> String {
+    match *in_view {}
 }
 
 fn running(script: &Script<'_>) -> String {

@@ -365,7 +365,13 @@ fn leading_bytes(path: &Path) -> anyhow::Result<[u8; 8]> {
 /// program has in its data (blaze has the words of the message) is never taken for one.
 pub(crate) fn stand_ins(exe: &Path) -> anyhow::Result<Vec<String>> {
     use object::{Object, ObjectSection};
-    let bytes = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+    let file = std::fs::File::open(exe).with_context(|| format!("opening {}", exe.display()))?;
+    // Mapped, not read: a debug executable is over 100 MB and only the headers and one small
+    // section are looked at, by every build that is over, a no-op's too.
+    // SAFETY: nothing writes the file meanwhile: who asks linked it (a worker, a doc test), or
+    // is a client that holds it unwritten ([`crate::splice::unwritten`]).
+    let bytes = unsafe { memmap2::Mmap::map(&file) }
+        .with_context(|| format!("reading {}", exe.display()))?;
     if wasmparser::Parser::is_core_wasm(&bytes) {
         let (_, name) = hir_ty_codegen::stand_in_section(object::BinaryFormat::Wasm);
         let segments = wasm_segments_named(&bytes, name)

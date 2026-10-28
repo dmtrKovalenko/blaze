@@ -19,9 +19,11 @@ on:
     # build_release.py and llvm.json: the recipe's features and the LLVM it links.
     paths: [Cargo.lock, "**/Cargo.toml", harness/toolchain, .github/scripts/build_release.py, crates/hir-ty-codegen/llvm.json]
 
+# A push replaces the run of the push before it, never a run by hand: the release train's
+# dispatch on a release commit (train_release.py) must finish, or its tag never comes.
 concurrency:
-  group: pgo
-  cancel-in-progress: true
+  group: pgo-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 permissions:
   contents: read

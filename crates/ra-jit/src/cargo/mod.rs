@@ -15,6 +15,7 @@ pub(crate) mod compile_time;
 mod directives;
 mod experimental;
 pub(crate) mod fetches;
+#[cfg(unix)]
 mod hermetic;
 pub(crate) mod layout;
 mod messages;

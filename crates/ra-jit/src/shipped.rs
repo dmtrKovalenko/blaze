@@ -4,9 +4,11 @@
 //! and most of a minute on a laptop. `ra-jit std REMOTE TOOLCHAIN` makes them once, for the
 //! toolchain and this build of ra-jit, and sends them to a remote as the project
 //! `std-<target>-<build>`; the release workflow does that for each target and attaches what
-//! it sent to the release. A build of a release fetches that project before it first reads
-//! the store, once a store, and `RA_JIT_STD_FROM` names another remote to fetch it from
-//! (`off` for none).
+//! it sent to the release. A build of a release fetches that project once a store, beside
+//! the build and never waited for: the build compiles what has not arrived, and what has is
+//! found in the store. `RA_JIT_STD_FROM` names another remote to fetch it from (`off` for
+//! none), and `fetch-public = false` in `[workspace.metadata.blaze]` of the root manifest
+//! turns the release's off.
 //!
 //! What is fetched is checked as everything a remote gives is (`remote.rs`): a pack is used
 //! only when its bytes hash to the name its list gives it, and only by the build of ra-jit
@@ -16,7 +18,6 @@
 
 use std::{
     path::Path,
-    thread::JoinHandle,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -36,30 +37,70 @@ fn project(target: &str) -> Option<String> {
     Some(format!("std-{target}-{}", ra_jit_store::build_name()?))
 }
 
+/// The key, in `[workspace.metadata.blaze]` of a workspace's root manifest, that turns off
+/// fetching what is public (the standard library a release ships) when `false`.
+pub(crate) const FETCH_PUBLIC: &str = "fetch-public";
+
 /// Where the standard library is fetched from: `RA_JIT_STD_FROM`, and without it the release
-/// this build is, when it is one.
-fn source() -> Option<String> {
+/// this build is, when it is one and the workspace at `root` does not say [`FETCH_PUBLIC`]
+/// `= false`.
+fn source(root: &Path) -> anyhow::Result<Option<String>> {
     match std::env::var("RA_JIT_STD_FROM") {
-        Ok(from) => (!from.is_empty() && from != "off").then_some(from),
+        Ok(from) => Ok((!from.is_empty() && from != "off").then_some(from)),
+        Err(_) if !fetch_public(root)? => Ok(None),
         Err(_) => {
             let release = option_env!("RA_JIT_RELEASE").filter(|it| !it.is_empty());
-            release.map(|tag| format!("{RELEASES}/{tag}"))
+            Ok(release.map(|tag| format!("{RELEASES}/{tag}")))
         }
     }
 }
 
+/// What [`FETCH_PUBLIC`] in the root manifest of the workspace `dir` is in says: `true` when
+/// it has no manifest or does not say.
+pub(crate) fn fetch_public(dir: &Path) -> anyhow::Result<bool> {
+    let dir = if dir.is_file() { dir.parent().unwrap_or(dir) } else { dir };
+    let root = crate::cargo::sandboxed::workspace_root(dir)?.unwrap_or_else(|| dir.to_owned());
+    let manifest = root.join("Cargo.toml");
+    let Ok(text) = std::fs::read_to_string(&manifest) else { return Ok(true) };
+    let value: toml::Value =
+        toml::from_str(&text).with_context(|| format!("reading {}", manifest.display()))?;
+    let said = ["workspace", "metadata", "blaze", FETCH_PUBLIC]
+        .iter()
+        .try_fold(&value, |it, key| it.get(*key));
+    match said {
+        None => Ok(true),
+        Some(said) => said.as_bool().with_context(|| {
+            format!(
+                "`{FETCH_PUBLIC}` in [workspace.metadata.blaze] of {} is not `true` or `false`",
+                manifest.display()
+            )
+        }),
+    }
+}
+
 /// Fetches the standard library for `target` into the store on a thread of its own, when
-/// there is somewhere to fetch it from and this store has not fetched it before: to be
-/// joined before the store is first read.
-pub(crate) fn fetch_ahead(target: &str) -> Option<JoinHandle<()>> {
-    let from = source()?;
-    let project = project(target)?;
-    let store = crate::cargo::daemon::store()?;
-    Some(std::thread::spawn(move || {
-        if let Err(e) = fetch(&store, &from, &project) {
-            eprintln!("standard library: not fetched from {from}: {e:#}");
+/// there is somewhere to fetch it from ([`source`] of the workspace at `root`) and this store
+/// has not fetched it before. Nothing waits for it: the build compiles what it needs from the
+/// start, and once the fetch is in, the store reads it, so what the build asks for after that
+/// is found rather than compiled. A fetch the build did not need is kept for the next one.
+pub(crate) fn fetch_ahead(target: &str, root: &Path) -> anyhow::Result<()> {
+    let Some(from) = source(root)? else { return Ok(()) };
+    let (Some(project), Some(store)) = (project(target), crate::cargo::daemon::store()) else {
+        return Ok(());
+    };
+    std::thread::spawn(move || match fetch(&store, &from, &project) {
+        Ok(()) => {
+            if let Some(store) = ra_jit_store::Store::global() {
+                store.refresh();
+            }
         }
-    }))
+        Err(e) => {
+            let why = format!("{e:#}");
+            let why = why.lines().next().unwrap_or_default();
+            eprintln!("standard library: not fetched from {from}, built here: {why}");
+        }
+    });
+    Ok(())
 }
 
 /// Fetches `project` from `from` into `store` unless the store did, or tried within
@@ -86,17 +127,6 @@ fn fetch(store: &Path, from: &str, project: &str) -> anyhow::Result<()> {
     std::fs::write(&fetched, if done.is_ok() { "fetched" } else { "failed" })?;
     eprintln!("standard library: {} from {from} in {:.1?}", done?, start.elapsed());
     Ok(())
-}
-
-/// Waits for what [`fetch_ahead`] fetches, and has the store read it.
-pub(crate) fn fetched(ahead: Option<JoinHandle<()>>) {
-    let Some(ahead) = ahead else { return };
-    if ahead.join().is_err() {
-        eprintln!("standard library: fetching it panicked");
-    }
-    if let Some(store) = ra_jit_store::Store::global() {
-        store.refresh();
-    }
 }
 
 /// Builds a program that prints a line, whole, with `profile` and the toolchain at `sysroot`,
@@ -185,4 +215,26 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     println!("{project}: {sent} in {:.1?}", start.elapsed());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_workspace_turns_fetching_what_is_public_off_in_its_root_manifest() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-fetch-public-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("member/src")).unwrap();
+        let write = |text: &str| std::fs::write(dir.join("Cargo.toml"), text).unwrap();
+        std::fs::write(dir.join("member/Cargo.toml"), "[package]\nname = \"m\"\n").unwrap();
+        write("[workspace]\nmembers = [\"member\"]\n");
+        assert!(fetch_public(&dir.join("member")).unwrap());
+        write("[workspace]\n[workspace.metadata.blaze]\nfetch-public = false\n");
+        assert!(!fetch_public(&dir.join("member")).unwrap());
+        assert!(!fetch_public(&dir.join("member/Cargo.toml")).unwrap());
+        assert!(!fetch_public(&dir).unwrap());
+        write("[workspace]\n[workspace.metadata.blaze]\nfetch-public = \"no\"\n");
+        assert!(fetch_public(&dir).is_err());
+        _ = std::fs::remove_dir_all(&dir);
+    }
 }

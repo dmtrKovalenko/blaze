@@ -11638,27 +11638,12 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 bytes[..memory.len()].copy_from_slice(memory);
                 Ok(Some(u128::from_le_bytes(bytes)))
             }
-            OperandKind::Copy(place) | OperandKind::Move(place)
-                if place.projection.as_slice().is_empty() =>
-            {
-                let Some(body) = self.body else { return Ok(None) };
-                let mut assigned = body.basic_blocks.iter().flat_map(|(_, block)| {
-                    block.statements.iter().filter_map(|it| match &it.kind {
-                        StatementKind::Assign(to, rvalue) if to.local == place.local => {
-                            Some((to, rvalue))
-                        }
-                        _ => None,
-                    })
-                });
-                let (Some((to, rvalue)), None) = (assigned.next(), assigned.next()) else {
+            OperandKind::Copy(_) | OperandKind::Move(_) => {
+                let Some(Rvalue::Use(from) | Rvalue::Cast(CastKind::IntToInt, from, _)) =
+                    self.assigned_once(operand)
+                else {
                     return Ok(None);
                 };
-                let (Rvalue::Use(from) | Rvalue::Cast(CastKind::IntToInt, from, _)) = rvalue else {
-                    return Ok(None);
-                };
-                if to != place {
-                    return Ok(None);
-                }
                 let from_ty = self.operand_ty(from)?;
                 let Some(value) = self.immediate(from)? else { return Ok(None) };
                 // An `as` to a wider type extends by the sign of the narrower.
@@ -11670,6 +11655,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 Ok(Some(value & mask))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// What the local `operand` reads is assigned, where the body assigns it once and whole.
+    fn assigned_once(&self, operand: &Operand) -> Option<&'db Rvalue> {
+        let (OperandKind::Copy(place) | OperandKind::Move(place)) = &operand.kind else {
+            return None;
+        };
+        if !place.projection.as_slice().is_empty() {
+            return None;
+        }
+        let mut assigned = self.body?.basic_blocks.iter().flat_map(|(_, block)| {
+            block.statements.iter().filter_map(|it| match &it.kind {
+                StatementKind::Assign(to, rvalue) if to.local == place.local => Some((to, rvalue)),
+                _ => None,
+            })
+        });
+        match (assigned.next(), assigned.next()) {
+            (Some((to, rvalue)), None) if to == place => Some(rvalue),
+            _ => None,
         }
     }
 
@@ -16626,11 +16631,80 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         dst: Value,
         dst_ty: Ty<'db>,
     ) -> Result<()> {
+        let mut args: Vec<&Operand> = args.iter().collect();
+        let mut with_immediate = None;
+        if let Some(immediate) = &lowered.immediate {
+            if immediate.arg >= args.len() {
+                unsupported!("`{name}` with {} arguments", args.len());
+            }
+            let arg = args.remove(immediate.arg);
+            let value = match immediate.splat {
+                Some(lane) => self.splat_immediate(arg, lane)?,
+                None => self.immediate(arg)?,
+            };
+            let range = &immediate.range;
+            let Some(value) =
+                value.and_then(|it| u32::try_from(it).ok()).filter(|it| range.contains(it))
+            else {
+                unsupported!(
+                    "`{name}` with an immediate that is not a constant of {}..={}",
+                    range.start(),
+                    range.end()
+                );
+            };
+            let text = lowered.text.replace("{imm}", &value.to_string());
+            with_immediate = Some(neon::Lowered { text, ..lowered.clone() });
+        }
         let args = args
-            .iter()
+            .into_iter()
             .map(|arg| Ok((self.operand(arg)?.0, self.operand_ty(arg)?)))
             .collect::<Result<Vec<_>>>()?;
-        self.neon_call(name, lowered, &args, dst, dst_ty)
+        self.neon_call(name, with_immediate.as_ref().unwrap_or(lowered), &args, dst, dst_ty)
+    }
+
+    /// The lane each lane of a constant vector operand is, as an immediate of lanes of
+    /// `lane` bytes: `core::arch` passes a shift so (`const { int8x8_t([N as i8; 8]) }`).
+    /// It comes as a constant, or a local assigned the vector (`int8x8_t(lanes)`) of an array
+    /// of the lane repeated (`[N as i8; 8]`).
+    fn splat_immediate(&mut self, operand: &Operand, lane: u32) -> Result<Option<u128>> {
+        let memory = match &operand.kind {
+            OperandKind::Allocation { allocation } => allocation.as_ref().memory.to_vec(),
+            OperandKind::Constant { konst, ty } => match konst.as_ref().kind() {
+                ConstKind::Value(value) => self.valtree_blob(ty.as_ref(), value.value)?.bytes,
+                ConstKind::Unevaluated(named) => self.eval_const(named)?.memory.to_vec(),
+                _ => return Ok(None),
+            },
+            OperandKind::Copy(_) | OperandKind::Move(_) => {
+                return match self.assigned_once(operand) {
+                    Some(Rvalue::Use(from)) => self.splat_immediate(from, lane),
+                    Some(Rvalue::Aggregate(AggregateKind::Adt(..), fields))
+                        if fields.len() == 1 =>
+                    {
+                        self.splat_immediate(&fields[0], lane)
+                    }
+                    Some(Rvalue::Repeat(from, _)) => {
+                        let ty = self.operand_ty(from)?;
+                        if self.layout(ty)?.size.bytes() != u64::from(lane) {
+                            return Ok(None);
+                        }
+                        self.immediate(from)
+                    }
+                    _ => Ok(None),
+                };
+            }
+            _ => return Ok(None),
+        };
+        let ty = self.operand_ty(operand)?;
+        let size = self.layout(ty)?.size.bytes_usize();
+        let Some(memory) = memory.get(..size) else { return Ok(None) };
+        let mut lanes = memory.chunks_exact(lane as usize);
+        let Some(first) = lanes.next() else { return Ok(None) };
+        if !lanes.remainder().is_empty() || lanes.any(|it| it != first) {
+            return Ok(None);
+        }
+        let mut bytes = [0; 16];
+        bytes[..first.len()].copy_from_slice(first);
+        Ok(Some(u128::from_le_bytes(bytes)))
     }
 
     /// The instruction LLVM selects for this body when it is one of `core::arch`'s NEON fused

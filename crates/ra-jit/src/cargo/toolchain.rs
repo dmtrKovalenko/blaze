@@ -229,14 +229,17 @@ fn note_once(version: &str, named: &str) {
 }
 
 /// What a build that failed says after its errors: which toolchain built it, when it was not
-/// the project's own, since the failure may be what one has and the other has not.
+/// the project's own, since the failure may be what one has and the other has not. It may as
+/// well be blaze's own error (its checker reporting what rustc accepts), which only rustc of
+/// blaze's release tells apart, so the note names that rather than blame the difference.
 pub(crate) fn failed_note() -> Option<String> {
     let (version, named) = IN_PLACE_OF.get()?;
+    let ours = OURS.trim();
     Some(format!(
-        "blaze built this with its own toolchain, {} (Rust {}), not {version}, {named}; an error \
-         {version} would not give comes from that difference",
+        "blaze built this with its own toolchain, {} (Rust {ours}), not {version}, {named}; an \
+         error {version} would not give may come from that difference, or be blaze's own if \
+         `cargo +{ours} check` gives none either",
         name(),
-        OURS.trim()
     ))
 }
 

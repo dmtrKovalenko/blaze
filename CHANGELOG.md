@@ -1056,6 +1056,14 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
+- `Self::Variant` in a pattern of an `impl` whose `Self` type is an alias or projection to an
+  enum (`impl Deserialize<E, D> for <E as Archive>::Archived`, as `#[derive(rkyv::Deserialize)]`
+  writes) resolves the variant instead of failing MIR lowering with `unresolved variant`.
+- A closure that captures nothing, coerced to `fn` and borrowed as part of a constant, is
+  promoted as rustc promotes it: minijinja's `type_erase!` vtable, so `tract-linalg`'s build
+  script runs. blaze lowered it as a temporary of the frame, so the reference outlived it: the
+  borrow checker said E0515, and without it the call through the table jumped to 0.
+  `harness/breakers` has the case (`promoted_closure_table`).
 - A proc-macro server that dies or fails an expansion fails the build with what it said, the
   macro and its library (`ra_jit_expand::server_failed`), at the end of the cold build and on
   every build after. Before, the build went on without the expansion and failed far from it:

@@ -37312,6 +37312,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -37343,6 +37344,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -37406,6 +37408,10 @@
        "unit": "pulley-interpreter@49.0.2 lib pulley_interpreter build"
       },
       {
+       "name": "rayon",
+       "unit": "rayon@1.12.0 lib rayon build"
+      },
+      {
        "name": "rustix",
        "unit": "rustix@1.1.4 lib rustix build"
       },
@@ -37462,6 +37468,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -58951,6 +58958,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -58982,6 +58990,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -59045,6 +59054,10 @@
        "unit": "pulley-interpreter@49.0.2 lib pulley_interpreter build"
       },
       {
+       "name": "rayon",
+       "unit": "rayon@1.12.0 lib rayon build"
+      },
+      {
        "name": "rustix",
        "unit": "rustix@1.1.4 lib rustix build"
       },
@@ -59101,6 +59114,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -80736,6 +80750,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -80767,6 +80782,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -80830,6 +80846,10 @@
        "unit": "pulley-interpreter@49.0.2 lib pulley_interpreter build"
       },
       {
+       "name": "rayon",
+       "unit": "rayon@1.12.0 lib rayon build"
+      },
+      {
        "name": "rustix",
        "unit": "rustix@1.1.4 lib rustix build"
       },
@@ -80886,6 +80906,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -102402,6 +102423,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -102433,6 +102455,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"
@@ -102496,6 +102519,10 @@
        "unit": "pulley-interpreter@49.0.2 lib pulley_interpreter build"
       },
       {
+       "name": "rayon",
+       "unit": "rayon@1.12.0 lib rayon build"
+      },
+      {
        "name": "rustix",
        "unit": "rustix@1.1.4 lib rustix build"
       },
@@ -102552,6 +102579,7 @@
      "features": [
       "cranelift",
       "once_cell",
+      "parallel-compilation",
       "runtime",
       "std",
       "wasmtime-jit-icache-coherence"

@@ -2487,13 +2487,15 @@ impl<'db> InferenceContext<'db> {
                 while let Some(current_segment) = remaining_segments.first() {
                     // If we can resolve to an enum variant, it takes priority over associated type
                     // of the same name.
-                    if let TyKind::Adt(adt_def, _) = ty.kind()
+                    let ty_resolved =
+                        path_ctx.expect_table().try_structurally_resolve_type(node.into(), ty);
+                    if let TyKind::Adt(adt_def, _) = ty_resolved.kind()
                         && let AdtId::EnumId(id) = adt_def.def_id()
                     {
                         let enum_data = id.enum_variants(self.db);
                         if let Some(variant) = enum_data.variant(current_segment.name) {
                             return if remaining_segments.len() == 1 {
-                                (ty, Some(variant.into()))
+                                (ty_resolved, Some(variant.into()))
                             } else {
                                 // We still have unresolved paths, but enum variants never have
                                 // associated types!
@@ -2523,7 +2525,7 @@ impl<'db> InferenceContext<'db> {
                     remaining_segments = remaining_segments.skip(1);
                 }
                 drop(ctx);
-
+                let ty = self.table.try_structurally_resolve_type(node.into(), ty);
                 let variant = ty.as_adt().and_then(|(id, _)| match id {
                     AdtId::StructId(s) => Some(VariantId::StructId(s)),
                     AdtId::UnionId(u) => Some(VariantId::UnionId(u)),
@@ -2548,7 +2550,7 @@ impl<'db> InferenceContext<'db> {
                 let (mut ty, _) =
                     path_ctx.lower_partly_resolved_path(resolution, true, node.into());
                 ty = ctx.expect_table().process_user_written_ty(ty);
-
+                ty = ctx.expect_table().try_structurally_resolve_type(node.into(), ty);
                 if let Some(segment) = remaining_segments.get(1)
                     && let Some((AdtId::EnumId(id), _)) = ty.as_adt()
                 {

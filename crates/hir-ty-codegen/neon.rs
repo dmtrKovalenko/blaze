@@ -8,16 +8,43 @@
 //! where its operands are: `v1` up from the first argument, `x1` up for a pointer, the result
 //! left in `v0` (and `v1` up for a tuple of vectors).
 
+use std::ops::RangeInclusive;
+
 /// An intrinsic as instructions on the registers [`asm::neon_function`](super::asm) loads.
+#[derive(Clone)]
 pub(super) struct Lowered {
     /// The target features, as Rust names them, the instructions need of the assembler.
     pub(super) features: Vec<&'static str>,
     pub(super) text: String,
     /// The bytes each argument has in its register, `None` for a pointer: argument `i` is
-    /// read into `v{i+1}` (`x{i+1}` for a pointer).
+    /// read into `v{i+1}` (`x{i+1}` for a pointer), counted without the immediate.
     pub(super) args: Vec<Option<u32>>,
     /// The bytes of each result, from `v0` up; none for an intrinsic that only stores.
     pub(super) results: Vec<u32>,
+    pub(super) immediate: Option<Immediate>,
+}
+
+/// The argument an instruction takes as an immediate, which the text names `{imm}`: a
+/// constant `core::arch` passes, which LLVM requires to be in `range`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct Immediate {
+    /// Which argument it is, of all the intrinsic's.
+    pub(super) arg: usize,
+    pub(super) range: RangeInclusive<u32>,
+    /// The bytes of each lane of the vector it comes splat into (`sqshlu`'s shift), or
+    /// `None` for an integer.
+    pub(super) splat: Option<u32>,
+}
+
+impl Immediate {
+    fn of(arg: usize, range: RangeInclusive<u32>) -> Immediate {
+        Immediate { arg, range, splat: None }
+    }
+}
+
+/// `lowered`, which names `immediate` `{imm}`.
+fn taking(lowered: Option<Lowered>, immediate: Immediate) -> Option<Lowered> {
+    Some(Lowered { immediate: Some(immediate), ..lowered? })
 }
 
 /// The values of an intrinsic's signature as its name says them: `v8i8`, `v1f64`, `i32`.
@@ -242,6 +269,7 @@ fn instruction(
         text,
         args: args.into_iter().map(|it| Some(it.bytes())).collect(),
         results: results.into_iter().map(Lanes::bytes).collect(),
+        immediate: None,
     })
 }
 
@@ -322,6 +350,42 @@ fn neon(op: &str, types: &[Lanes]) -> Option<Lowered> {
         // To single precision, rounded to odd.
         ("fcvtxn", &[r, a]) if r.float && a.float && r.count == a.count && a.bits == 64 => {
             instruction(&[], format!("fcvtxn {}, {}", r.reg(0), a.reg(1)), [a], [r])
+        }
+        // Between floats and fixed-point integers of `#imm` fraction bits; to an integer
+        // rounded toward zero, saturated, a NaN 0. A half and an integer of 32 or 64 bits
+        // are converted in registers of halves, as LLVM selects them: of the integer's low 16
+        // bits, to a result whose bits above 16 are 0.
+        ("vcvtfxs2fp" | "vcvtfxu2fp" | "vcvtfp2fxs" | "vcvtfp2fxu", &[r, a])
+            if r.float != a.float && r.count == a.count && r.is_scalar_or_register() =>
+        {
+            let mnemonic = match op {
+                "vcvtfxs2fp" => "scvtf",
+                "vcvtfxu2fp" => "ucvtf",
+                "vcvtfp2fxs" => "fcvtzs",
+                _ => "fcvtzu",
+            };
+            let (float, int) = if r.float { (r, a) } else { (a, r) };
+            let text = if r.bits == a.bits {
+                format!("{mnemonic} {}, {}, #{{imm}}", r.reg(0), a.reg(1))
+            } else if float == HALF && matches!(int.bits, 32 | 64) {
+                format!("{mnemonic} h0, h1, #{{imm}}")
+            } else {
+                return None;
+            };
+            taking(instruction(&[], text, [a], [r]), Immediate::of(1, 1..=float.bits))
+        }
+        // The second operand shifted left by `#imm` into the first, which keeps the bits
+        // below the shift.
+        ("vsli", &[t]) if t.is_int() && t.is_scalar_or_register() => {
+            let text = format!("{ACCUMULATE}sli {}, {}, #{{imm}}", t.reg(0), t.reg(2));
+            taking(instruction(&[], text, [t, t], [t]), Immediate::of(2, 0..=t.bits - 1))
+        }
+        // Signed lanes shifted left by `#imm` to unsigned ones, saturated. `core::arch`
+        // passes the shift as a vector each lane of which is it.
+        ("sqshlu", &[t]) if t.is_int() && t.is_scalar_or_register() => {
+            let text = format!("sqshlu {}, {}, #{{imm}}", t.reg(0), t.reg(1));
+            let shift = Immediate { splat: Some(t.bits / 8), ..Immediate::of(1, 0..=t.bits - 1) };
+            taking(instruction(&[], text, [t], [t]), shift)
         }
         // JavaScript's conversion of a double to a 32-bit integer, modulo 2^32.
         ("fjcvtzs", &[]) => {
@@ -404,6 +468,12 @@ fn neon(op: &str, types: &[Lanes]) -> Option<Lowered> {
             let op = &op["scalar.".len()..];
             instruction(&[], format!("{op} {}, {}", r.reg(0), a.reg(1)), [a], [r])
         }
+        // Shifted right by `#imm`, rounded, into lanes of half the width.
+        ("rshrn", &[r]) if r.is_int() && r.bytes() == 8 => {
+            let a = r.with_bits(2 * r.bits);
+            let text = format!("rshrn {}, {}, #{{imm}}", r.reg(0), a.reg(1));
+            taking(instruction(&[], text, [a], [r]), Immediate::of(1, 1..=r.bits))
+        }
         ("raddhn" | "rsubhn", &[r]) if r.is_int() && r.bytes() == 8 => {
             let a = r.with_bits(2 * r.bits);
             let text = format!("{op} {}, {}, {}", r.reg(0), a.reg(1), a.reg(2));
@@ -417,7 +487,13 @@ fn neon(op: &str, types: &[Lanes]) -> Option<Lowered> {
         }
         ("pmull64", &[]) => {
             let text = "pmull v0.1q, v1.1d, v2.1d".to_owned();
-            Some(Lowered { features: vec!["aes"], text, args: vec![Some(8); 2], results: vec![16] })
+            Some(Lowered {
+                features: vec!["aes"],
+                text,
+                args: vec![Some(8); 2],
+                results: vec![16],
+                immediate: None,
+            })
         }
         // Twice the product of two 32-bit integers in 64 bits, saturated.
         ("sqdmulls.scalar", &[]) => {
@@ -458,7 +534,33 @@ fn neon(op: &str, types: &[Lanes]) -> Option<Lowered> {
                 text,
                 args: vec![None],
                 results: vec![t.bytes(); n as usize],
+                immediate: None,
             })
+        }
+        // Lane `#imm` of each of `n` vectors loaded from consecutive elements, the others
+        // those the vectors come in with (from `v1` up, out of `v0` up).
+        ("ld2lane" | "ld3lane" | "ld4lane", &[t]) if t.is_register() => {
+            let n = u32::from(op.as_bytes()[2] - b'0');
+            let moves: String = (0..n).map(|k| format!("mov v{k}.16b, v{}.16b\n", k + 1)).collect();
+            let size = size_letter(t.bits);
+            let lanes: Vec<String> = (0..n).map(|k| format!("v{k}.{size}")).collect();
+            let text = format!("{moves}ld{n} {{{}}}[{{imm}}], [x{}]", lanes.join(", "), n + 1);
+            let mut args = vec![Some(t.bytes()); n as usize];
+            args.push(None);
+            let results = vec![t.bytes(); n as usize];
+            let lowered = Lowered { features: Vec::new(), text, args, results, immediate: None };
+            taking(Some(lowered), Immediate::of(n as usize, 0..=t.count - 1))
+        }
+        ("st2lane" | "st3lane" | "st4lane", &[t]) if t.is_register() => {
+            let n = u32::from(op.as_bytes()[2] - b'0');
+            let size = size_letter(t.bits);
+            let lanes: Vec<String> = (1..=n).map(|k| format!("v{k}.{size}")).collect();
+            let text = format!("st{n} {{{}}}[{{imm}}], [x{}]", lanes.join(", "), n + 1);
+            let mut args = vec![Some(t.bytes()); n as usize];
+            args.push(None);
+            let lowered =
+                Lowered { features: Vec::new(), text, args, results: Vec::new(), immediate: None };
+            taking(Some(lowered), Immediate::of(n as usize, 0..=t.count - 1))
         }
         // Stores of `n` vectors, the address last: consecutive (`st1x2`) or interleaved.
         ("st1x2" | "st1x3" | "st1x4" | "st2" | "st3" | "st4", &[t]) if t.is_register() => {
@@ -470,7 +572,7 @@ fn neon(op: &str, types: &[Lanes]) -> Option<Lowered> {
             let text = format!("{mnemonic} {}, [x{}]", list(t, 1, n), n + 1);
             let mut args = vec![Some(t.bytes()); n as usize];
             args.push(None);
-            Some(Lowered { features: Vec::new(), text, args, results: Vec::new() })
+            Some(Lowered { features: Vec::new(), text, args, results: Vec::new(), immediate: None })
         }
         _ => None,
     }
@@ -488,6 +590,16 @@ fn crypto(op: &str, types: &[Lanes]) -> Option<Lowered> {
         }
         ("rax1", &[]) => {
             instruction(&["sha3"], "rax1 v0.2d, v1.2d, v2.2d".to_owned(), [vector; 2], [vector])
+        }
+        // The two xored, each 64-bit lane rotated right by `#imm`.
+        ("xar", &[]) => {
+            let text = "xar v0.2d, v1.2d, v2.2d, #{imm}".to_owned();
+            taking(instruction(&["sha3"], text, [vector; 2], [vector]), Immediate::of(2, 0..=63))
+        }
+        // A round of SM3 of the state, the next words and word `#imm` of the third operand.
+        ("sm3tt1a" | "sm3tt1b" | "sm3tt2a" | "sm3tt2b", &[]) => {
+            let text = format!("{ACCUMULATE}{op} v0.4s, v2.4s, v3.s[{{imm}}]");
+            taking(instruction(&["sm4"], text, [vector; 3], [vector]), Immediate::of(3, 0..=3))
         }
         // Four rounds of SHA-1 of the hash, its fifth word and the next four words.
         ("sha1c" | "sha1m" | "sha1p", &[]) => {
@@ -682,6 +794,7 @@ impl Fused {
             text,
             args: vec![bytes(t), bytes(t), Some(c_bytes)],
             results: vec![t.bytes()],
+            immediate: None,
         };
         finish(lowered, &[t])
     }
@@ -919,5 +1032,59 @@ aarch64.neon.facgt.i32.f16: facgt h0, h1, h2 [\"neon\", \"fp16\"]
         for (name, lane) in others {
             assert!(!splats_c(name, lane), "{name} {lane:?}");
         }
+    }
+
+    /// As `rustc --emit asm` has each (aarch64-unknown-linux-gnu, nightly-2026-10-27): the
+    /// instruction, its immediate the argument it is of all the intrinsic's, in the range
+    /// LLVM selects.
+    #[test]
+    fn an_immediate_is_named_in_the_text_and_not_loaded() {
+        let cases = [
+            ("aarch64.neon.vcvtfxs2fp.v4f32.v4i32", "scvtf v0.4s, v1.4s, #{imm}", 1, 1..=32),
+            ("aarch64.neon.vcvtfp2fxu.i64.f64", "fcvtzu d0, d1, #{imm}", 1, 1..=64),
+            ("aarch64.neon.vcvtfxs2fp.f16.i32", "scvtf h0, h1, #{imm}", 1, 1..=16),
+            ("aarch64.neon.vcvtfp2fxs.i64.f16", "fcvtzs h0, h1, #{imm}", 1, 1..=16),
+            ("aarch64.neon.vcvtfp2fxs.v8i16.v8f16", "fcvtzs v0.8h, v1.8h, #{imm}", 1, 1..=16),
+            ("aarch64.neon.vsli.v1i64", "mov v0.16b, v1.16b; sli d0, d2, #{imm}", 2, 0..=63),
+            ("aarch64.neon.rshrn.v8i8", "rshrn v0.8b, v1.8h, #{imm}", 1, 1..=8),
+            ("aarch64.neon.sqshlu.v4i32", "sqshlu v0.4s, v1.4s, #{imm}", 1, 0..=31),
+            ("aarch64.crypto.xar", "xar v0.2d, v1.2d, v2.2d, #{imm}", 2, 0..=63),
+            (
+                "aarch64.crypto.sm3tt2b",
+                "mov v0.16b, v1.16b; sm3tt2b v0.4s, v2.4s, v3.s[{imm}]",
+                3,
+                0..=3,
+            ),
+            (
+                "aarch64.neon.ld3lane.v8i16.p0",
+                "mov v0.16b, v1.16b; mov v1.16b, v2.16b; mov v2.16b, v3.16b; \
+                 ld3 {v0.h, v1.h, v2.h}[{imm}], [x4]",
+                3,
+                0..=7,
+            ),
+            ("aarch64.neon.st2lane.v1f64.p0", "st2 {v1.d, v2.d}[{imm}], [x3]", 2, 0..=0),
+        ];
+        for (name, text, arg, range) in cases {
+            let lowered = lower(name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(lowered.text.replace('\n', "; "), text, "{name}");
+            let immediate = lowered.immediate.unwrap();
+            assert_eq!((immediate.arg, immediate.range), (arg, range), "{name}");
+        }
+        let sqshlu = lower("aarch64.neon.sqshlu.v4i32").unwrap();
+        assert_eq!(sqshlu.immediate.unwrap().splat, Some(4));
+        assert_eq!(sqshlu.args, [Some(16)]);
+        let half = lower("aarch64.neon.vcvtfxs2fp.f16.i32").unwrap();
+        assert_eq!(
+            (half.args, half.results, half.features),
+            (vec![Some(4)], vec![2], vec!["neon", "fp16"])
+        );
+        let load = lower("aarch64.neon.ld3lane.v8i16.p0").unwrap();
+        assert_eq!(
+            (load.args, load.results),
+            (vec![Some(16), Some(16), Some(16), None], vec![16, 16, 16])
+        );
+        assert_eq!(lower("aarch64.crypto.xar").unwrap().features, ["neon", "sha3"]);
+        assert!(lower("aarch64.neon.vcvtfxs2fp.v2f64.v2i32").is_none());
+        assert!(lower("aarch64.neon.vsli.v4f32").is_none());
     }
 }

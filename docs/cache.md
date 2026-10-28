@@ -257,12 +257,24 @@ or the build), so a cache that stopped working is not a slowdown nobody sees.
 A build with nothing of rustc's (a build script, `--exe` with every crate ra-jit's) starts
 from the standard library compiled by ra-jit, which takes seconds on many cores. A release
 ships it: `ra-jit std REMOTE TOOLCHAIN` builds it for the binary and the toolchain at that sysroot and pushes it as
-the project `std-<target>-<build>`, and the release attaches that remote's files. Before such a
-build first reads the store it fetches the project once per store, from:
+the project `std-<target>-<build>`, and the release attaches that remote's files. Such a
+build fetches the project once per store, from:
 
 | Variable | Meaning | Default |
 |---|---|---|
 | `BLAZE_STD_FROM` | the remote to fetch the standard library from, or `off` | the binary's own release, when it is one; otherwise none |
+
+The build never waits for it. It compiles from the start, and the fetch runs beside it; once
+the fetch is in, the store reads it, and what the build asks for after that is found rather
+than compiled. A fetch that comes in after the build is kept for the next one. Once a store
+holds the project it is not asked for again (`fetched-<project>` in the store's directory),
+so a warm machine with no network builds as fast as with one. A connection that is not made
+within 2 seconds fails the fetch, which says so in one line and is tried again an hour later.
+
+What is public is fetched by default. A workspace turns that off in its root manifest:
+
+    [workspace.metadata.blaze]
+    fetch-public = false   # no standard library from the release; RA_JIT_STD_FROM still names one
 
 A build of another binary (crates.io, nix, your own) finds nothing for its `<build>` and
 compiles the library itself, once per store.

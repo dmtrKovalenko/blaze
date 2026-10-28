@@ -27,6 +27,19 @@ use super::transfer::{Object, Refused, TooLong, Traffic, Version};
 /// How many redirects one request follows.
 const REDIRECTS: usize = 5;
 
+/// How long a connection may take to be made. A network that is down or drops what is sent
+/// is told from a slow answer this soon, not after the patience of a request.
+pub(crate) const CONNECT_WITHIN: Duration = Duration::from_secs(2);
+
+/// The connector of a client to an HTTP(S) remote: [`CONNECT_WITHIN`], or `patience` when
+/// that is shorter.
+pub(crate) fn connector(patience: Duration) -> HttpConnector {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_connect_timeout(Some(CONNECT_WITHIN.min(patience)));
+    http
+}
+
 pub(crate) struct Https {
     client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     /// With no `/` at its end.
@@ -44,7 +57,7 @@ impl Https {
         let roots = HttpsConnectorBuilder::new()
             .with_native_roots()
             .context("the machine's certificates cannot be read")?;
-        let connector = roots.https_or_http().enable_http1().build();
+        let connector = roots.https_or_http().enable_http1().wrap_connector(connector(patience));
         let client = Client::builder(TokioExecutor::new()).build(connector);
         let base = spec.as_str().trim_end_matches('/').to_owned();
         Ok(Https { client, base, patience, traffic })
