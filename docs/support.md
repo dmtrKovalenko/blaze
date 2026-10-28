@@ -8,7 +8,7 @@ written against, under both backends (see [results.md](results.md)). [platforms.
 nobody recorded running it; it does not mean it is known to fail.
 
 "Yes" has a narrow meaning: the named harness passes there. It does not mean your project
-will build without fallbacks.
+will build: what blaze cannot build fails the build with the reason.
 
 ## Toolchain
 
@@ -32,7 +32,7 @@ by the move.
 names ([cargo.md](cargo.md)). A rustc counts as the pinned one only when its whole
 `rustc -V` line matches, since every nightly of a release says `1.101.0`. A project that
 needs its own toolchain fails with rustc's error and a note naming both.
-`RA_JIT_OTHER_TOOLCHAIN=1` (or `BLAZE_OTHER_TOOLCHAIN=1`) builds with the project's toolchain
+`BLAZE_OTHER_TOOLCHAIN=1` (or its old name, `RA_JIT_OTHER_TOOLCHAIN=1`) builds with the project's toolchain
 instead, for a project pinned to a nightly near ours. Nothing checks that the other rustc
 lays out, mangles and passes values as the pinned nightly does.
 
@@ -111,8 +111,8 @@ harness below.
 ## Backends
 
 Cranelift is the default and needs nothing installed. LLVM is in every released binary (LLVM 23,
-linked statically); a ra-jit built from source needs `--features llvm`. It is selected with `RA_JIT_BACKEND=llvm`. Everything that was
-measured under LLVM used `RA_JIT_OPT=2 RA_JIT_EMIT=fast`. Other levels are accepted and are
+linked statically); a ra-jit built from source needs `--features llvm`. It is selected with `BLAZE_BACKEND=llvm`. Everything that was
+measured under LLVM used `BLAZE_OPT=2 BLAZE_EMIT=fast`. Other levels are accepted and are
 not covered by the gate.
 
 Neither backend inlines one function into another in a build, so LLVM at `-O2` is not
@@ -121,8 +121,8 @@ LLVM bug is worked around by turning off a vectoriser pass (finding 6 in FUZZ.md
 
 ## MIR optimizations
 
-`RA_JIT_MIR_OPT=1` runs the passes rustc runs on a debug build's MIR before code is generated
-from it, `RA_JIT_MIR_OPT=2` the ones it runs above `-Copt-level=0` that are ported; 0, the
+`BLAZE_MIR_OPT=1` runs the passes rustc runs on a debug build's MIR before code is generated
+from it, `BLAZE_MIR_OPT=2` the ones it runs above `-Copt-level=0` that are ported; 0, the
 default, runs none ([mir-passes.md](../vendor/rust-analyzer/docs/mir-passes.md#optimizations),
 [research/mir-gap.md](research/mir-gap.md)). Coroutine bodies are never optimized.
 
@@ -139,7 +139,7 @@ default, runs none ([mir-passes.md](../vendor/rust-analyzer/docs/mir-passes.md#o
 A program that takes edits with `ra-jit-live` has its hot functions compiled again while it
 runs, at LLVM `-O3` with what they call built in and then with a profile, and patched in
 ([tiers.md](tiers.md)). macOS arm64 with `--features llvm` only, like live edits; on by
-default there, off with `RA_JIT_TIER=off`.
+default there, off with `BLAZE_TIER=off`.
 
 | | macOS arm64 | elsewhere |
 |---|---|---|
@@ -149,7 +149,7 @@ default there, off with `RA_JIT_TIER=off`.
 | An edit demotes a tiered function in the same build | yes, `harness/tiers.py` (local) | no |
 | An edit does not wait for a compile at a higher level | yes (local, with LLVM's part stretched to a second) | no |
 | Code no patch can hold stays out, the program is not started over | yes (local, 12 runs of the Life benchmark under one daemon, [tiers.md](tiers.md#code-no-patch-can-hold)) | no |
-| `RA_JIT_TIER=off` changes nothing | yes, `harness/tiers.py` (local) | does not apply |
+| `BLAZE_TIER=off` changes nothing | yes, `harness/tiers.py` (local) | does not apply |
 | Within 10% of a release build | within 6% of a release build that checks overflow as the dev profile does, which is as far as the tiered code may go, and 88% of release, on the Life benchmark under load | no |
 
 ## Debug info
@@ -231,7 +231,7 @@ Borrow-check errors are the main case: ra-jit's borrow checker ([borrowck.md](bo
 finds nothing rustc accepts in rustc's tests or in seven real projects, but it misses about a
 third of the errors rustc gives (67% of rustc's borrow-check tests get rustc's verdict), and
 an edit with one it misses builds and runs. Run `cargo blaze check` or `cargo check` to get
-rustc's verdict. `RA_JIT_BORROWCK_REFUSE=0` stops the daemon refusing borrow-check errors.
+rustc's verdict. `BLAZE_BORROWCK_REFUSE=0` stops the daemon refusing borrow-check errors.
 
 ## Nightly features
 
@@ -261,8 +261,11 @@ native AArch64, where four rows that need an x86-64 host are not run (CI on `513
 [reports/BUILDMODEL.md](reports/BUILDMODEL.md) has the table at 97 cases per backend, of
 which 92 were supported and 5 refused.
 
-`cargo blaze` is narrower. It serves the dev and test profiles and hands the rest to
-cargo, as [cargo.md](cargo.md) lists.
+`cargo blaze` is narrower. Its column was recorded while it still handed builds to cargo. Since
+2026-10-27 it hands none ([#408](https://github.com/indexable-inc/blaze/pull/408),
+[#571](https://github.com/indexable-inc/blaze/pull/571)): what it does not build fails with the
+reason (`refused` in `crates/ra-jit/src/cargo/whole.rs`). A cell that says "cargo" or "handed to
+cargo" now means one of the two, and which is unverified.
 
 | Feature | Daemon (`buildmodel.py`) | `cargo blaze` |
 |---|---|---|
@@ -277,6 +280,7 @@ cargo, as [cargo.md](cargo.md) lists.
 | unit tests, integration tests, examples, benches | supported | served; adding or removing a `#[test]` is cargo's |
 | doctests | supported through `cargo blaze test --doc` (`doctests.py`, 30 crates); documentation behind `cfg(doc)` is not seen | served; an example ra-jit cannot build is left to rustdoc with the reason |
 | features, optional and weak dependencies, feature unification under resolvers 1, 2 and 3 | supported | `--features` served; `--all-features` and `--no-default-features` handed to cargo |
+| `resolver.feature-unification` (`-Zfeature-unification`) | `selected` and `workspace` supported; `package` supported for one package, and refused with a reason for several, which it builds with other features each | as for a build |
 | path, git, registry, renamed, vendored, `[patch]` and `[replace]` dependencies | supported | served |
 | an edit to a path dependency the daemon was not asked to build | refused with a reason | cargo |
 | `RUSTFLAGS` and `[build] rustflags`, including `-C target-cpu` and `target-feature` | supported | handed to cargo when set in the environment; unverified in configuration |

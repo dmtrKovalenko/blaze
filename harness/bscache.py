@@ -5,6 +5,8 @@ what a hermetic sandbox would refuse them.
 usage: bscache.py record [PROJECT...] --ra-jit BIN [--work DIR] [--out DIR] [--jobs N]
        bscache.py report --out DIR
        bscache.py directives [--work DIR] --out DIR
+       bscache.py closure [PROJECT...] --ra-jit BIN --store DIR [--work DIR] [--out DIR] [--jobs N]
+       bscache.py closure-report --out DIR
 
 `record` fetches each project of harness/bench.py at its pinned revision (all of them when none
 is named) and runs the step of a workspace load that builds and runs its build scripts and proc
@@ -30,10 +32,18 @@ would-be denial by package, `<out>/denied.json`:
               closure; a dependency's OUT_DIR (what `links` gives a script by DEP_*) is listed
               apart, as a read a hermetic sandbox allows
 
+`closure` runs the same step with every build script in its closure alone (RA_JIT_SCRIPT_VIEW=on:
+the package, OUT_DIR and the pinned nixpkgs toolchain and libraries in a mount namespace,
+cargo/hermetic), `--keep-going`, against the store `--store` (which must hold the closure, or
+RA_JIT_REMOTE must bring it), and writes per project whether each script ran, came from the
+store (its run's key is of what it is made of), or failed, with its note. Run it twice, the
+second time on another machine whose store pulled the first's, for the hit rate across hosts.
+`closure-report` writes `<out>/closure.md` of them.
+
 `directives` checks what each run below `<work>/target` printed (`run/stdout`) against the rules
 of cargo/directives.rs, and their first, stricter form, into `<out>/directives.md`.
 """
-import collections, concurrent.futures, json, os, re, shutil, subprocess, sys
+import collections, concurrent.futures, json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -444,15 +454,136 @@ def directives(work, out_dir):
     print("\n".join(text))
 
 
+KEPT_LINE = "blaze: a run the store kept, of its closure"
+
+
+def said_by_cargo(stderr, package):
+    """What cargo printed of the failed run of `package`'s build script (`name vX`): its stderr,
+    which the run's directory does not keep when it failed."""
+    start = stderr.find(f"failed to run custom build command for `{package}")
+    if start < 0:
+        return ""
+    block = stderr[start:].split("\n--- stderr\n", 1)
+    rest = block[1] if len(block) == 2 else block[0]
+    ends = [at for at in (rest.find("\nwarning: build failed"), rest.find("\nerror: ")) if at >= 0]
+    return rest[: min(ends)] if ends else rest
+
+
+def in_closure(name, repo, rev, work, ra_jit, jobs, store):
+    """Runs `name`'s compile-time step with every build script in its closure alone
+    (RA_JIT_SCRIPT_VIEW=on), keeping going past a failed script, with `store` as the store: what
+    each script did, from its run directory."""
+    source = os.path.join(work, "src", name)
+    fetch_git(repo, rev, source)
+    target = os.path.join(work, "target", name)
+    shutil.rmtree(target, ignore_errors=True)
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith(("CARGO_", "RUSTC_")) and key != "CARGO_HOME":
+            del env[key]
+    env.update(
+        RUSTC_WRAPPER=os.path.join(os.path.dirname(ra_jit), "ra-jit-rustc"),
+        RA_JIT_ONLY_ASKS="1",
+        RA_JIT_PROC_MACRO_SERVER="0",
+        RA_JIT_SCRIPT_VIEW="on",
+        RA_JIT_STATS="1",
+        RA_JIT_CACHE=store,
+        CARGO_TARGET_DIR=target,
+        CARGO_BUILD_JOBS=str(jobs),
+        CARGO_UNSTABLE_CHECKSUM_FRESHNESS="false",
+        CARGO_HOME=env.get("CARGO_HOME") or os.path.join(work, "cargo-home"),
+        RUST_BACKTRACE="0",
+    )
+    command = ["cargo", "check", "-Zunstable-options", "--compile-time-deps", "--workspace", "--all-targets", "--keep-going"]
+    start = time.monotonic()
+    proc = subprocess.run(command, cwd=source, env=env, capture_output=True, text=True, errors="replace")
+    seconds = time.monotonic() - start
+    # Cargo names a package of the workspace with its path after it.
+    named = re.findall(r"failed to run custom build command for `([^`]+)`", proc.stderr)
+    failed = sorted({re.sub(r" \(.*\)$", "", it) for it in named})
+    scripts = []
+    for dir in run_dirs(target):
+        var = dict(json.load(open(os.path.join(dir, RAN)))["env"])
+        # Cargo keeps a run's output beside its OUT_DIR, or in `run/` there (build-dir layout v2).
+        run = os.path.join(dir, "run") if os.path.isdir(os.path.join(dir, "run")) else dir
+        stdout = os.path.join(run, "stdout" if run != dir else "output")
+        said = open(os.path.join(run, "stderr"), errors="replace").read() if os.path.exists(os.path.join(run, "stderr")) else ""
+        package = f"{var.get('CARGO_PKG_NAME')} v{var.get('CARGO_PKG_VERSION')}"
+        ok = os.path.exists(stdout) and package not in failed
+        notes = [line for line in said.splitlines() if line.startswith(("note: the build script", "error:"))]
+        if not ok:
+            said = said or said_by_cargo(proc.stderr, package)
+            notes = [line for line in said.splitlines() if line.startswith(("note: the build script", "error:"))]
+        scripts.append(dict(package=var.get("CARGO_PKG_NAME"), version=var.get("CARGO_PKG_VERSION"), ok=ok,
+                            kept=KEPT_LINE in said, notes=notes[-3:], tail=[] if ok else said.splitlines()[-12:]))
+    # A script cargo said failed whose run left no directory of ours failed before it ran.
+    ran = {f"{s['package']} v{s['version']}" for s in scripts}
+    for package in failed:
+        if package not in ran:
+            name_, _, version = package.rpartition(" v")
+            said = said_by_cargo(proc.stderr, package)
+            notes = [line for line in said.splitlines() if line.startswith(("note: the build script", "error:"))]
+            scripts.append(dict(package=name_, version=version, ok=False, kept=False, notes=notes[-3:],
+                                tail=said.splitlines()[-12:]))
+    return dict(project=name, rev=rev, status=proc.returncode, seconds=round(seconds, 2), failed=failed,
+                stderr_tail=proc.stderr[-6000:] if proc.returncode else "",
+                scripts=sorted(scripts, key=lambda it: (it["package"] or "", it["version"] or "")))
+
+
+def closure_report(out_dir):
+    """`<out>/closure.md` of the `closure` runs in `<out>`: per project the scripts that ran in
+    their closure, came from the store, failed; each failed package with what it said."""
+    rows, failures = [], {}
+    totals = collections.Counter()
+    for file in sorted(os.listdir(out_dir)):
+        if not file.endswith(".json"):
+            continue
+        project = json.load(open(os.path.join(out_dir, file)))
+        count = collections.Counter(scripts=len(project["scripts"]))
+        for script in project["scripts"]:
+            count["ok"] += script["ok"]
+            count["kept"] += script["kept"]
+            count["failed"] += not script["ok"]
+            if not script["ok"]:
+                entry = failures.setdefault(f"{script['package']} {script['version']}", dict(projects=set(), said=script["notes"] + script["tail"]))
+                entry["projects"].add(project["project"])
+        totals.update(count)
+        rows.append((project["project"], project["status"], project["seconds"], count))
+    lines = ["| project | cargo | seconds | scripts | ok | from the store | failed |", "|---|---|---|---|---|---|---|"]
+    for name, status, seconds, c in rows + [("total", "", "", totals)]:
+        lines.append(f"| {name} | {status} | {seconds} | {c['scripts']} | {c['ok']} | {c['kept']} | {c['failed']} |")
+    lines += ["", "## Scripts that failed in their closure", ""]
+    for package, entry in sorted(failures.items()):
+        lines += [f"### `{package}` ({', '.join(sorted(entry['projects']))})", "", "```", *entry["said"][-10:], "```", ""]
+    open(os.path.join(out_dir, "closure.md"), "w").write("\n".join(lines) + "\n")
+    print("\n".join(lines[: len(rows) + 3]))
+
+
 def main():
     argv = sys.argv[1:]
-    if not argv or argv[0] not in ("record", "report", "directives"):
+    if not argv or argv[0] not in ("record", "report", "directives", "closure", "closure-report"):
         sys.exit(__doc__)
     mode = argv.pop(0)
     out_dir = option(argv, "--out", os.path.join(HERE, "..", "bench", "results", "bscache"))
     os.makedirs(out_dir, exist_ok=True)
     if mode == "report":
         return report(out_dir)
+    if mode == "closure-report":
+        return closure_report(out_dir)
+    if mode == "closure":
+        ra_jit = os.path.abspath(option(argv, "--ra-jit") or sys.exit("--ra-jit BIN"))
+        work = option(argv, "--work", os.path.join(os.environ.get("TMPDIR", "/tmp"), "blaze-bscache"))
+        store = option(argv, "--store") or sys.exit("--store DIR")
+        jobs = int(option(argv, "--jobs", "8"))
+        corpus = projects()
+        for name in argv or list(corpus):
+            repo, rev = corpus[name]
+            result = in_closure(name, repo, rev, work, ra_jit, jobs, store)
+            json.dump(result, open(os.path.join(out_dir, f"{name}.json"), "w"), indent=1)
+            ok = sum(s["ok"] for s in result["scripts"])
+            kept = sum(s["kept"] for s in result["scripts"])
+            print(f"{name}: cargo {result['status']} in {result['seconds']} s, {len(result['scripts'])} scripts, {ok} ok, {kept} from the store, failed {result['failed']}", flush=True)
+        return
     if mode == "directives":
         return directives(option(argv, "--work", os.path.join(os.environ.get("TMPDIR", "/tmp"), "blaze-bscache")), out_dir)
     ra_jit = os.path.abspath(option(argv, "--ra-jit") or sys.exit("--ra-jit BIN"))

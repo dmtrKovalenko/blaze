@@ -23,7 +23,7 @@ loop {
 While the program runs, the daemon also samples where its threads spend their time and
 compiles the functions they are found in again with LLVM, swapping them in as patches like any
 edit. `ra_jit_live::tiers()` says which functions are hot and at which level, for the program to
-show. `RA_JIT_TIER=off` in the program's environment turns it off.
+show. `BLAZE_TIER=off` in the program's environment turns it off.
 
 macOS on Apple silicon and Linux x86-64; elsewhere `Live::start` says so and you still get
 ra-jit's fast builds. MIT or Apache-2.0.

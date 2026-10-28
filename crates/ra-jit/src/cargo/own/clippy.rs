@@ -234,7 +234,7 @@ fn selects(typed: &[String], target: &Target, lib: bool) -> (bool, bool) {
                 names.push(name.to_owned());
             }
         }
-        names.iter().any(|it| *it == target.name)
+        names.contains(&target.name)
     };
     let tests = has("--tests") && target.test;
     let plain = (lib && has("--lib"))

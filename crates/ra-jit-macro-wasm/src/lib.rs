@@ -63,6 +63,9 @@ pub mod exports {
     pub const LIST: &str = "blaze_proc_macro_list";
     /// `(index, attr_ptr, attr_len, ptr, len)`: expands the macro at `index` of the list.
     pub const EXPAND: &str = "blaze_proc_macro_expand";
+    /// The custom section that holds what [`LIST`] gives, for the host to read without
+    /// compiling the module.
+    pub const LIST_SECTION: &str = "blaze_proc_macros";
 }
 
 /// The host's functions the module imports.
@@ -80,6 +83,7 @@ fn engine() -> &'static Engine {
     ENGINE.get_or_init(|| {
         let mut config = Config::new();
         config.cranelift_nan_canonicalization(true);
+        config.parallel_compilation(true);
         Engine::new(&config).expect("Wasmtime's configuration for proc macros")
     })
 }
@@ -543,65 +547,92 @@ pub struct Ran {
 }
 
 impl Wasm {
-    /// The module at `path`, compiled once a process, and its machine code kept in `store`
-    /// under the store's identity of this build and host, which the code is of: unlike the
-    /// module, it is for one host.
+    /// The module at `path`, compiled once a process, and its machine code kept beside it and
+    /// in `store` under [`code_key`], which says the host it is for: unlike the module, the
+    /// code is for one kind of host.
     pub fn at(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<Arc<Wasm>, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let digest = keyed::sha256(&bytes);
-        static COMPILED: Mutex<Option<FxHashMap<[u8; 32], Arc<Wasm>>>> = Mutex::new(None);
-        if let Some(found) = COMPILED.lock().unwrap().get_or_insert_default().get(&digest) {
-            found.keep_code(store);
-            return Ok(found.clone());
-        }
-        let wasm = Arc::new(Wasm::compile(path, digest, &bytes, store)?);
-        COMPILED.lock().unwrap().get_or_insert_default().insert(digest, wasm.clone());
+        let known = Known { digest: keyed::sha256(&bytes), identity: None };
+        Wasm::known(path, known, Some(&bytes), store)
+    }
+
+    /// As [`Wasm::at`], of a module whose digest is known: its bytes are read only if its
+    /// machine code is not beside it.
+    fn known(
+        path: &Path,
+        known: Known,
+        bytes: Option<&[u8]>,
+        store: Option<&ra_jit_store::Store>,
+    ) -> Result<Arc<Wasm>, String> {
+        // A module being compiled (`prepare_soon`) is waited for, not compiled again.
+        type Once = Arc<OnceLock<Result<Arc<Wasm>, String>>>;
+        static COMPILED: Mutex<Option<FxHashMap<[u8; 32], Once>>> = Mutex::new(None);
+        let once = {
+            let mut compiled = COMPILED.lock().unwrap();
+            compiled.get_or_insert_default().entry(known.digest).or_default().clone()
+        };
+        let compiled = once.get_or_init(|| Wasm::compile(path, known, bytes, store).map(Arc::new));
+        let wasm = compiled.clone()?;
+        wasm.keep_code(store);
         Ok(wasm)
     }
 
     fn compile(
         path: &Path,
-        digest: [u8; 32],
-        bytes: &[u8],
+        Known { digest, identity }: Known,
+        given: Option<&[u8]>,
         store: Option<&ra_jit_store::Store>,
     ) -> Result<Wasm, String> {
         let start = Instant::now();
         let failed = |e: wasmtime::Error| format!("{}: {e:#}", path.display());
+        let read = std::cell::OnceCell::new();
+        let bytes = || module_bytes(path, &digest, given, &read);
         let key = code_key(&digest);
-        // SAFETY: what the store has under the key is what `serialize` wrote, checked against
-        // its checksum when read; Wasmtime refuses code of another version or configuration.
-        let kept = store
-            .and_then(|it| it.get(&key))
-            .and_then(|it| unsafe { Module::deserialize(engine(), it) }.ok());
+        let file = code_file(path, &key);
         let stats = std::env::var_os("RA_JIT_STATS").is_some();
-        let was_kept = kept.is_some();
-        let module = match kept {
-            Some(module) => {
-                if stats {
-                    eprintln!(
-                        "ra-jit: a proc-macro module's machine code the store kept: {}",
-                        path.display()
-                    );
+        // SAFETY: the file beside the module and what the store has under the key are what
+        // `serialize` wrote for this key, the store's checked against its checksum when read;
+        // Wasmtime refuses code of another version, configuration or CPU.
+        let beside = unsafe { Module::deserialize_file(engine(), &file) }.ok();
+        let (module, was_kept) = match beside {
+            // Written beside it by the process that compiled it, which kept it in the store.
+            Some(module) => (module, true),
+            None => match store
+                .and_then(|it| it.get_lasting(&key))
+                .and_then(|it| unsafe { Module::deserialize(engine(), &it) }.ok().map(|m| (m, it)))
+            {
+                Some((module, code)) => {
+                    write_whole(&file, &code);
+                    (module, true)
                 }
-                module
-            }
-            None => {
-                if stats {
-                    let store = if store.is_some() { "" } else { " (no store yet)" };
-                    eprintln!(
-                        "ra-jit: Cranelift compiles the proc-macro module {}{store}",
-                        path.display()
-                    );
+                None => {
+                    let module = Module::new(engine(), bytes()?).map_err(failed)?;
+                    if stats {
+                        eprintln!(
+                            "blaze: Cranelift compiled the proc-macro module {} in {:.1?}",
+                            path.display(),
+                            start.elapsed()
+                        );
+                    }
+                    let code = module.serialize().map_err(failed)?;
+                    write_whole(&file, &code);
+                    if let Some(store) = store {
+                        store.insert_lasting(&key, &code);
+                        store.flush();
+                    }
+                    (module, store.is_some())
                 }
-                Module::new(engine(), bytes).map_err(failed)?
-            }
+            },
         };
         let mut linker = Linker::new(engine());
         wasi::add(&mut linker).map_err(failed)?;
         add_host(&mut linker).map_err(failed)?;
         wasi::rest(&mut linker, &module).map_err(failed)?;
         let pre = linker.instantiate_pre(&module).map_err(failed)?;
-        let identity = made_of(path, bytes).unwrap_or(digest);
+        let identity = match identity {
+            Some(identity) => identity,
+            None => made_of(path, bytes()?).unwrap_or(digest),
+        };
         let compiled_in = start.elapsed();
         let kept = was_kept.into();
         let wasm = Wasm { path: path.to_owned(), digest, identity, pre, compiled_in, kept };
@@ -618,10 +649,10 @@ impl Wasm {
             return;
         }
         if let Ok(code) = self.pre.module().serialize() {
-            store.insert(&code_key(&self.digest), &code);
+            store.insert_lasting(&code_key(&self.digest), &code);
             store.flush();
             if std::env::var_os("RA_JIT_STATS").is_some() {
-                eprintln!("ra-jit: the store keeps the machine code of {}", self.path.display());
+                eprintln!("blaze: the store keeps the machine code of {}", self.path.display());
             }
         }
     }
@@ -809,13 +840,223 @@ impl Wasm {
     }
 }
 
-/// The package directory of the crate a macro expands in, from its `CARGO_MANIFEST_DIR`.
-/// What the store keeps the machine code of the module of `digest` under, for this build of
-/// ra-jit (Wasmtime's version and configuration) and machine.
+/// What the store keeps the machine code of the module of `digest` under: the module's bytes
+/// and what Wasmtime says code must match to load (its version, its configuration, the
+/// target and the CPU features it compiled for), and nothing of the checkout, the build of
+/// ra-jit or the toolchain, so every checkout and every host of the same kind shares it.
 fn code_key(digest: &[u8; 32]) -> [u8; 32] {
-    let mut key = keyed::Key::new("wasmtime machine code of a proc-macro module 1");
-    key.field(digest);
+    use std::hash::Hash as _;
+    struct Fields<'a>(&'a mut keyed::Key);
+    impl std::hash::Hasher for Fields<'_> {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.field(bytes);
+        }
+        fn finish(&self) -> u64 {
+            0
+        }
+    }
+    let mut key = keyed::Key::new("wasmtime machine code of a proc-macro module 2");
+    key.field(digest).field(std::env::consts::ARCH.as_bytes());
+    engine().precompile_compatibility_hash().hash(&mut Fields(&mut key));
     key.done()
+}
+
+/// The file beside the module at `path` its machine code of `key` is kept in, for a process to
+/// map rather than read.
+fn code_file(path: &Path, key: &[u8; 32]) -> PathBuf {
+    let hex: String = key[..8].iter().map(|it| format!("{it:02x}")).collect();
+    let mut named = path.as_os_str().to_owned();
+    named.push(format!(".{hex}.cwasm"));
+    PathBuf::from(named)
+}
+
+/// Writes `bytes` to `path` whole or not at all: a process that reads it while it is written
+/// sees the old file or none.
+fn write_whole(path: &Path, bytes: &[u8]) {
+    let new = path.with_extension(format!("{}.new", std::process::id()));
+    if std::fs::write(&new, bytes).is_err() || std::fs::rename(&new, path).is_err() {
+        _ = std::fs::remove_file(&new);
+    }
+}
+
+/// Readies the module at `path` for the processes that expand with it, in the build that
+/// made it: compiles it with Cranelift (or finds its machine code in `store`), keeps the code
+/// beside it and in `store`, and writes the list of its macros beside it, so that a load
+/// compiles nothing and reads the list without running it.
+pub fn prepare(path: &Path, store: Option<&ra_jit_store::Store>) -> Result<(), String> {
+    let start = Instant::now();
+    if let Some((known, _)) = listing(path)
+        && code_file(path, &code_key(&known.digest)).is_file()
+    {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let known = Known { digest: keyed::sha256(&bytes), identity: None };
+    let wasm = Wasm::known(path, known, Some(&bytes), store)?;
+    list(path, &wasm, &wasm.list()?);
+    if std::env::var_os("RA_JIT_STATS").is_some() {
+        eprintln!(
+            "blaze: the proc-macro module {} ready in {:.1?}",
+            path.display(),
+            start.elapsed()
+        );
+    }
+    Ok(())
+}
+
+/// As [`prepare`], but a module that carries its list of macros ([`exports::LIST_SECTION`]) is
+/// compiled on a thread of its own: its list is written now, and the first of its macros to
+/// expand in this process waits for the compile.
+pub fn prepare_soon(
+    path: &Path,
+    store: Option<&'static ra_jit_store::Store>,
+) -> Result<(), String> {
+    if let Some((known, _)) = listing(path)
+        && code_file(path, &code_key(&known.digest)).is_file()
+    {
+        return Ok(());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let Some(text) = carried_list(&bytes) else { return prepare(path, store) };
+    let digest = keyed::sha256(&bytes);
+    let identity = made_of(path, &bytes).unwrap_or(digest);
+    list_known(path, &digest, &identity, &text);
+    let path = path.to_owned();
+    let known = Known { digest, identity: Some(identity) };
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        let done = Wasm::known(&path, known, Some(&bytes), store);
+        if std::env::var_os("RA_JIT_STATS").is_some() {
+            let how = done.map_or_else(|e| format!("failed: {e}"), |_| "ready".to_owned());
+            eprintln!(
+                "blaze: the proc-macro module {} {how} in {:.1?}",
+                path.display(),
+                start.elapsed()
+            );
+        }
+    });
+    Ok(())
+}
+
+/// What the module of `bytes` carries in its [`exports::LIST_SECTION`] custom section, read
+/// without compiling it: `None` for a module built before modules carried one.
+fn carried_list(bytes: &[u8]) -> Option<String> {
+    fn leb(bytes: &[u8], at: &mut usize) -> Option<usize> {
+        let mut value = 0usize;
+        for shift in (0..35).step_by(7) {
+            let byte = *bytes.get(*at)?;
+            *at += 1;
+            value |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+    if bytes.get(..4)? != b"\0asm" {
+        return None;
+    }
+    let mut at = 8;
+    while at < bytes.len() {
+        let id = bytes[at];
+        at += 1;
+        let size = leb(bytes, &mut at)?;
+        let end = at.checked_add(size).filter(|it| *it <= bytes.len())?;
+        if id == 0 {
+            let mut named = at;
+            let len = leb(bytes, &mut named)?;
+            let name = bytes.get(named..named.checked_add(len)?)?;
+            if name == exports::LIST_SECTION.as_bytes() {
+                return String::from_utf8(bytes.get(named + len..end)?.to_vec()).ok();
+            }
+        }
+        at = end;
+    }
+    None
+}
+
+/// What is known of a module without reading it: its digest, and what its expansions are kept
+/// under ([`Wasm`]'s `identity`) when the file beside it says.
+#[derive(Clone, Copy)]
+struct Known {
+    digest: [u8; 32],
+    identity: Option<[u8; 32]>,
+}
+
+/// The bytes of the module at `path` of `digest`: `given`, or read into `read` once.
+fn module_bytes<'a>(
+    path: &Path,
+    digest: &[u8; 32],
+    given: Option<&'a [u8]>,
+    read: &'a std::cell::OnceCell<Result<Vec<u8>, String>>,
+) -> Result<&'a [u8], String> {
+    if let Some(given) = given {
+        return Ok(given);
+    }
+    let read = read.get_or_init(|| {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        match keyed::sha256(&bytes) == *digest {
+            true => Ok(bytes),
+            false => Err(format!("{} changed while it was loaded", path.display())),
+        }
+    });
+    read.as_deref().map_err(Clone::clone)
+}
+
+/// What tells that the module at `path` and the file beside it that says what it was built of
+/// are the files a list was written for: each one's length, time of writing and inode. Both
+/// are written whole under a new name when they change.
+fn stamp(path: &Path) -> Option<String> {
+    let one = |path: &Path| -> Option<String> {
+        let Ok(meta) = std::fs::metadata(path) else { return Some("-".to_owned()) };
+        let written = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        Some(format!("{}.{}.{inode}", meta.len(), written.as_nanos()))
+    };
+    let mut made_of = path.as_os_str().to_owned();
+    made_of.push(".made-of");
+    Some(format!("{}:{}", one(path)?, one(Path::new(&made_of))?))
+}
+
+/// What the list file beside the module at `path` knows of it, and its list of macros, when
+/// it was written for the files there now ([`stamp`]): then the module need not be read.
+fn listing(path: &Path) -> Option<(Known, String)> {
+    let text = std::fs::read_to_string(list_file(path)).ok()?;
+    let (digest, rest) = text.split_once('\n')?;
+    let (head, list) = rest.split_once('\n').unwrap_or((rest, ""));
+    let (identity, stamped) = head.strip_prefix("@ ")?.split_once(' ')?;
+    (stamp(path)? == stamped).then_some(())?;
+    let known = Known { digest: unhex(digest)?, identity: Some(unhex(identity)?) };
+    Some((known, list.to_owned()))
+}
+
+/// Writes the list file of the module at `path`, compiled as `wasm`, whose macros `text` lists.
+fn list(path: &Path, wasm: &Wasm, text: &str) {
+    list_known(path, &wasm.digest, &wasm.identity, text);
+}
+
+fn list_known(path: &Path, digest: &[u8; 32], identity: &[u8; 32], text: &str) {
+    let Some(stamp) = stamp(path) else { return };
+    let (digest, identity) = (hex(digest), hex(identity));
+    write_whole(&list_file(path), format!("{digest}\n@ {identity} {stamp}\n{text}").as_bytes());
+}
+
+fn hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|it| format!("{it:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Option<[u8; 32]> {
+    let mut out = [0; 32];
+    if text.len() != 64 {
+        return None;
+    }
+    for (at, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(text.get(at * 2..at * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// What the module of `bytes` at `path` was built of, as the file beside it says, when that
@@ -830,6 +1071,7 @@ fn made_of(path: &Path, bytes: &[u8]) -> Option<[u8; 32]> {
     (keyed::digest_bytes(bytes) == file).then(|| identity.done())
 }
 
+/// The package directory of the crate a macro expands in, from its `CARGO_MANIFEST_DIR`.
 fn package_dir(env: &Env) -> Option<PathBuf> {
     env.get("CARGO_MANIFEST_DIR").map(PathBuf::from).filter(|it| it.is_absolute())
 }
@@ -935,7 +1177,7 @@ impl Shapes {
         let count = u32::from_le_bytes(value.get(..4)?.try_into().ok()?) as usize;
         let table = value.get(4..4 + count.checked_mul(16)?)?;
         let mut spans = Spans::default();
-        for shape in table.chunks_exact(16) {
+        for shape in table.as_chunks::<16>().0 {
             let field = |at: usize| u32::from_le_bytes(shape[at..at + 4].try_into().unwrap());
             let span = Span {
                 range: range(field(0), field(4)),
@@ -958,13 +1200,14 @@ pub struct Expander {
 /// A module compiled when it first expands, by when the store can give its machine code.
 struct Lazy {
     path: PathBuf,
-    digest: [u8; 32],
+    known: Known,
     compiled: OnceLock<Result<Arc<Wasm>, String>>,
 }
 
 impl Lazy {
     fn get(&self) -> Result<&Arc<Wasm>, String> {
-        let compiled = self.compiled.get_or_init(|| Wasm::at(&self.path, store()));
+        let compiled =
+            self.compiled.get_or_init(|| Wasm::known(&self.path, self.known, None, store()));
         let wasm = compiled.as_ref().map_err(Clone::clone)?;
         wasm.keep_code(store());
         Ok(wasm)
@@ -972,7 +1215,8 @@ impl Lazy {
 }
 
 /// The file beside a module that has its list of macros, for the module whose digest is on
-/// its first line: a load reads it there and compiles nothing.
+/// its first line, with what its expansions are kept under and the [`stamp`] of the files it
+/// was written for on the second: a load reads it there and compiles nothing.
 fn list_file(path: &Path) -> PathBuf {
     let mut named = path.as_os_str().to_owned();
     named.push(".macros");
@@ -1027,9 +1271,9 @@ impl ProcMacroExpander for Expander {
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        (other as &dyn Any)
-            .downcast_ref::<Expander>()
-            .is_some_and(|other| self.wasm.digest == other.wasm.digest && self.index == other.index)
+        (other as &dyn Any).downcast_ref::<Expander>().is_some_and(|other| {
+            self.wasm.known.digest == other.wasm.known.digest && self.index == other.index
+        })
     }
 }
 
@@ -1048,22 +1292,21 @@ pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
         )
     };
     let path: &Path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
-    let digest = keyed::sha256(&bytes);
-    let hex: String = digest.iter().map(|it| format!("{it:02x}")).collect();
-    let lazy = Arc::new(Lazy { path: path.to_owned(), digest, compiled: OnceLock::new() });
-    let file = list_file(path);
-    let kept = std::fs::read_to_string(&file).ok();
-    let text = match kept.as_deref().and_then(|it| it.strip_prefix(&hex)?.strip_prefix('\n')) {
-        Some(text) => text.to_owned(),
+    let (lazy, text) = match listing(path) {
+        Some((known, text)) => {
+            (Lazy { path: path.to_owned(), known, compiled: OnceLock::new() }, text)
+        }
         None => {
             let wasm = Wasm::at(path, store()).map_err(failed)?;
-            _ = lazy.compiled.set(Ok(wasm.clone()));
             let text = wasm.list().map_err(failed)?;
-            _ = std::fs::write(&file, format!("{hex}\n{text}"));
-            text
+            list(path, &wasm, &text);
+            let known = Known { digest: wasm.digest, identity: Some(wasm.identity) };
+            let lazy = Lazy { path: path.to_owned(), known, compiled: OnceLock::new() };
+            _ = lazy.compiled.set(Ok(wasm));
+            (lazy, text)
         }
     };
+    let lazy = Arc::new(lazy);
     Ok(listed(&text)
         .into_iter()
         .enumerate()
@@ -1126,6 +1369,60 @@ mod tests {
         let bytes = writer.out;
         let trees = Reader::new(&bytes, &spans).stream().unwrap();
         assert_eq!(wire::top_subtree(trees, span(3, 9)).to_string(), top.to_string());
+    }
+
+    #[test]
+    fn a_module_carries_its_list_in_a_custom_section() {
+        let custom = |name: &str, payload: &[u8]| {
+            let mut body = vec![name.len() as u8];
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(payload);
+            let mut section = vec![0, body.len() as u8];
+            section.extend(body);
+            section
+        };
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        // A type section of no types, then a custom section of another name.
+        module.extend_from_slice(&[1, 1, 0]);
+        module.extend(custom("name", b"\0\0"));
+        assert_eq!(carried_list(&module), None);
+        module.extend(custom(exports::LIST_SECTION, b"0\tSerialize\tserde\n"));
+        assert_eq!(carried_list(&module).as_deref(), Some("0\tSerialize\tserde\n"));
+        module.truncate(module.len() - 1);
+        assert_eq!(carried_list(&module), None, "a section that runs past the end");
+    }
+
+    #[test]
+    fn a_prepared_module_is_loaded_without_compiling_or_reading_it() {
+        let dir = scratch("prepared");
+        ra_jit_store::compiles_against("ra-jit-macro-wasm tests");
+        let store: &'static ra_jit_store::Store =
+            Box::leak(Box::new(ra_jit_store::Store::open_at(&dir.join("store")).unwrap()));
+        let path = dir.join("m.wasm");
+        let list = "0\tSerialize\tserde\n";
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        let name = exports::LIST_SECTION.as_bytes();
+        module.extend_from_slice(&[0, (1 + name.len() + list.len()) as u8, name.len() as u8]);
+        module.extend_from_slice(name);
+        module.extend_from_slice(list.as_bytes());
+        std::fs::write(&path, &module).unwrap();
+        prepare_soon(&path, Some(store)).unwrap();
+        let (known, text) = listing(&path).expect("the list is written before the compile ends");
+        assert_eq!(text, list);
+        assert_eq!(known.digest, keyed::sha256(&module));
+        // Waits for the compile `prepare_soon` started, which keeps the code beside the module
+        // and in the store, under a key of no path.
+        Wasm::known(&path, known, None, Some(store)).unwrap();
+        let key = code_key(&known.digest);
+        assert!(code_file(&path, &key).is_file());
+        store.seal();
+        assert!(store.get_lasting(&key).is_some());
+        // Another write of the module, even of the same bytes, is listed again.
+        std::fs::write(&path, &module).unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(later).unwrap();
+        assert!(listing(&path).is_none());
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

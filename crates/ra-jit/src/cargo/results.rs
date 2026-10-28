@@ -29,7 +29,10 @@ use std::{
 use sha2::{Digest as _, Sha256};
 
 use super::sandboxed;
-use crate::sandbox::{Line, Reached};
+use crate::{
+    content::hex,
+    sandbox::{Line, Reached},
+};
 
 /// What the store's test results are kept under in place of a toolchain: the toolchain is in
 /// each test's hash already.
@@ -211,7 +214,7 @@ impl Results {
             .entry((path.to_owned(), seen))
             .or_insert_with(|| {
                 let hash = Sha256::digest(input(Path::new(path), seen).as_bytes());
-                hash.iter().take(16).map(|it| format!("{it:02x}")).collect()
+                hex(&hash[..16])
             })
             .clone()
     }
@@ -300,8 +303,7 @@ pub(crate) fn programs(paths: &[&Path]) -> String {
         field(&mut hash, path.as_os_str().as_encoded_bytes());
         field(&mut hash, digest.as_bytes());
     }
-    let hex: String = hash.finalize().iter().take(16).map(|it| format!("{it:02x}")).collect();
-    format!("-{hex}")
+    format!("-{}", hex(&hash.finalize()[..16]))
 }
 
 fn pure(first: &Key) -> Key {

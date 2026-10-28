@@ -29,32 +29,32 @@ the code of the functions that actually changed.
 built. Where they differ, ra-jit is wrong.
 
 **Never guess; refuse visibly.** The code generator returns "unsupported" with a reason for
-anything it has no explicit lowering for. A refused function is left to rustc's copy when
-that copy is current, and otherwise the build goes to cargo. A refusal is printed, counted
+anything it has no explicit lowering for. Under `cargo ra-jit` a refused function fails the
+build, which names it (`cargo/whole.rs`); plain cargo after `ra-jit enable` still has rustc
+build what ra-jit does not ([no-rustc.md](no-rustc.md#today)). A refusal is printed, counted
 and listed (`--report`, `cargo ra-jit status`); it is treated as a bug to fix, not as a
 normal path. What must not happen is a best-effort lowering of input the generator does not
 understand, because that is wrong code nobody sees.
 
-Leaning on rustc's copy and on cargo is how ra-jit works today, not how it is meant to:
+Leaning on rustc under plain cargo is how ra-jit works today, not how it is meant to:
 ra-jit is to compile everything itself and never run rustc, and each place it still does is a
 bug to remove ([no-rustc.md](no-rustc.md)).
 
 The same rule shapes the smaller pieces. `type_id.rs` computes `TypeId` hashes the way the
 pinned rustc does and returns `None` for a type whose hash needs something it does not
 reproduce. The splice returns an error for anything it has no answer for and the caller
-links in full. `cargo ra-jit` hands the build to cargo when an input it does not model has
-changed.
+links in full. `cargo ra-jit` fails a build that needs what it does not model, with the
+reason (`refused` in `cargo/whole.rs`), and hands nothing to cargo.
 
 ## Processes
 
     cargo ra-jit build ──► ra-jit cargo (client) ──► ra-jit daemon ──► worker: ra-jit <project> --socket
-                              │                         │                │
-                              └── cargo + rustc         └── more workers └── one database
-                                  (first build, fallback)
+                                                        │                │
+                                                        └── more workers └── one database
 
 The **client** (`crates/ra-jit/src/cargo/`, entry in `mod.rs`) is what `cargo ra-jit` runs.
 It parses the command line (`cli.rs`), decides whether the daemon can serve it (`state.rs`),
-and either asks the daemon or runs cargo.
+and asks the daemon; `build`, `run` and `test` are whole builds (`whole.rs`) and run no cargo.
 
 The **daemon** (`cargo/daemon.rs`) is one process per user on a Unix socket
 (`socket.rs`). It loads nothing. It starts workers, passes requests to them, and stops them
@@ -181,7 +181,10 @@ appends the patch: it lays the patch out behind everything the linker loaded, re
 references against the executable's symbols, and writes a jump to the new code over the
 entry of each replaced function. Calls, vtables and function pointers still arrive at the
 old entry and continue to the new code. A static with a new value is written in place when
-it is no larger. Each splice starts from the executable as the linker left it, so splices
+it fits there. One that outgrew its place (larger, or aligned to more) is a static of the
+patch's own, and the patch has everything of the program that refers to it compiled again
+to refer to that (`patch::Base::moved`, [#168](https://github.com/indexable-inc/blaze/issues/168)).
+Each splice starts from the executable as the linker left it, so splices
 do not accumulate; a program built in full onto what rustc linked is spliced into that
 executable whole, and the patches after it start from what that left (see "The first edits
 patch what rustc linked"). Anything the splice has no answer for is an error and the daemon links in
@@ -253,6 +256,14 @@ does the same for what cargo built of registry dependencies.
 
 ## The cargo drop-in and the unit graph
 
+Since 2026-10-27 ([#408](https://github.com/indexable-inc/blaze/pull/408),
+[#571](https://github.com/indexable-inc/blaze/pull/571)), `cargo ra-jit build`, `run` and `test`
+are whole builds: every crate is compiled from source over the shipped standard library and
+linked by ra-jit, with no cargo build and no rustc (`cargo/whole.rs`). This section and the next
+describe the model `cargo ra-jit` had before, a first build by cargo and rustc that the daemon
+took over from. The wrapper part of it remains for plain cargo after `ra-jit enable`, until step
+M of [no-rustc.md](no-rustc.md#the-plan) removes it.
+
 `cargo ra-jit` needs three things from cargo for every program: the rlibs and objects rustc
 built, the line rustc ran the linker with, and which workspace crates are in the program.
 It gets them by being cargo's `RUSTC_WORKSPACE_WRAPPER` on the first build
@@ -290,15 +301,9 @@ stops using once a build is in full. On macOS the wrapper links those executable
 `-Wl,-headerpad,0x400000` and `-Wl,-bind_at_load`, so a splice has room for its load commands
 and the unwind table of a program of some four hundred thousand functions, and every import
 is bound at start; the daemon's own links leave both out of rustc's line
-(`cargo::plan::rustc_link_args`). While cargo builds, the spare worker resolves the names
-of each crate cargo is done with and compiles its functions, without the generic instances
-they reach, on a quarter of the cores, the rest being cargo's. It reads the symbols of each
-library as cargo writes it (`symbols::read_ahead`), so that once cargo is done only the
-program's own are left to read. Every line of cargo's reaches it through the daemon as cargo
-says it, and the spare reads its input from its first moment: a full pipe would have cargo
-wait. The daemon starts a spare as it starts and another as each build of a workspace it has
-no worker for begins (`Request::Ahead`); none is started to wait once a workspace is loaded,
-unless `RA_JIT_SPARE=ready` ([cargo.md](cargo.md#environment-variables)).
+(`cargo::plan::rustc_link_args`). The daemon starts a spare worker as it starts, which has
+the library of the toolchain loaded before it is told a build; none is started to wait once
+a workspace is loaded, unless `RA_JIT_SPARE=ready` ([cargo.md](cargo.md#environment-variables)).
 
 A patch over rustc has no marks of before to compare with, so the daemon takes them just in
 time: before an edit's text reaches the database, `home` notes the functions written in the
@@ -363,7 +368,7 @@ nothing in the store: it names rustc's private symbols, which no other link has.
 on Linux keeps the compiler-builtins functions ra-jit's code calls (`--undefined`,
 `hir_ty_codegen::BUILTINS`), which it would otherwise drop as unused. A splice that fails, of
 the whole or of a patch after it (a library function the executable does not import, a
-static that grows), has the daemon start again from what cargo builds and link, as when the
+static of the whole that grows), has the daemon start again from what cargo builds and link, as when the
 first edits' splice fails: that is what splicing can't do, and an own base links it too. Only ELF is spliced whole; on macOS
 such an edit still links in full, and the link takes the room for splices that the executable
 there wanted (`headerpad_ahead`), so it is not linked twice.

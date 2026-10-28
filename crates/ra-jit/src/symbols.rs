@@ -720,7 +720,7 @@ impl Linked {
                 return None;
             }
             let Some(args) = demangled.strip_prefix(&prefix) else { continue };
-            let Some(after) = args_closed(args).map(|at| &args[at..]) else { return None };
+            let after = args_closed(args).map(|at| &args[at..])?;
             // A closure of the instance is compiled with it.
             if !after.is_empty() {
                 if closures_only(after) {

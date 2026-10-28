@@ -10,12 +10,9 @@ use std::{
 use anyhow::{Context as _, bail};
 use rustc_hash::FxHashMap;
 
-use crate::{
-    Context, GitReference, Package, Registry, SourceId, SourceKind,
-    directory::Directory,
-    download::From,
-    source_id::{CRATES_IO_REGISTRY, path_of},
-};
+use blaze_source::{CRATES_IO_REGISTRY, GitReference, SourceId, SourceKind};
+
+use crate::{Context, Package, Registry, directory::Directory, download::From, path_of};
 
 /// One `[source.<name>]` table, as blaze-manifest reads it: paths already resolved against the
 /// directory holding the `.cargo` directory the file is in, as cargo resolves them.
@@ -62,14 +59,14 @@ pub struct SourceMap {
 impl SourceMap {
     pub fn new(config: &SourceConfig) -> anyhow::Result<SourceMap> {
         let crates_io =
-            if config.crates_io_git { SourceId::crates_io_git() } else { SourceId::crates_io() };
+            if config.crates_io_git { SourceId::crates_io() } else { SourceId::crates_io_sparse() };
         let mut map = SourceMap {
             by_name: FxHashMap::default(),
             names: FxHashMap::default(),
             registries: config.registries.clone(),
-            crates_io: crates_io.clone(),
+            crates_io,
         };
-        map.add(CRATES_IO_REGISTRY, Replacement { id: SourceId::crates_io_git(), with: None })?;
+        map.add(CRATES_IO_REGISTRY, Replacement { id: SourceId::crates_io(), with: None })?;
         map.add(CRATES_IO_REGISTRY, Replacement { id: crates_io, with: None })?;
         for (name, def) in &config.sources {
             map.add_def(name, def)?;
@@ -78,7 +75,7 @@ impl SourceMap {
     }
 
     fn add(&mut self, name: &str, replacement: Replacement) -> anyhow::Result<()> {
-        if let Some(old) = self.names.insert(replacement.id.clone(), name.to_owned())
+        if let Some(old) = self.names.insert(replacement.id, name.to_owned())
             && name != CRATES_IO_REGISTRY
         {
             bail!(
@@ -102,8 +99,7 @@ impl SourceMap {
         };
         let mut ids = Vec::new();
         if let Some(registry) = &def.registry {
-            url(registry, "registry")?;
-            ids.push(SourceId::for_registry(registry)?);
+            ids.push(SourceId::for_source_replacement_registry(&url(registry, "registry")?, name)?);
         }
         if let Some(path) = &def.local_registry {
             ids.push(SourceId::for_local_registry(path)?);
@@ -131,7 +127,7 @@ impl SourceMap {
             }
         }
         if name == CRATES_IO_REGISTRY && ids.is_empty() {
-            ids.push(self.crates_io.clone());
+            ids.push(self.crates_io);
         }
         let id = match ids.len() {
             0 => bail!(
@@ -146,10 +142,10 @@ impl SourceMap {
     }
 
     /// The source the packages of `id` come from: `id` itself, or the end of its chain of
-    /// `replace-with`. `precise` is whether the lock file pins the package (a git source's
-    /// commit), which a vendored replacement of a git source needs.
-    pub fn replacement(&self, id: &SourceId, precise: bool) -> anyhow::Result<SourceId> {
-        let Some(original) = self.names.get(id) else { return Ok(id.clone()) };
+    /// `replace-with`. A vendored replacement of a git source needs `id` to be pinned, as a
+    /// lock file pins it to a commit.
+    pub fn replacement(&self, id: SourceId) -> anyhow::Result<SourceId> {
+        let Some(original) = self.names.get(&id) else { return Ok(id) };
         let mut name = original;
         let mut at = "";
         let replaced = loop {
@@ -167,8 +163,8 @@ impl SourceMap {
                     name = with;
                     at = definition;
                 }
-                None if replacement.id == *id => return Ok(id.clone()),
-                None => break replacement.id.clone(),
+                None if replacement.id == id => return Ok(id),
+                None => break replacement.id,
             }
             if name == original {
                 bail!(
@@ -177,14 +173,14 @@ impl SourceMap {
                 );
             }
         };
-        if supports_checksums(id) && !supports_checksums(&replaced) {
+        if supports_checksums(id) && !supports_checksums(replaced) {
             bail!(
                 "cannot replace `{original}` with `{name}`, the source `{original}` supports \
                  checksums, but `{name}` does not\n\na lock file compatible with `{original}` \
                  cannot be generated in this situation"
             );
         }
-        if requires_precise(id) && !precise {
+        if requires_precise(id) && !id.has_precise() {
             bail!(
                 "the source {original} requires a lock file to be present first before it can be\n\
                  used against vendored source code\n\nremove the source replacement \
@@ -198,16 +194,17 @@ impl SourceMap {
     /// `[registries.<name>]` as a source, as cargo's `SourceId::alt_registry`.
     fn registry(&self, name: &str) -> Option<anyhow::Result<SourceId>> {
         if name == CRATES_IO_REGISTRY {
-            return Some(Ok(SourceId::crates_io_git()));
+            return Some(Ok(SourceId::crates_io()));
         }
         let index = self.registries.get(name)?;
-        Some(SourceId::for_registry(index).with_context(|| {
+        let url = url::Url::parse(index).map_err(anyhow::Error::from);
+        Some(url.and_then(|url| SourceId::for_alt_registry(&url, name)).with_context(|| {
             format!("invalid index URL for registry `{name}` defined in configuration")
         }))
     }
 }
 
-fn supports_checksums(id: &SourceId) -> bool {
+fn supports_checksums(id: SourceId) -> bool {
     matches!(
         id.kind(),
         SourceKind::Registry
@@ -217,16 +214,15 @@ fn supports_checksums(id: &SourceId) -> bool {
     )
 }
 
-fn requires_precise(id: &SourceId) -> bool {
+fn requires_precise(id: SourceId) -> bool {
     matches!(id.kind(), SourceKind::Git(_) | SourceKind::Directory)
 }
 
-/// A package of a lock file: its source as the lock file names it, the commit a git source is
-/// pinned to, and the package.
+/// A package of a lock file: its source as the lock file names it, pinned (a git source to its
+/// commit), and the package.
 #[derive(Clone, Debug)]
 pub struct Locked {
     pub source: SourceId,
-    pub precise: Option<String>,
     pub package: Package,
 }
 
@@ -253,28 +249,26 @@ impl Sources {
     }
 
     /// The registry `id` is, remote or local.
-    pub fn registry(&self, id: &SourceId) -> anyhow::Result<Arc<Registry>> {
+    pub fn registry(&self, id: SourceId) -> anyhow::Result<Arc<Registry>> {
         let mut open = self.registries.lock().expect("sources");
-        if let Some(registry) = open.get(id) {
+        if let Some(registry) = open.get(&id) {
             return Ok(registry.clone());
         }
         let registry = Arc::new(match id.kind() {
-            SourceKind::LocalRegistry => {
-                Registry::local(id.clone(), &path_of(id)?, self.context.clone())
-            }
-            _ => Registry::remote(id.clone(), self.context.clone())?,
+            SourceKind::LocalRegistry => Registry::local(id, &path_of(id)?, self.context.clone()),
+            _ => Registry::remote(id, self.context.clone())?,
         });
-        open.insert(id.clone(), registry.clone());
+        open.insert(id, registry.clone());
         Ok(registry)
     }
 
-    pub fn directory(&self, id: &SourceId) -> anyhow::Result<Arc<Directory>> {
+    pub fn directory(&self, id: SourceId) -> anyhow::Result<Arc<Directory>> {
         let mut open = self.directories.lock().expect("sources");
-        if let Some(directory) = open.get(id) {
+        if let Some(directory) = open.get(&id) {
             return Ok(directory.clone());
         }
-        let directory = Arc::new(Directory::new(id.clone(), path_of(id)?));
-        open.insert(id.clone(), directory.clone());
+        let directory = Arc::new(Directory::new(id, path_of(id)?));
+        open.insert(id, directory.clone());
         Ok(directory)
     }
 
@@ -285,14 +279,14 @@ impl Sources {
     pub fn fetch(&self, locked: &[Locked]) -> anyhow::Result<Vec<(PathBuf, From)>> {
         let mut by_source: FxHashMap<SourceId, Vec<usize>> = FxHashMap::default();
         for (at, it) in locked.iter().enumerate() {
-            let from = self.map.replacement(&it.source, it.precise.is_some())?;
+            let from = self.map.replacement(it.source)?;
             by_source.entry(from).or_default().push(at);
         }
         let mut roots = vec![(PathBuf::new(), From::Unpacked); locked.len()];
         for (from, at) in by_source {
             match from.kind() {
                 SourceKind::Registry | SourceKind::SparseRegistry | SourceKind::LocalRegistry => {
-                    let registry = self.registry(&from)?;
+                    let registry = self.registry(from)?;
                     let packages: Vec<Package> =
                         at.iter().map(|&at| locked[at].package.clone()).collect();
                     for (&at, fetched) in at.iter().zip(registry.fetch(&packages)?) {
@@ -300,7 +294,7 @@ impl Sources {
                     }
                 }
                 SourceKind::Directory => {
-                    let directory = self.directory(&from)?;
+                    let directory = self.directory(from)?;
                     for &at in &at {
                         roots[at] = (directory.fetch(&locked[at].package)?, From::Vendored);
                     }
@@ -310,11 +304,11 @@ impl Sources {
                     let mut checkouts: FxHashMap<Option<&str>, crate::git::Checkout> =
                         FxHashMap::default();
                     for &at in &at {
-                        let precise = locked[at].precise.as_deref();
+                        let precise = locked[at].source.precise_git_fragment();
                         let checkout = match checkouts.get(&precise) {
                             Some(it) => it,
                             None => {
-                                let checkout = crate::git::fetch(&self.context, &from, precise)?;
+                                let checkout = crate::git::fetch(&self.context, from, precise)?;
                                 checkouts.entry(precise).or_insert(checkout)
                             }
                         };
@@ -369,20 +363,17 @@ mod tests {
     #[test]
     fn crates_io_is_read_sparse_unless_told() {
         let map = map(vec![]).unwrap();
+        assert_eq!(map.replacement(SourceId::crates_io()).unwrap(), SourceId::crates_io_sparse());
         assert_eq!(
-            map.replacement(&SourceId::crates_io_git(), false).unwrap(),
-            SourceId::crates_io()
+            map.replacement(SourceId::crates_io_sparse()).unwrap(),
+            SourceId::crates_io_sparse()
         );
-        assert_eq!(map.replacement(&SourceId::crates_io(), false).unwrap(), SourceId::crates_io());
-        let other = SourceId::for_registry("sparse+https://other.example.com/").unwrap();
-        assert_eq!(map.replacement(&other, false).unwrap(), other);
+        let other = crate::registry_source("sparse+https://other.example.com/").unwrap();
+        assert_eq!(map.replacement(other).unwrap(), other);
 
         let git = SourceMap::new(&SourceConfig { crates_io_git: true, ..SourceConfig::default() })
             .unwrap();
-        assert_eq!(
-            git.replacement(&SourceId::crates_io_git(), false).unwrap(),
-            SourceId::crates_io_git()
-        );
+        assert_eq!(git.replacement(SourceId::crates_io()).unwrap(), SourceId::crates_io());
     }
 
     #[test]
@@ -400,14 +391,14 @@ mod tests {
             ("vendored", def(|it| it.directory = Some(abs("/w/vendor")))),
         ])
         .unwrap();
-        assert_eq!(map.replacement(&SourceId::crates_io_git(), false).unwrap(), vendor);
-        assert_eq!(map.replacement(&SourceId::crates_io(), false).unwrap(), vendor);
+        assert_eq!(map.replacement(SourceId::crates_io()).unwrap(), vendor);
+        assert_eq!(map.replacement(SourceId::crates_io_sparse()).unwrap(), vendor);
 
-        let mine = SourceId::for_registry("sparse+https://mine.example.com/index/").unwrap();
+        let mine = crate::registry_source("sparse+https://mine.example.com/index/").unwrap();
         let map =
             self::map(vec![("crates-io", def(|it| it.replace_with = Some("mine".to_owned())))])
                 .unwrap();
-        assert_eq!(map.replacement(&SourceId::crates_io_git(), false).unwrap(), mine);
+        assert_eq!(map.replacement(SourceId::crates_io()).unwrap(), mine);
 
         let git = SourceId::for_git(
             &"https://github.com/o/r".parse().unwrap(),
@@ -426,8 +417,11 @@ mod tests {
             ("vendored", def(|it| it.directory = Some(abs("/w/vendor")))),
         ])
         .unwrap();
-        assert_eq!(map.replacement(&git, true).unwrap(), vendor);
-        assert!(error(map.replacement(&git, false)).starts_with(
+        assert_eq!(
+            map.replacement(git.with_git_precise(Some("0123abcd".to_owned()))).unwrap(),
+            vendor
+        );
+        assert!(error(map.replacement(git)).starts_with(
             "the source o requires a lock file to be present first before it can be\nused against vendored"
         ));
     }
@@ -448,13 +442,13 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            error(map.replacement(&SourceId::crates_io(), false)),
+            error(map.replacement(SourceId::crates_io_sparse())),
             "detected a cycle of `replace-with` sources, the source `crates-io` is eventually \
              replaced with itself (configuration in `/w/.cargo/config.toml`)"
         );
         let map = self::map(vec![("crates-io", to("nowhere"))]).unwrap();
         assert_eq!(
-            error(map.replacement(&SourceId::crates_io(), false)),
+            error(map.replacement(SourceId::crates_io_sparse())),
             "could not find a configured source with the name `nowhere` when attempting to lookup \
              `crates-io` (configuration in `/w/.cargo/config.toml`)"
         );
@@ -463,7 +457,7 @@ mod tests {
             ("g", def(|it| it.git = Some("https://example.com/g".to_owned()))),
         ])
         .unwrap();
-        assert!(error(map.replacement(&SourceId::crates_io(), false)).starts_with(
+        assert!(error(map.replacement(SourceId::crates_io_sparse())).starts_with(
             "cannot replace `crates-io` with `g`, the source `crates-io` supports checksums, but `g` does not"
         ));
         assert_eq!(

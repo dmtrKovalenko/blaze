@@ -36,12 +36,16 @@ pub(crate) fn check() -> bool {
     std::env::var(CHECK).is_ok_and(|it| it == "check")
 }
 
-/// A key of fields, each its length and its bytes.
-pub(crate) struct Key(Sha256);
+/// The variable naming a directory where each key done is written as its fields, one a line,
+/// in `<key>.txt`: what two machines' keys differ in.
+const TRACE: &str = "RA_JIT_KEY_TRACE";
+
+/// A key of fields, each its length and its bytes, and them as text when [`TRACE`] is set.
+pub(crate) struct Key(Sha256, Option<Vec<u8>>);
 
 impl Key {
     pub(crate) fn new(kind: &str) -> Key {
-        let mut key = Key(Sha256::new());
+        let mut key = Key(Sha256::new(), std::env::var_os(TRACE).map(|_| Vec::new()));
         key.field(kind.as_bytes());
         key
     }
@@ -49,11 +53,21 @@ impl Key {
     pub(crate) fn field(&mut self, bytes: &[u8]) -> &mut Key {
         self.0.update((bytes.len() as u64).to_le_bytes());
         self.0.update(bytes);
+        if let Some(trace) = &mut self.1 {
+            trace.extend(bytes.escape_ascii());
+            trace.push(b'\n');
+        }
         self
     }
 
     pub(crate) fn done(self) -> [u8; 32] {
-        self.0.finalize().into()
+        let key: [u8; 32] = self.0.finalize().into();
+        if let (Some(trace), Some(dir)) = (self.1, std::env::var_os(TRACE)) {
+            let dir = Path::new(&dir);
+            _ = std::fs::create_dir_all(dir);
+            _ = std::fs::write(dir.join(format!("{}.txt", hex(&key))), trace);
+        }
+        key
     }
 }
 

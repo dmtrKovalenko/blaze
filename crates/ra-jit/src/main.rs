@@ -533,7 +533,7 @@ impl<'a> ResolverParts<'a> {
 /// The standard library ra-jit built before the program ([`std_unit`]).
 struct Prebuilt {
     /// What its object defines for others to link to.
-    defined: FxHashSet<String>,
+    defined: Arc<FxHashSet<String>>,
     /// Its crates, as [`library_unit`] has them.
     crates: FxHashSet<ide_db::base_db::Crate>,
 }
@@ -686,6 +686,28 @@ pub(crate) fn unlinked_panic_runtime(db: &RootDatabase, program: &[Crate]) -> &'
     if abort { "panic_unwind" } else { "panic_abort" }
 }
 
+/// [`defined_symbols`] of the object at `path`, read again only when the file is not the one it
+/// was read from: every build of the program asks for the standard library's unit, which is
+/// tens of megabytes of object.
+fn defined_symbols_kept(path: &Path) -> anyhow::Result<Arc<FxHashSet<String>>> {
+    type Kept = FxHashMap<PathBuf, ((std::time::SystemTime, u64), Arc<FxHashSet<String>>)>;
+    static KEPT: std::sync::LazyLock<std::sync::Mutex<Kept>> =
+        std::sync::LazyLock::new(Default::default);
+    let file = std::fs::metadata(path).ok();
+    let key = file.and_then(|it| Some((it.modified().ok()?, it.len())));
+    if let Some(key) = key
+        && let Some((was, names)) = lock(&KEPT).get(path)
+        && *was == key
+    {
+        return Ok(names.clone());
+    }
+    let names = Arc::new(defined_symbols(path)?);
+    if let Some(key) = key {
+        lock(&KEPT).insert(path.to_owned(), (key, names.clone()));
+    }
+    Ok(names)
+}
+
 /// The names an object defines for others to link to.
 fn defined_symbols(path: &Path) -> anyhow::Result<FxHashSet<String>> {
     use object::{Object as _, ObjectSymbol as _, SymbolScope};
@@ -730,42 +752,6 @@ fn defined_symbols(path: &Path) -> anyhow::Result<FxHashSet<String>> {
     Ok(names)
 }
 
-/// The names the executable at `path` defines, read once for each file a link writes: a
-/// splice adds to the file in place, where a link writes a new one.
-fn kept_names(path: &Path) -> Option<Arc<FxHashSet<String>>> {
-    #[cfg(unix)]
-    {
-        use object::{Object as _, ObjectSymbol as _};
-        use std::os::unix::fs::MetadataExt as _;
-        type Kept = FxHashMap<PathBuf, ((u64, u64), Arc<FxHashSet<String>>)>;
-        static KEPT: std::sync::LazyLock<std::sync::Mutex<Kept>> =
-            std::sync::LazyLock::new(Default::default);
-        let file = std::fs::metadata(path).ok()?;
-        let key = (file.dev(), file.ino());
-        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, names)) = kept.get(path)
-            && *at == key
-        {
-            return Some(names.clone());
-        }
-        let bytes = std::fs::read(path).ok()?;
-        let file = object::File::parse(&*bytes).ok()?;
-        let macho = file.format() == object::BinaryFormat::MachO;
-        let names = file.symbols().filter(|it| it.is_definition()).filter_map(|it| {
-            let name = it.name().ok()?;
-            Some(if macho { name.strip_prefix('_').unwrap_or(name) } else { name }.to_owned())
-        });
-        let names = Arc::new(names.collect::<FxHashSet<_>>());
-        kept.insert(path.to_owned(), (key, names.clone()));
-        Some(names)
-    }
-    #[cfg(not(unix))]
-    {
-        _ = path;
-        None
-    }
-}
-
 /// The [`SymbolTable::generation`] and the checkout that paths were found with.
 type SharedKey = (u64, PathBuf, Option<PathBuf>);
 
@@ -797,6 +783,39 @@ impl<'a> Resolver<'a> {
         known: &Rejections,
         contents: &'a content::Contents,
         listed: &'a Listed,
+    ) -> anyhow::Result<Resolver<'a>> {
+        let prebuilt = args.prebuilt.as_deref().filter(|_| table.is_empty()).map(|path| {
+            let defined = defined_symbols_kept(path).context("the standard library blaze built")?;
+            let program: Vec<Crate> =
+                args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten().collect();
+            let crates = library_unit(db, &program);
+            anyhow::Ok(Arc::new(Prebuilt { defined, crates }))
+        });
+        let prebuilt = prebuilt.transpose()?;
+        Ok(Resolver::with(db, table, args, known, contents, listed, prebuilt))
+    }
+
+    /// [`Resolver::of`] for what is asked of what rustc linked alone, which the standard
+    /// library blaze built is no part of: its symbols are not read.
+    fn of_rustcs(
+        db: &'a RootDatabase,
+        table: &'a SymbolTable,
+        args: &Args,
+        known: &Rejections,
+        contents: &'a content::Contents,
+        listed: &'a Listed,
+    ) -> Resolver<'a> {
+        Resolver::with(db, table, args, known, contents, listed, None)
+    }
+
+    fn with(
+        db: &'a RootDatabase,
+        table: &'a SymbolTable,
+        args: &Args,
+        known: &Rejections,
+        contents: &'a content::Contents,
+        listed: &'a Listed,
+        prebuilt: Option<Arc<Prebuilt>>,
     ) -> Resolver<'a> {
         let over_rustc = known.homes() && !known.builds_base();
         // A build with thread-locals of its own is linked in full: building it for a splice
@@ -814,22 +833,13 @@ impl<'a> Resolver<'a> {
             .splice
             .as_deref()
             .filter(|_| linked.is_none() && table.is_empty() && args.patch.is_some())
-            .and_then(kept_names);
+            .and_then(splice::kept_names);
         let (root, base) = (args.checkout.clone(), args.base.clone());
         let debug = args.debug;
         let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
         let named = (root.clone(), base.clone());
         hir_ty_codegen::name_sources(move |db, file| {
             source_path(db, &named.0, named.1.as_deref(), file)
-        });
-        let prebuilt = args.prebuilt.as_deref().filter(|_| table.is_empty()).map(|path| {
-            let defined = defined_symbols(path);
-            let defined =
-                defined.unwrap_or_else(|e| panic!("the standard library blaze built: {e:#}"));
-            let program: Vec<Crate> =
-                args.crates().filter_map(|it| crates_named(db, it, args).ok()).flatten().collect();
-            let crates = library_unit(db, &program);
-            Arc::new(Prebuilt { defined, crates })
         });
         Resolver {
             db,
@@ -1060,15 +1070,7 @@ impl Resolver<'_> {
     /// Whether the function, or the `impl` it is in, takes types or constants. A method a
     /// trait provides takes `Self`.
     fn is_generic(&self, func: FunctionId) -> bool {
-        let generic = |def: hir::GenericDef| !def.type_or_const_params(self.db).is_empty();
-        if generic(hir::Function::from(func).into()) {
-            return true;
-        }
-        match func.lookup(self.db).container {
-            ItemContainerId::ImplId(imp) => generic(hir::Impl::from(imp).into()),
-            ItemContainerId::TraitId(_) => true,
-            _ => false,
-        }
+        is_generic_function(self.db, func)
     }
 
     /// Whether another function written in a body of the crate has this one's path. rustc
@@ -3749,7 +3751,28 @@ struct ListedCrate {
     in_provided: Vec<FunctionId>,
     /// For each, whether a runtime looks it up by name.
     exported: Vec<bool>,
+    /// What a build takes of `functions` for its roots, each with whether a runtime looks it up
+    /// by name and whether it is generic: those only the const evaluator runs are left out.
+    /// Kept with the crate, as a query of the attributes of every function of every crate is
+    /// most of what an edit would otherwise wait for.
+    rooted: Vec<(FunctionId, bool, bool)>,
+    /// The same of `in_provided`: each with whether it is generic.
+    provided: Vec<(FunctionId, bool)>,
     main: Option<FunctionId>,
+}
+
+/// Whether the function, or the `impl` it is in, takes types or constants. A method a trait
+/// provides takes `Self`.
+fn is_generic_function(db: &RootDatabase, func: FunctionId) -> bool {
+    let generic = |def: hir::GenericDef| !def.type_or_const_params(db).is_empty();
+    if generic(hir::Function::from(func).into()) {
+        return true;
+    }
+    match func.lookup(db).container {
+        ItemContainerId::ImplId(imp) => generic(hir::Impl::from(imp).into()),
+        ItemContainerId::TraitId(_) => true,
+        _ => false,
+    }
 }
 
 fn is_bodiless_intrinsic(db: &RootDatabase, id: FunctionId) -> bool {
@@ -3805,8 +3828,10 @@ fn write_reach(
     let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match of_tests(args) {
         true => hir::attach_db(db, || {
             let contents = content::Contents::default();
-            let resolver = Resolver::of(db, table, args, known, &contents, listed);
-            reach_of_tests(db, &resolver, listed, args)
+            match Resolver::of(db, table, args, known, &contents, listed) {
+                Ok(resolver) => reach_of_tests(db, &resolver, listed, args),
+                Err(error) => format!("*\t{error:#}\n"),
+            }
         }),
         // A test target cargo builds without libtest's harness says what it runs itself.
         false => "*\tit is not built with libtest's harness\n".to_owned(),
@@ -4021,7 +4046,28 @@ impl ListedCrate {
             .filter(|_| !has_no_main(db, krate));
         let exported = exported(db, &functions);
         let shared_paths = Default::default();
-        ListedCrate { functions, shared_paths, kept, statics, in_provided, exported, main }
+        let rooted = functions
+            .iter()
+            .zip(&exported)
+            .filter(|&(&it, _)| !hir_ty_codegen::compile_time_only(db, it))
+            .map(|(&it, &exported)| (it, exported, is_generic_function(db, it)))
+            .collect();
+        let provided = in_provided
+            .iter()
+            .filter(|&&it| !hir_ty_codegen::compile_time_only(db, it))
+            .map(|&it| (it, is_generic_function(db, it)))
+            .collect();
+        ListedCrate {
+            functions,
+            shared_paths,
+            kept,
+            statics,
+            in_provided,
+            exported,
+            rooted,
+            provided,
+            main,
+        }
     }
 }
 
@@ -4374,7 +4420,7 @@ fn home_in_rustcs(
         let contents = content::Contents::default();
         for program in programs.iter_mut().filter(|it| it.known.homes()) {
             let Program { args, table, known, .. } = program;
-            let resolver = Resolver::of(db, table, args, known, &contents, listed);
+            let resolver = Resolver::of_rustcs(db, table, args, known, &contents, listed);
             for (file, functions, statics, callers) in &found {
                 known.home(db, &resolver, *file, functions, statics, callers);
             }
@@ -4455,7 +4501,7 @@ fn none_linked(
         };
         let contents = content::Contents::default();
         let Program { args, table, known, .. } = program;
-        let resolver = Resolver::of(db, table, args, known, &contents, listed);
+        let resolver = Resolver::of_rustcs(db, table, args, known, &contents, listed);
         let named = |func: &FunctionId| {
             let name = hir::Function::from(*func).name(db);
             names.iter().any(|it| it.as_str() == name.as_str())
@@ -4669,6 +4715,63 @@ fn std_unit(
     args: &Args,
     listed: &Listed,
 ) -> anyhow::Result<Option<PathBuf>> {
+    std_unit_at(db, table, args, listed, args.out.with_extension("std.o"))
+}
+
+/// The [`UnitStamps`] of each standard library's unit this process wrote, by its path.
+static UNITS_WRITTEN: std::sync::LazyLock<Mutex<FxHashMap<PathBuf, UnitStamps>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The length and write time of a standard library's unit and of its list of what it refused.
+type UnitStamps = [Option<(u64, SystemTime)>; 2];
+
+fn unit_stamps(unit: &Path) -> UnitStamps {
+    let stamp = |path: &Path| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.len(), meta.modified().ok()?))
+    };
+    [stamp(unit), stamp(&refused_exports_of(unit))]
+}
+
+/// Writes the standard library's unit at `args.prebuilt` again, from the store or built, when
+/// what [`std_unit`] wrote there is gone or another file since: a worker keeps the path for as
+/// long as it runs, and a `cargo clean` or `rm -rf target` under it tells it nothing.
+fn std_unit_again(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    args: &Args,
+    listed: &Listed,
+) -> anyhow::Result<()> {
+    static AGAIN: Mutex<()> = Mutex::new(());
+    let Some(unit) = &args.prebuilt else { return Ok(()) };
+    let _again = lock(&AGAIN);
+    let Some(written) = lock(&UNITS_WRITTEN).get(unit).copied() else { return Ok(()) };
+    if written.iter().all(Option::is_some) && unit_stamps(unit) == written {
+        return Ok(());
+    }
+    eprintln!(
+        "standard library: {} is not the file blaze wrote there, written again",
+        unit.display()
+    );
+    // As the worker had it when it wrote the unit first, before it had a line to link with.
+    let of_unit = Args { prebuilt: None, link_cmd: None, splice: None, ..args.clone() };
+    match std_unit_at(db, table, &of_unit, listed, unit.with_extension("o"))? {
+        Some(again) if again == *unit => Ok(()),
+        again => bail!(
+            "the standard library blaze built at {} is gone, and was written again as {again:?}",
+            unit.display()
+        ),
+    }
+}
+
+/// [`std_unit`], with the unit at `object`, or beside it as an archive.
+fn std_unit_at(
+    db: &RootDatabase,
+    table: &SymbolTable,
+    args: &Args,
+    listed: &Listed,
+    object: PathBuf,
+) -> anyhow::Result<Option<PathBuf>> {
     use sha2::{Digest, Sha256};
     if !table.is_empty() || args.prebuilt.is_some() || patches_its_library(args) {
         return Ok(None);
@@ -4739,9 +4842,11 @@ fn std_unit(
     // What it refused that a program can call by name is kept beside it ([`refused_exports_of`]).
     let refused_key: [u8; 32] =
         Sha256::new().chain_update(key).chain_update(b"refused").finalize().into();
-    let object = args.out.with_extension("std.o");
-    let archive = args.out.with_extension("std.a");
+    let archive = object.with_extension("a");
     let refused = refused_exports_of(&object);
+    let written = |path: &Path| {
+        lock(&UNITS_WRITTEN).insert(path.to_owned(), unit_stamps(path));
+    };
     let store = ra_jit_store::Store::global();
     let stored = || -> anyhow::Result<Option<PathBuf>> {
         let Some(store) = store else { return Ok(None) };
@@ -4753,6 +4858,7 @@ fn std_unit(
         std::fs::write(&refused, listed)
             .with_context(|| format!("writing {}", refused.display()))?;
         eprintln!("standard library: from the store, {} crates", members.len());
+        written(path);
         Ok(Some(path.clone()))
     };
     if let Some(path) = stored()? {
@@ -4817,6 +4923,7 @@ fn std_unit(
         store.insert(&key, &bytes);
         store.flush();
     }
+    written(&path);
     Ok(Some(path))
 }
 
@@ -5048,7 +5155,7 @@ fn build(
 ) -> anyhow::Result<Option<Build>> {
     let start = Instant::now();
     let contents = &content::Contents::default();
-    let resolver = Resolver::of(db, table, args, known, contents, listed);
+    let resolver = Resolver::of(db, table, args, known, contents, listed)?;
     let hir_db: &dyn HirDatabase = db;
     let mut functions = Vec::new();
     let mut kept = Vec::new();
@@ -5074,11 +5181,19 @@ fn build(
             } else if at == 0 {
                 main = main.or_else(|| harness_main(db, &listed.functions));
             }
-            functions.extend(listed.functions.iter().copied().zip(listed.exported.iter().copied()));
+            // With nothing of rustc's there is no copy of a generic function to name: each
+            // instance is compiled with the caller that asks for it.
+            let kept_rooted = |it: &&(FunctionId, bool, bool)| !(table.is_empty() && it.2);
+            functions.extend(
+                listed.rooted.iter().filter(kept_rooted).map(|&(it, exported, _)| (it, exported)),
+            );
             // rustc's copy of the crate has them when rustc built it.
             let own = resolver.own_crate_id(krate.into()).is_some();
             if table.is_empty() || own {
-                functions.extend(listed.in_provided.iter().map(|&it| (it, false)));
+                let kept_provided = |it: &&(FunctionId, bool)| !(table.is_empty() && it.1);
+                functions.extend(
+                    listed.provided.iter().filter(kept_provided).map(|&(it, _)| (it, false)),
+                );
             }
             if own {
                 kept.extend(&listed.kept);
@@ -5109,8 +5224,10 @@ fn build(
         for krate in linked {
             local.push(krate);
             let listed = listed.of(db, krate);
-            functions.extend(listed.functions.iter().copied().zip(listed.exported.iter().copied()));
-            functions.extend(listed.in_provided.iter().map(|&it| (it, false)));
+            functions.extend(
+                listed.rooted.iter().filter(|it| !it.2).map(|&(it, exported, _)| (it, exported)),
+            );
+            functions.extend(listed.provided.iter().filter(|it| !it.1).map(|&(it, _)| (it, false)));
             kept.extend(&listed.kept);
             every_static.extend(&listed.statics);
         }
@@ -5128,11 +5245,6 @@ fn build(
     // rustc's there is no copy of it to name: each instance a caller asks for is compiled with
     // the caller. As a root it would only be counted as left out ("no rustc symbol"), which is
     // not something blaze could not compile.
-    if table.is_empty() {
-        functions.retain(|&(func, _)| !resolver.is_generic(func));
-    }
-    // A function only the const evaluator runs has no code, in rustc's build or ours.
-    functions.retain(|&(func, _)| !hir_ty_codegen::compile_time_only(db, func));
     let list = start.elapsed();
     // With a program to start from, only what it reaches is compiled, and what a runtime
     // looks up by name. Without one any function may be the one called.
@@ -5622,13 +5734,16 @@ impl std::error::Error for PatchUnlinked {}
 /// linked (`over_rustc`) is spliced or fails with [`RustcLinkedLost`], and so is an object
 /// that names what only that executable has (`onto`, [`ONTO_RUSTCS`]). With `packs` the object
 /// is kept packed after the link ([`whole`]). A patch the splice declines whose line is the
-/// worker's own (`own_line`, [`own_link_line`]) fails with [`PatchUnlinked`].
+/// worker's own (`own_line`, [`own_link_line`]) fails with [`PatchUnlinked`]. `prebuilt` is the
+/// standard library the line links besides `object`, which the room of a first link counts
+/// ([`headerpad_ahead`]).
 #[expect(clippy::too_many_arguments)]
 fn link(
     cmd: Option<&str>,
     splice: Option<&Path>,
     patch: Option<&Path>,
     object: &Path,
+    prebuilt: Option<&Path>,
     patched: bool,
     over_rustc: bool,
     onto: bool,
@@ -5821,7 +5936,8 @@ fn link(
     let reading = whole::read(object)?;
     if let Some(binary) = splice {
         set_aside(binary)?;
-        headerpad_ahead(binary)?;
+        let objects: Vec<&Path> = [Some(object), prebuilt, patch].into_iter().flatten().collect();
+        headerpad_ahead(binary, &objects)?;
     }
     let reached = cargo::plan::reached_only(cmd);
     let cmd = match reached.as_deref() {
@@ -5948,17 +6064,23 @@ impl std::fmt::Display for LinkFailed {
 
 impl std::error::Error for LinkFailed {}
 
-/// Tells the link of the program at `binary` the room after the load commands that the
-/// executable there now wants for splices, when that is more than the link is told: what
-/// rustc linked there, or the last link, is the program as it was, and the room it wants is
-/// what this one will, so that it is not linked a second time with more
-/// ([`headerpad_short`]).
-fn headerpad_ahead(binary: &Path) -> std::io::Result<()> {
+/// Tells the link of the program at `binary` the room after the load commands it will want for
+/// splices, when that is more than the link is told, so that it is not linked a second time
+/// with more ([`headerpad_short`]): what the executable there, of the last link, wants, and
+/// what the unwind information of the `objects` it links will take, which is all a first
+/// link has to go by (#173).
+fn headerpad_ahead(binary: &Path, objects: &[&Path]) -> anyhow::Result<()> {
     let Some(kept) = cargo::plan::headerpad_of(binary) else { return Ok(()) };
-    match splice::headerpad_wanted(binary) {
-        Ok(Some((pad, _))) if pad > kept => cargo::plan::write_headerpad(binary, pad),
-        _ => Ok(()),
+    let before = match splice::headerpad_wanted(binary) {
+        Ok(Some((pad, _))) => pad,
+        _ => 0,
+    };
+    let linked = splice::headerpad_of_objects(objects)?.unwrap_or(0);
+    let pad = before.max(linked);
+    if pad > kept {
+        cargo::plan::write_headerpad(binary, pad)?;
     }
+    Ok(())
 }
 
 /// The room after the load commands to link the executable at `binary` again with, when the
@@ -6271,8 +6393,9 @@ impl std::fmt::Display for Refused {
     }
 }
 
-/// Why the source as it is can't be built by the daemon, when it can't: a file that does
-/// not parse, then the errors found in the edited files, then a function left uncompiled.
+/// Why the source as it is can't be built by the daemon, when it can't: the proc-macro server
+/// failed an expansion, then a file that does not parse, then the errors found in the edited
+/// files, then a function left uncompiled.
 /// Paths are shown from `root`, the workspace's, as rustc's errors show them.
 fn refusal(
     db: &RootDatabase,
@@ -6282,6 +6405,9 @@ fn refusal(
     broken: Option<errors::Said>,
     out_of_date: Option<hir_ty_codegen::OutOfDate>,
 ) -> Option<Refused> {
+    if let Some(failed) = ra_jit_expand::server_failed() {
+        return Some(Refused::Error(errors::Said::one(errors::of_none(failed))));
+    }
     if let Some(unparsed) = unparsed(db, sources, watched, root) {
         return Some(Refused::Error(errors::Said::one(unparsed)));
     }
@@ -8861,7 +8987,10 @@ fn run_holding(
     // daemon's.
     let library = ahead.then(|| built_library(&vfs, emits.triple()));
     match toolchain_identity(&vfs, library.as_ref().unwrap_or(&args.symbol_files)) {
-        Some(toolchain) => ra_jit_store::compiles_against(&toolchain),
+        Some(toolchain) => {
+            ra_jit_store::compiles_against(&toolchain);
+            std::thread::spawn(ra_jit_store::check_packs);
+        }
         None => eprintln!("store: the toolchain of the library cannot be told from another"),
     }
     // A build with nothing of rustc's starts from the standard library, which a release ships.
@@ -9122,6 +9251,10 @@ fn run_holding(
                 errors_for_the_daemon(&args, &errors::Said::one(errors::of_none(unset)))?;
                 bail!("{unset}");
             }
+            if let Some(failed) = ra_jit_expand::server_failed() {
+                errors_for_the_daemon(&args, &errors::Said::one(errors::of_none(failed)))?;
+                bail!("{failed}");
+            }
             if !served {
                 eprint!("cold: ");
                 report(&cold);
@@ -9196,6 +9329,7 @@ fn run_holding(
                 args.splice.as_deref(),
                 args.patch.as_deref(),
                 &args.out,
+                args.prebuilt.as_deref(),
                 false,
                 false,
                 known.stats.onto_rustcs,
@@ -10498,6 +10632,7 @@ fn run_holding(
             let (as_built, object) = (as_built.clone(), out.clone());
             let packs = packs_whole(&programs[at].args);
             let own_line = programs[at].args.exe.is_some();
+            let prebuilt = programs[at].args.prebuilt.clone();
             let read_as = (over != base).then(|| (over.clone(), unlinked.clone()));
             let linked = std::thread::spawn(move || {
                 let failed = link(
@@ -10505,6 +10640,7 @@ fn run_holding(
                     splice.as_deref(),
                     spliced.as_deref(),
                     &object,
+                    prebuilt.as_deref(),
                     patched,
                     over_rustc,
                     onto,
@@ -10941,6 +11077,16 @@ impl Program {
         let named_anew = std::mem::take(&mut self.unbuilt.named_anew);
         let unnamed = if named_anew { None } else { self.widen(db) };
         self.read_copies_again(db)?;
+        std_unit_again(db, &self.table, &self.args, listed)?;
+        // What the worker wrote under the target directory is taken away by a clean under it,
+        // which tells it nothing: with the object of the program gone, there is nothing to
+        // patch.
+        if let Some(gone) = self.whole.clone().filter(|it| !whole::is_there(it)) {
+            eprintln!("{} is gone: built in full", gone.display());
+            self.known.start_again();
+            self.unbuilt.stale = true;
+            (self.wrote, self.whole) = (None, None);
+        }
         let Outputs { out, patch, link_cmd, splice, exe } = self.outputs(db, wanted)?;
         let Program {
             args, table, known, unbuilt, wrote, whole, tests, tests_now, own_lines, ..
@@ -11118,7 +11264,17 @@ impl Program {
             let packs = packs_whole(args);
             let own_line = args.exe.is_some();
             let unlinked = link(
-                cmd, splice, patch, &args.out, patched, over_rustc, onto, defer, packs, own_line,
+                cmd,
+                splice,
+                patch,
+                &args.out,
+                args.prebuilt.as_deref(),
+                patched,
+                over_rustc,
+                onto,
+                defer,
+                packs,
+                own_line,
             )
             .err();
             if let Some(lost) =
@@ -11410,6 +11566,111 @@ fn main() {}
             assert_eq!(crates_of(&within(&[app]), shared), [app]);
             assert_eq!(crates_of(&within(&[example]), main), [app]);
         });
+    }
+
+    /// What a build roots of a crate is what it always was: its functions with whether a runtime
+    /// looks each up by name, but those only the const evaluator runs, and with whether each is
+    /// generic, which a build with nothing of rustc's leaves out. They are listed with the
+    /// crate, so an edit does not ask the attributes of every function of every crate again.
+    #[test]
+    fn the_roots_of_a_listed_crate_are_its_functions_but_those_only_the_const_evaluator_runs() {
+        use test_fixture::WithFixture;
+        let (db, file) = RootDatabase::with_single_file(
+            r#"
+fn plain() {}
+fn generic<T>(_: T) {}
+#[rustc_comptime]
+fn comptime() {}
+struct S;
+impl S { fn method(&self) {} }
+impl<T> Tr for T { fn provided(&self) {} }
+trait Tr { fn required(&self); fn default(&self) { fn inner() {} } }
+#[no_mangle]
+extern "C" fn exported() {}
+"#,
+        );
+        hir::attach_db(&db, || {
+            let sema = hir::Semantics::new(&db);
+            let module = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
+            let listed = ListedCrate::new(&db, module.krate(&db));
+            let name = |func: FunctionId| hir::Function::from(func).name(&db).as_str().to_owned();
+            let before: Vec<(FunctionId, bool)> = listed
+                .functions
+                .iter()
+                .copied()
+                .zip(listed.exported.iter().copied())
+                .filter(|&(it, _)| !hir_ty_codegen::compile_time_only(&db, it))
+                .collect();
+            let rooted: Vec<_> =
+                listed.rooted.iter().map(|&(it, exported, _)| (it, exported)).collect();
+            assert_eq!(rooted, before);
+            assert!(listed.functions.iter().any(|&it| name(it) == "comptime"));
+            assert!(listed.rooted.iter().all(|&(it, _, _)| name(it) != "comptime"));
+            let flags: Vec<_> = listed
+                .rooted
+                .iter()
+                .map(|&(it, exported, generic)| (name(it), exported, generic))
+                .collect();
+            for (wanted, exported, generic) in [
+                ("plain", false, false),
+                ("generic", false, true),
+                ("method", false, false),
+                ("provided", false, true),
+                ("exported", true, false),
+            ] {
+                assert!(
+                    flags.contains(&(wanted.to_owned(), exported, generic)),
+                    "{wanted}: {flags:?}"
+                );
+            }
+            assert!(listed.provided.iter().any(|&(it, generic)| name(it) == "inner" && !generic));
+            for &(it, generic) in &listed.provided {
+                assert_eq!(generic, is_generic_function(&db, it));
+                assert!(!hir_ty_codegen::compile_time_only(&db, it));
+            }
+        });
+    }
+
+    /// The symbols of the standard library's object are read once for as long as the file is the
+    /// one they were read from.
+    #[test]
+    fn the_symbols_of_an_object_are_read_again_only_when_the_file_changed() {
+        use object::write::{Object, Symbol, SymbolSection};
+        let dir = std::env::temp_dir().join(format!("ra-jit-defined-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("std.o");
+        let write = |names: &[&str]| {
+            let mut object = Object::new(
+                object::BinaryFormat::Elf,
+                object::Architecture::X86_64,
+                object::Endianness::Little,
+            );
+            let section = object.section_id(object::write::StandardSection::Text);
+            for name in names {
+                let symbol = Symbol {
+                    name: name.as_bytes().to_vec(),
+                    value: 0,
+                    size: 0,
+                    kind: object::SymbolKind::Text,
+                    scope: object::SymbolScope::Dynamic,
+                    weak: false,
+                    section: SymbolSection::Section(section),
+                    flags: object::SymbolFlags::None,
+                };
+                object.add_symbol(symbol);
+            }
+            object.append_section_data(section, &[0x90], 1);
+            std::fs::write(&path, object.write().unwrap()).unwrap();
+        };
+        write(&["one"]);
+        let first = defined_symbols_kept(&path).unwrap();
+        assert!(first.contains("one"));
+        assert!(Arc::ptr_eq(&first, &defined_symbols_kept(&path).unwrap()));
+        write(&["one", "another_and_longer"]);
+        let second = defined_symbols_kept(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(second.contains("another_and_longer"));
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     /// A COFF object has no hidden symbols to tell apart from the others, and `object` calls

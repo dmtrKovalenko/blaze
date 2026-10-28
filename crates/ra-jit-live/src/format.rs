@@ -39,7 +39,8 @@ pub fn wake_event(dir: &Path) -> String {
 pub fn root() -> Option<PathBuf> {
     let set = |name| std::env::var_os(name).filter(|it| !it.is_empty());
     let home = set("HOME").or_else(|| set("USERPROFILE"));
-    let home = match (set("RA_JIT_HOME"), set("XDG_RUNTIME_DIR"), home) {
+    let blaze_home = crate::setting("HOME").filter(|it| !it.is_empty());
+    let home = match (blaze_home, set("XDG_RUNTIME_DIR"), home) {
         (Some(home), _, _) => PathBuf::from(home),
         (None, Some(runtime), _) => Path::new(&runtime).join("ra-jit"),
         (None, None, Some(home)) => Path::new(&home).join(".cache/ra-jit"),

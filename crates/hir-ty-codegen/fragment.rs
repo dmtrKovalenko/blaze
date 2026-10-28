@@ -242,6 +242,13 @@ pub struct CompiledStatic {
     pub(super) writable: bool,
 }
 
+impl CompiledStatic {
+    /// The size and alignment of its value.
+    pub(super) fn layout(&self) -> (u64, u64) {
+        (self.blob.bytes.len() as u64, self.blob.align)
+    }
+}
+
 /// How many requests a [`Recorder`] had at some point, to tell the ones made since.
 #[derive(Clone, Copy)]
 #[cfg_attr(not(feature = "llvm"), expect(dead_code))]

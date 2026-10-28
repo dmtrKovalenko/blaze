@@ -35,6 +35,12 @@ fn beside(path: &Path) -> PathBuf {
     new.into()
 }
 
+/// Whether the object at `path` is there, or what [`pack`] left of it.
+pub(crate) fn is_there(path: &Path) -> bool {
+    let _changing = lock(&CHANGING);
+    path.exists() || packed(path).exists()
+}
+
 /// Has the object at `path` be there for as long as the guard is held, inflated from what
 /// [`pack`] left of it when it is not.
 pub(crate) fn read(path: &Path) -> std::io::Result<RwLockReadGuard<'static, ()>> {

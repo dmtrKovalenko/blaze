@@ -620,6 +620,32 @@ impl SourceId {
     pub fn full_hash<S: Hasher>(self, into: &mut S) {
         ptr::NonNull::from(self.inner).hash(into)
     }
+
+    /// The name of the directories under `$CARGO_HOME/registry/{index,cache,src}` a registry
+    /// is kept in: the host of its URL and a hash of the source, `index.crates.io-1949cf8c6b5b557f`
+    /// for crates.io's sparse index (cargo's `short_name` in `src/sources/registry/mod.rs`).
+    pub fn registry_dir_name(self) -> String {
+        let host = self.inner.url.host_str().unwrap_or("");
+        format!("{host}-{}", short_hash(&self))
+    }
+
+    /// `<name>-<hash>`, the name of a git repository's database and of its checkouts'
+    /// directory under `$CARGO_HOME/git`: the last segment of its canonical URL and a hash of
+    /// that URL (cargo's `ident` in `src/sources/git/source.rs`).
+    pub fn git_ident(self) -> String {
+        let url = self.inner.canonical_url.raw_canonicalized_url();
+        let last = url.path_segments().and_then(|mut it| it.next_back()).unwrap_or("");
+        let last = if last.is_empty() { "_empty" } else { last };
+        format!("{last}-{}", short_hash(url.as_str()))
+    }
+}
+
+/// Sixteen hex digits of a hash of `value` that are the same on every platform and release, as
+/// cargo's `util::hex::short_hash`: the little-endian bytes of a 64-bit SipHash-1-3 of 128 bits.
+pub fn short_hash<H: Hash + ?Sized>(value: &H) -> String {
+    let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+    value.hash(&mut hasher);
+    Hasher::finish(&hasher).to_le_bytes().iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 impl PartialEq for SourceId {
@@ -757,6 +783,9 @@ mod tests {
             canon("sparse+https://github.com/Foo/x.git"),
             "sparse+https://github.com/Foo/x.git"
         );
+        // A path of only `/` keeps it: the url crate has no empty path for a URL with a host.
+        assert_eq!(canon("sparse+https://index.crates.io/"), "sparse+https://index.crates.io/");
+        assert_eq!(canon("sparse+https://example.com/index/"), "sparse+https://example.com/index");
         assert!(CanonicalUrl::new(&url("mailto:x@y")).is_err());
     }
 
@@ -897,6 +926,50 @@ mod tests {
         assert!(SourceId::from_url("https://example.com").is_err());
         assert!(SourceId::from_url("svn+https://example.com").is_err());
         assert!(SourceId::from_url("registry+not a url").is_err());
+    }
+
+    /// The values of cargo 1.99's `test_stable_hash` (`src/workspace/source_id.rs`), and the
+    /// directories cargo 1.99 makes for crates.io.
+    #[test]
+    fn names_directories_as_cargo() {
+        let mine = SourceId::for_registry(&url("https://my-crates.io")).unwrap();
+        assert_eq!(short_hash(&SourceId::crates_io()), "25cdd57fae9f0462");
+        assert_eq!(short_hash(&mine), "b2d65deb64f05373");
+        assert_eq!(
+            SourceId::crates_io_sparse().registry_dir_name(),
+            "index.crates.io-1949cf8c6b5b557f"
+        );
+        assert_eq!(SourceId::crates_io().registry_dir_name(), "github.com-25cdd57fae9f0462");
+        // The precise of a lock file's source is not part of the name.
+        let locked = SourceId::from_url("sparse+https://index.crates.io/").unwrap();
+        assert_eq!(locked.registry_dir_name(), "index.crates.io-1949cf8c6b5b557f");
+
+        // `gen_hash` of cargo's test: the source's `stable_hash`, which for these is its kind
+        // and its URL as written, finished as a number.
+        let stable = |id: SourceId| {
+            let mut hasher = rustc_stable_hash::StableSipHasher128::new();
+            id.kind().hash(&mut hasher);
+            id.url().as_str().hash(&mut hasher);
+            Hasher::finish(&hasher)
+        };
+        assert_eq!(stable(SourceId::crates_io()), 7062945687441624357);
+        assert_eq!(stable(mine), 8310250053664888498);
+        let yours = SourceId::for_registry(&url("https://your-crates.io")).unwrap();
+        assert_eq!(stable(yours), 14149534903000258933);
+    }
+
+    /// The directory cargo 1.99 made for zed's `async-process` dependency
+    /// (`git+https://github.com/zed-industries/async-process.git?rev=0b6d671…`).
+    #[test]
+    fn names_git_directories_as_cargo() {
+        let base = url("https://github.com/zed-industries/async-process.git");
+        let rev = GitReference::Rev("0b6d6713570af61806e1e5cb40e0f757cb93fd9d".to_owned());
+        assert_eq!(
+            SourceId::for_git(&base, rev).unwrap().git_ident(),
+            "async-process-b80486ce8f827270"
+        );
+        let root = SourceId::for_git(&url("https://example.com/"), GitReference::DefaultBranch);
+        assert!(root.unwrap().git_ident().starts_with("_empty-"));
     }
 
     #[test]

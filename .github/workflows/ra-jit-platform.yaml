@@ -401,8 +401,10 @@ jobs:
     runs-on: ${{ inputs.os }}
     timeout-minutes: 120
     # Known to fail until https://github.com/indexable-inc/blaze/issues/26 is fixed: a test of
-    # axum's example-testing crashes in the test binary the daemon builds.
-    continue-on-error: ${{ matrix.projects == 'axum' }}
+    # axum's example-testing crashes in the test binary the daemon builds. nushell's cold build
+    # needs about 16 GB, more than the hosted AArch64 runner has, until
+    # https://github.com/indexable-inc/blaze/issues/734 is fixed.
+    continue-on-error: ${{ matrix.projects == 'axum' || matrix.projects == 'nushell' }}
     strategy:
       fail-fast: false
       matrix:

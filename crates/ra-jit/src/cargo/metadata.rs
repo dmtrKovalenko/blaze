@@ -36,8 +36,9 @@ fn read(config: Config, manifest_path: Option<&Path>) -> anyhow::Result<Metadata
 }
 
 /// How the daemon's loads read a workspace for the build `selection` names: blaze's own
-/// reading and resolution, the graph that of the build, its features not unified over the
-/// other members. `RA_JIT_OWN_RESOLVE=0` leaves both to cargo.
+/// reading and resolution, the graph that of the build, its features unified over the other
+/// members only as `resolver.feature-unification` says. `RA_JIT_OWN_RESOLVE=0` leaves both to
+/// cargo.
 pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::OwnMetadata> {
     if std::env::var_os("RA_JIT_OWN_RESOLVE").is_some_and(|it| it == "0") {
         return None;
@@ -90,6 +91,7 @@ pub(crate) fn own(selection: &crate::plan::Selection) -> Option<project_model::O
             platform: Some(blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
             offline: false,
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let json = blaze_metadata::metadata(&asked)?;
         serde_json::from_str(&json).context("blaze's own metadata is not cargo's form")
@@ -189,6 +191,7 @@ fn library_read(
         platform: triple.map(|triple| blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
         offline: false,
         store: None,
+        rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let json = match no_deps {
         true => blaze_metadata::metadata_no_deps(&asked)?,
@@ -243,6 +246,7 @@ pub(crate) fn programs(
             platform: Some(blaze_metadata::TargetPlatform { triple: &triple, cfg: &cfg }),
             offline: false,
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         Ok(blaze_metadata::programs(&asked, targets)?.1)
     }
@@ -321,6 +325,7 @@ pub(crate) fn units(
         }),
         offline: false,
         store: None,
+        rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let units = blaze_metadata::Units {
         intent,
@@ -331,6 +336,112 @@ pub(crate) fn units(
         target: target.as_ref(),
     };
     blaze_metadata::units(&asked, &units).context("making the build's unit graph")
+}
+
+/// The targets the flags `targets` pick (`--lib`, `--tests`, `--bin NAME`, ...), as cargo's
+/// `from_raw_arguments` reads them.
+fn filter(targets: &[String]) -> blaze_units::Filter {
+    let (mut lib, mut all_targets) = (false, false);
+    let (mut all_bins, mut all_tests, mut all_examples, mut all_benches) =
+        (false, false, false, false);
+    let (mut bins, mut tests, mut examples, mut benches) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut flags = targets.iter();
+    while let Some(flag) = flags.next() {
+        let mut named = |to: &mut Vec<String>| to.extend(flags.next().cloned());
+        match flag.as_str() {
+            "--lib" => lib = true,
+            "--all-targets" => all_targets = true,
+            "--bins" => all_bins = true,
+            "--tests" => all_tests = true,
+            "--examples" => all_examples = true,
+            "--benches" => all_benches = true,
+            "--bin" => named(&mut bins),
+            "--test" => named(&mut tests),
+            "--example" => named(&mut examples),
+            "--bench" => named(&mut benches),
+            _ => {}
+        }
+    }
+    blaze_units::Filter::from_flags(
+        lib,
+        bins,
+        all_bins,
+        tests,
+        all_tests,
+        examples,
+        all_examples,
+        benches,
+        all_benches,
+        all_targets,
+    )
+}
+
+/// The unit graph of `cargo check` of `selection` with the target flags `targets`, asked for
+/// in `cwd` (of the package of `manifest`, when there is one), for the triple `selection`
+/// names or the host's: the targets the check picks, each checked as a test or not, and what
+/// they depend on.
+pub(crate) fn checked(
+    selection: &crate::plan::Selection,
+    targets: &[String],
+    cwd: &Path,
+    manifest: Option<&Path>,
+) -> anyhow::Result<blaze_units::UnitGraph> {
+    if let Some(flag) = selection.unstable.first() {
+        anyhow::bail!("blaze's unit graph is not made for cargo's unstable flag `-Z {flag}`");
+    }
+    let rustc = super::state::rustc_path();
+    let said = |args: &[&str]| {
+        let said = super::state::rustc_says(&rustc, args).filter(|it| !it.is_empty());
+        said.with_context(|| format!("`rustc {}` says nothing", args.join(" ")))
+    };
+    let platformed = |triple: &str| -> anyhow::Result<blaze_units::Platformed> {
+        let printed = said(&["--print", "cfg", "--target", triple])?;
+        let cfg = printed.lines().filter(|it| !it.is_empty()).map(|it| {
+            use std::str::FromStr;
+            cargo_platform::Cfg::from_str(it).with_context(|| format!("the cfg {it}"))
+        });
+        let cfg = cfg.collect::<anyhow::Result<_>>()?;
+        Ok(blaze_units::Platformed { triple: triple.to_owned(), cfg })
+    };
+    let told = said(&["-vV"])?;
+    let host = told.lines().find_map(|it| it.strip_prefix("host: "));
+    let host = platformed(host.context("rustc names no host")?)?;
+    let target = selection.target.as_deref().map(platformed).transpose()?;
+    let filter = filter(targets);
+    let intent = blaze_units::Intent::Check { test: false };
+    let built_for = target.as_ref().unwrap_or(&host);
+    let asked = blaze_metadata::Asked {
+        cwd,
+        env: std::env::vars().collect(),
+        manifest_path: manifest,
+        config: &selection.config,
+        features: &selection.features,
+        all_features: selection.all_features,
+        no_default_features: selection.no_default_features,
+        build: Some(blaze_metadata::Build {
+            packages: &selection.packages,
+            workspace: selection.workspace,
+            excludes: &selection.excludes,
+            dev_units: filter.need_dev_deps(intent),
+        }),
+        platform: Some(blaze_metadata::TargetPlatform {
+            triple: &built_for.triple,
+            cfg: &built_for.cfg,
+        }),
+        offline: false,
+        store: None,
+        rustc_version: told.lines().find_map(|it| it.strip_prefix("release: ")),
+    };
+    let units = blaze_metadata::Units {
+        intent,
+        filter: &filter,
+        release: false,
+        profile: Some(&selection.profile),
+        host: &host,
+        target: target.as_ref(),
+    };
+    blaze_metadata::units(&asked, &units).context("making the check's unit graph")
 }
 
 /// A `cfg` as rust-analyzer has it, as cargo's platforms read it.
@@ -419,5 +530,111 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&scratch);
         assert!(read >= 3, "{read} fixtures read");
+    }
+
+    /// The features of `shared` in the build of `packages` of #596's workspace, where only
+    /// `other` asks for `shared/extra`, with `config` as its `.cargo/config.toml`; or why
+    /// blaze refuses the build.
+    fn shared_features(config: &str, packages: &[&str]) -> Result<Vec<String>, String> {
+        let root = std::env::temp_dir().join(format!(
+            "ra-jit-unification-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let package = |name: &str, deps: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{deps}")
+        };
+        let files = [
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app\", \"other\", \"shared\"]\nresolver = \"2\"\n"
+                    .to_owned(),
+            ),
+            (".cargo/config.toml", config.to_owned()),
+            ("shared/Cargo.toml", package("shared", "\n[features]\nextra = []\n")),
+            (
+                "shared/src/lib.rs",
+                "pub fn extra() -> bool { cfg!(feature = \"extra\") }\n".to_owned(),
+            ),
+            (
+                "app/Cargo.toml",
+                package("app", "\n[dependencies]\nshared = { path = \"../shared\" }\n"),
+            ),
+            (
+                "app/src/main.rs",
+                "fn main() { println!(\"extra = {}\", shared::extra()); }\n".to_owned(),
+            ),
+            (
+                "other/Cargo.toml",
+                package(
+                    "other",
+                    "\n[dependencies]\nshared = { path = \"../shared\", features = [\"extra\"] }\n",
+                ),
+            ),
+            ("other/src/lib.rs", "pub fn f() -> bool { shared::extra() }\n".to_owned()),
+        ];
+        for (path, text) in files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let home = root.join("cargo-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let packages: Vec<String> = packages.iter().map(|it| it.to_string()).collect();
+        let asked = blaze_metadata::Asked {
+            cwd: &root,
+            env: vec![("CARGO_HOME".to_owned(), home.display().to_string())],
+            manifest_path: None,
+            config: &[],
+            features: &[],
+            all_features: false,
+            no_default_features: false,
+            build: Some(blaze_metadata::Build {
+                packages: &packages,
+                workspace: false,
+                excludes: &[],
+                dev_units: false,
+            }),
+            platform: Some(blaze_metadata::TargetPlatform {
+                triple: "x86_64-unknown-linux-gnu",
+                cfg: &[],
+            }),
+            offline: true,
+            store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
+        };
+        let made = blaze_metadata::metadata(&asked);
+        let _ = std::fs::remove_dir_all(&root);
+        let metadata: serde_json::Value =
+            serde_json::from_str(&made.map_err(|err| format!("{err:#}"))?).unwrap();
+        let nodes = metadata["resolve"]["nodes"].as_array().unwrap();
+        let shared =
+            nodes.iter().find(|it| it["id"].as_str().unwrap().contains("shared#")).unwrap();
+        let features = shared["features"].as_array().unwrap().iter();
+        Ok(features.map(|it| it.as_str().unwrap().to_owned()).collect())
+    }
+
+    /// `resolver.feature-unification`, as nightly cargo reads it (#596): `workspace` resolves
+    /// the features of every member, `selected` (and the setting without
+    /// `-Zfeature-unification`) of those built, `package` of each package built alone.
+    #[test]
+    fn feature_unification_is_cargo_s() {
+        let mode = |mode: &str| {
+            format!(
+                "[unstable]\nfeature-unification = true\n\n[resolver]\nfeature-unification = \"{mode}\"\n"
+            )
+        };
+        let extra = Ok(vec!["extra".to_owned()]);
+        assert_eq!(shared_features(&mode("workspace"), &["app"]), extra);
+        assert_eq!(shared_features(&mode("selected"), &["app"]), Ok(vec![]));
+        assert_eq!(shared_features(&mode("package"), &["app"]), Ok(vec![]));
+        assert_eq!(shared_features(&mode("package"), &["other"]), extra);
+        assert_eq!(shared_features(&mode("selected"), &["app", "other"]), extra);
+        assert_eq!(shared_features("", &["app"]), Ok(vec![]));
+        let unflagged = "[resolver]\nfeature-unification = \"workspace\"\n";
+        assert_eq!(shared_features(unflagged, &["app"]), Ok(vec![]));
+        let refused = shared_features(&mode("package"), &["app", "other"]).unwrap_err();
+        assert!(refused.contains("resolver.feature-unification = \"package\""), "{refused}");
     }
 }

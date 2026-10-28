@@ -13,9 +13,7 @@
 //! - `rustc-link-arg` (and its `-bins`, `-bin=`, `-tests`, `-benches`, `-examples` and
 //!   `-cdylib` forms): one of [`LINK_ARGS`], or an rpath to a directory `rustc-link-search`
 //!   may name.
-//! - `rustc-env`: not a variable cargo or rustc gives a crate itself ([`given_by_cargo`]),
-//!   except an unchanged copy of `CARGO_CFG_TARGET_FEATURE` or `CARGO_ENCODED_RUSTFLAGS`
-//!   from the environment supplied to the script. These let a crate report how it was built.
+//! - `rustc-env`: not a variable cargo or rustc gives a crate itself ([`given_by_cargo`]).
 //!
 //! What counting these rules over the bench corpus found (590 scripts,
 //! `bench/results/2026-10-27-bscache/directives.md`) decided their edges: no
@@ -98,21 +96,11 @@ const LINK_ARG_PREFIXES: [&str; 5] = [
 pub(crate) struct Ran<'a> {
     pub(crate) package_dir: &'a Path,
     pub(crate) out_dir: &'a Path,
-    /// The environment supplied to the script, before any changes the script makes.
-    pub(crate) env: &'a [(String, String)],
     /// The system directories the workspace allows besides [`SYSTEM`].
     pub(crate) link_dirs: &'a [PathBuf],
 }
 
 impl Ran<'_> {
-    /// These build inputs may be copied into the crate's environment for `env!` to read.
-    /// They must be present and unchanged; paths, tool selection and package metadata
-    /// remain protected even when a script prints the value it was given.
-    fn echoes_metadata(&self, name: &str, value: &str) -> bool {
-        matches!(name, "CARGO_CFG_TARGET_FEATURE" | "CARGO_ENCODED_RUSTFLAGS")
-            && self.env.iter().find(|(key, _)| key == name).is_some_and(|(_, given)| given == value)
-    }
-
     /// The target directory's build directory, whose subdirectories are every package's
     /// `OUT_DIR`: `<build>/<package>-<hash>/out` or `<build>/<package>/<hash>/out`.
     fn build_dir(&self) -> Option<&Path> {
@@ -206,29 +194,29 @@ fn allowed_args() -> String {
 }
 
 /// Whether cargo or rustc gives a crate the variable `name` itself, which a script's
-/// `rustc-env` may not replace: the package's, the manifest's, the crate's, the target's
-/// configuration and the toolchain's. `CARGO_COMMIT_HASH`, which cargo's build sets for
-/// cargo, is not one.
+/// `rustc-env` may not set over: what cargo sets for a crate's compilation (cargo's
+/// "Environment variables Cargo sets for crates") and what the toolchain reads from its own
+/// environment (`RUSTC_BOOTSTRAP`, the jobserver's `CARGO_MAKEFLAGS`). What cargo gives only
+/// build scripts (`CARGO_CFG_*`, `CARGO_FEATURE_*`, `CARGO_ENCODED_RUSTFLAGS`,
+/// `CARGO_MANIFEST_LINKS`) is not one: a crate has it only when its script forwards it, as
+/// rav1e's does. Nor is `CARGO_COMMIT_HASH`, which cargo's build sets for cargo.
 pub(crate) fn given_by_cargo(name: &str) -> bool {
-    const NAMES: [&str; 15] = [
+    const NAMES: [&str; 13] = [
         "CARGO",
         "CARGO_MANIFEST_DIR",
         "CARGO_MANIFEST_PATH",
-        "CARGO_MANIFEST_LINKS",
         "CARGO_CRATE_NAME",
         "CARGO_BIN_NAME",
         "CARGO_PRIMARY_PACKAGE",
         "CARGO_TARGET_TMPDIR",
         "CARGO_RUSTC_CURRENT_DIR",
-        "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_MAKEFLAGS",
         "OUT_DIR",
         "RUSTC",
         "RUSTDOC",
         "RUSTFLAGS",
     ];
-    const PREFIXES: [&str; 6] =
-        ["CARGO_PKG_", "CARGO_CFG_", "CARGO_BIN_EXE_", "CARGO_FEATURE_", "RUSTC_", "RUSTDOC_"];
+    const PREFIXES: [&str; 4] = ["CARGO_PKG_", "CARGO_BIN_EXE_", "RUSTC_", "RUSTDOC_"];
     NAMES.contains(&name) || PREFIXES.iter().any(|it| name.starts_with(it))
 }
 
@@ -284,7 +272,7 @@ pub(crate) fn refused(stdout: &[u8], ran: &Ran<'_>) -> Vec<(String, String)> {
             | "rustc-cdylib-link-arg" => ran.link_arg_refused(value),
             "rustc-env" => value
                 .split_once('=')
-                .filter(|(name, value)| given_by_cargo(name) && !ran.echoes_metadata(name, value))
+                .filter(|(name, _)| given_by_cargo(name))
                 .map(|(name, _)| format!("`{name}`, which cargo gives the crate itself")),
             _ => None,
         };
@@ -337,7 +325,6 @@ mod tests {
         Ran {
             package_dir: Path::new("/src/pkg"),
             out_dir: Path::new("/t/debug/build/pkg/0123/out"),
-            env: &[],
             link_dirs: dirs,
         }
     }
@@ -443,67 +430,26 @@ mod tests {
                       cargo:rustc-env=GIT_HASH=abc\n\
                       cargo:rustc-env=CARGO_PKG_VERSION=9.9.9\n\
                       cargo::rustc-env=RUSTC_BOOTSTRAP=1\n\
+                      cargo:rustc-env=CARGO_MAKEFLAGS=-j1\n\
                       cargo:rustc-env-like=CARGO_PKG_NAME\n\
                       cargo:CARGO_PKG_NAME=metadata, not a directive\n";
         assert_eq!(
             refused_lines(stdout),
-            ["cargo:rustc-env=CARGO_PKG_VERSION=9.9.9", "cargo::rustc-env=RUSTC_BOOTSTRAP=1"]
+            [
+                "cargo:rustc-env=CARGO_PKG_VERSION=9.9.9",
+                "cargo::rustc-env=RUSTC_BOOTSTRAP=1",
+                "cargo:rustc-env=CARGO_MAKEFLAGS=-j1",
+            ]
         );
     }
 
     #[test]
-    fn rustc_env_may_echo_build_metadata_exactly() {
-        let env = [
-            ("CARGO_CFG_TARGET_FEATURE".to_owned(), "neon,fp-armv8".to_owned()),
-            ("CARGO_ENCODED_RUSTFLAGS".to_owned(), "-C\x1ftarget-cpu=native".to_owned()),
-        ];
-        let ran = Ran { env: &env, ..ran() };
-        let stdout = "cargo:rustc-env=CARGO_CFG_TARGET_FEATURE=neon,fp-armv8\n\
-                      cargo::rustc-env=CARGO_ENCODED_RUSTFLAGS=-C\x1ftarget-cpu=native\n";
-        assert!(refused(stdout.as_bytes(), &ran).is_empty());
-    }
-
-    #[test]
-    fn rustc_env_may_echo_empty_flags_but_not_invent_them() {
-        let stdout = b"cargo:rustc-env=CARGO_ENCODED_RUSTFLAGS=\n";
-        let env = [("CARGO_ENCODED_RUSTFLAGS".to_owned(), String::new())];
-        assert!(refused(stdout, &Ran { env: &env, ..ran() }).is_empty());
-        assert_eq!(refused(stdout, &ran()).len(), 1);
-    }
-
-    #[test]
-    fn rustc_env_may_not_change_or_add_build_metadata() {
-        let env = [
-            ("CARGO_CFG_TARGET_FEATURE".to_owned(), "sse2".to_owned()),
-            ("CARGO_ENCODED_RUSTFLAGS".to_owned(), String::new()),
-        ];
-        let ran = Ran { env: &env, ..ran() };
-        let stdout = "cargo::rustc-env=CARGO_CFG_TARGET_FEATURE=avx2\n\
-                      cargo:rustc-env=CARGO_ENCODED_RUSTFLAGS=-Clinker=/tmp/evil\n";
-        assert_eq!(refused(stdout.as_bytes(), &ran).len(), 2);
-        assert_eq!(refused_lines("cargo:rustc-env=CARGO_CFG_TARGET_FEATURE=sse2\n").len(), 1);
-    }
-
-    #[test]
-    fn rustc_env_may_not_echo_other_protected_variables() {
-        for (name, value) in [
-            ("CARGO", "/tools/cargo"),
-            ("RUSTC", "/tools/rustc"),
-            ("RUSTC_WRAPPER", "/tools/wrapper"),
-            ("RUSTFLAGS", "-Clinker=/tools/linker"),
-            ("OUT_DIR", "/t/debug/build/pkg/0123/out"),
-            ("CARGO_MANIFEST_DIR", "/src/pkg"),
-            ("CARGO_PKG_VERSION", "1.2.3"),
-            ("CARGO_CFG_TARGET_OS", "linux"),
-        ] {
-            let env = [(name.to_owned(), value.to_owned())];
-            let stdout = format!("cargo:rustc-env={name}={value}\n");
-            assert_eq!(
-                refused(stdout.as_bytes(), &Ran { env: &env, ..ran() }).len(),
-                1,
-                "{name} remains protected even with the same value",
-            );
-        }
+    fn rustc_env_may_forward_what_cargo_gives_only_scripts() {
+        let stdout = "cargo:rustc-env=CARGO_CFG_TARGET_FEATURE=aes,crc,neon\n\
+                      cargo:rustc-env=CARGO_ENCODED_RUSTFLAGS=\n\
+                      cargo::rustc-env=CARGO_FEATURE_ASM=1\n\
+                      cargo:rustc-env=CARGO_MANIFEST_LINKS=z\n";
+        assert_eq!(refused_lines(stdout), Vec::<String>::new());
     }
 
     #[test]

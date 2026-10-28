@@ -4,7 +4,9 @@
 
 use std::{
     fmt,
+    future::Future,
     io::Read,
+    pin::Pin,
     sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
@@ -37,10 +39,25 @@ impl Response {
     }
 }
 
+/// Work started at once and finished on whichever thread does it, awaited from any executor.
+pub type Pending<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
 /// What asks servers for files. An error is one where no answer came, which is worth trying
 /// again, as cargo tries a connection or a transfer that failed again.
 pub trait Http: Send + Sync {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response>;
+
+    /// [`Http::get`], sent before this returns and answered when it is done, so that many
+    /// requests are in flight at once. By default it is asked and answered on this thread.
+    fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
+        Box::pin(std::future::ready(self.get(url, headers)))
+    }
+
+    /// A wait that holds no thread; by default it holds this one.
+    fn sleep(&self, duration: Duration) -> Pending<()> {
+        std::thread::sleep(duration);
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// An answer that is not what was asked for.
@@ -108,25 +125,52 @@ impl Retry {
         let mut tried = 0;
         loop {
             match attempt() {
-                Err(e) if tried < self.retries && spurious(&e) => {
-                    let left = self.retries - tried;
-                    if !self.quiet {
-                        let tries = if left == 1 { "try" } else { "tries" };
-                        eprintln!(
-                            "warning: spurious network error ({left} {tries} remaining): {e:#}"
-                        );
-                    }
-                    tried += 1;
-                    let after = e.downcast_ref::<HttpNotSuccessful>().and_then(retry_after);
-                    let sleep = after.map_or_else(
-                        || self.fixed_sleep_ms.unwrap_or_else(|| sleep_ms(tried)),
-                        |it| it.min(MAX_RETRY_SLEEP_MS),
-                    );
-                    std::thread::sleep(Duration::from_millis(sleep));
-                }
+                Err(e) => match self.again(&mut tried, &e) {
+                    Some(wait) => std::thread::sleep(wait),
+                    None => return Err(e),
+                },
                 it => return it,
             }
         }
+    }
+
+    /// [`Retry::run`] of an attempt that waits, sleeping with `http`, so that the thread runs
+    /// other requests in between.
+    pub async fn run_async<T, F: Future<Output = anyhow::Result<T>>>(
+        &self,
+        http: &dyn Http,
+        mut attempt: impl FnMut() -> F,
+    ) -> anyhow::Result<T> {
+        let mut tried = 0;
+        loop {
+            match attempt().await {
+                Err(e) => match self.again(&mut tried, &e) {
+                    Some(wait) => http.sleep(wait).await,
+                    None => return Err(e),
+                },
+                it => return it,
+            }
+        }
+    }
+
+    /// How long to wait before trying again after `e`, said as cargo says it; none when `e`
+    /// is not worth another try or the tries are used up.
+    fn again(&self, tried: &mut u32, e: &anyhow::Error) -> Option<Duration> {
+        if *tried >= self.retries || !spurious(e) {
+            return None;
+        }
+        let left = self.retries - *tried;
+        if !self.quiet {
+            let tries = if left == 1 { "try" } else { "tries" };
+            eprintln!("warning: spurious network error ({left} {tries} remaining): {e:#}");
+        }
+        *tried += 1;
+        let after = e.downcast_ref::<HttpNotSuccessful>().and_then(retry_after);
+        let sleep = after.map_or_else(
+            || self.fixed_sleep_ms.unwrap_or_else(|| sleep_ms(*tried)),
+            |it| it.min(MAX_RETRY_SLEEP_MS),
+        );
+        Some(Duration::from_millis(sleep))
     }
 }
 
@@ -172,13 +216,23 @@ impl std::error::Error for Transport {}
 
 /// How many redirects one request follows.
 const REDIRECTS: usize = 10;
+/// How many requests [`HyperHttp::get_async`] has in flight at once, each on a connection of
+/// its own (HTTP/1).
+const IN_FLIGHT: usize = 64;
 
 /// [`Http`] over hyper and rustls, with the machine's certificates, on a runtime of its own
 /// that any number of threads ask through at once.
 pub struct HyperHttp {
     runtime: tokio::runtime::Runtime,
+    client: Requests,
+    in_flight: Arc<tokio::sync::Semaphore>,
+}
+
+/// What one request needs, cheap to clone into a task of the runtime.
+#[derive(Clone)]
+struct Requests {
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
-    user_agent: String,
+    user_agent: Arc<str>,
     /// How long a connection or a transfer may go without a byte, cargo's `http.timeout`.
     timeout: Duration,
 }
@@ -195,8 +249,12 @@ impl HyperHttp {
             .context("the machine's certificates cannot be read")?;
         let connector = roots.https_or_http().enable_http1().build();
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        let user_agent = format!("blaze/{}", env!("CARGO_PKG_VERSION"));
-        Ok(HyperHttp { runtime, client, user_agent, timeout })
+        let user_agent = format!("blaze/{}", env!("CARGO_PKG_VERSION")).into();
+        Ok(HyperHttp {
+            runtime,
+            client: Requests { client, user_agent, timeout },
+            in_flight: Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT)),
+        })
     }
 
     /// One shared by the whole process, with cargo's default timeout of 30 seconds.
@@ -216,9 +274,11 @@ impl HyperHttp {
         headers: &[(&str, &str)],
         body: Vec<u8>,
     ) -> anyhow::Result<Response> {
-        self.runtime.block_on(self.fetch(method, url, headers, Bytes::from(body)))
+        self.runtime.block_on(self.client.fetch(method, url, headers, Bytes::from(body)))
     }
+}
 
+impl Requests {
     async fn fetch(
         &self,
         method: Method,
@@ -231,7 +291,7 @@ impl HyperHttp {
             let mut request = Request::builder()
                 .method(method.clone())
                 .uri(&address)
-                .header(header::USER_AGENT, &self.user_agent)
+                .header(header::USER_AGENT, &*self.user_agent)
                 .header(header::ACCEPT_ENCODING, "gzip");
             for (name, value) in headers {
                 request = request.header(*name, *value);
@@ -291,6 +351,27 @@ impl HyperHttp {
 impl Http for HyperHttp {
     fn get(&self, url: &str, headers: &[(&str, &str)]) -> anyhow::Result<Response> {
         self.send(Method::GET, url, headers, Vec::new())
+    }
+
+    fn get_async(&self, url: &str, headers: &[(&str, &str)]) -> Pending<anyhow::Result<Response>> {
+        let (client, in_flight) = (self.client.clone(), self.in_flight.clone());
+        let url = url.to_owned();
+        let headers: Vec<(String, String)> =
+            headers.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())).collect();
+        let task = self.runtime.spawn(async move {
+            let _turn = in_flight.acquire_owned().await?;
+            let headers: Vec<(&str, &str)> =
+                headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+            client.fetch(Method::GET, &url, &headers, Bytes::new()).await
+        });
+        Box::pin(async move { task.await.context("a request's task ended")? })
+    }
+
+    fn sleep(&self, duration: Duration) -> Pending<()> {
+        let task = self.runtime.spawn(tokio::time::sleep(duration));
+        Box::pin(async move {
+            _ = task.await;
+        })
     }
 }
 

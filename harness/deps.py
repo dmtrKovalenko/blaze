@@ -84,7 +84,7 @@ def main():
 
     out = ra_jit(second, "pull", remote, ASKED_FOR_NOTHING)
     check("a pull from lists nobody signed is refused unless asked for",
-          out.returncode != 0 and "RA_JIT_REMOTE_UNSIGNED=1" in out.stderr and not any(os.path.exists(f"{second}/target/debug/{it}") for it in (".fingerprint", "build")),
+          out.returncode != 0 and "BLAZE_REMOTE_UNSIGNED=1" in out.stderr and not any(os.path.exists(f"{second}/target/debug/{it}") for it in (".fingerprint", "build")),
           out.stderr.strip()[-80:])
     out = ra_jit(second, "pull", remote)
     check("the units are pulled", out.returncode == 0, out.stdout.strip() + out.stderr.strip())

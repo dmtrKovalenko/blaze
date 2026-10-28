@@ -10,7 +10,8 @@ load commands, which is as much as `-headerpad` says. A program of a few hundred
 more table than the 1 MiB the daemon starts with; here a small one is made short of room the
 cheap way, by a `-headerpad` of its own in `.cargo/config.toml` that asks for 256 bytes.
 The program is built with `cargo ra-jit build` until the daemon serves the build, then
-edited a few times. The first link has to be done again with the room the table needs, and
+edited a few times. The first link is told the room the unwind information of what it links
+wants, so it is linked once (#173: a large program was linked a second time, 260 s more), and
 every edit after the first one (which writes the whole object again) has to be spliced, and
 print what the source says. The first edits would otherwise go into rustc's link, which the
 wrapper gives room of its own (rustcbase.py has those), so the daemon is run with
@@ -94,9 +95,11 @@ def main():
             time.sleep(0.5)
         else:
             raise SystemExit(f"no build said `[blaze]`; the daemon's log is in {home}")
-        again = [it for it in links(home) if "again with -Wl,-headerpad" in it]
-        print(f"{'the first link':30} {'linked again: ' + again[0] if again else 'NOT LINKED AGAIN WITH MORE ROOM'}")
-        wrong += not again
+        made = links(home)
+        again = [it for it in made if "again with -Wl,-headerpad" in it]
+        verdict = "NO LINK" if not made else f"LINKED AGAIN: {again[0]}" if again else "ok"
+        print(f"{'the first link':30} {verdict:12} {made[0][:110] if made else ''}")
+        wrong += verdict != "ok"
         for n in range(1, EDITS + 1):
             text = open(source).read()
             open(source, "w").write(text.replace(f"    {n}\n}}", f"    {n + 1}\n}}", 1))

@@ -61,7 +61,7 @@ const BUILT_IN: usize = 120;
 fn built_in() -> usize {
     static ASKED: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("RA_JIT_BUILT_IN").map_or(BUILT_IN, |it| {
-            it.parse().unwrap_or_else(|_| panic!("RA_JIT_BUILT_IN={it} is not a number"))
+            it.parse().unwrap_or_else(|_| panic!("BLAZE_BUILT_IN={it} is not a number"))
         })
     });
     *ASKED

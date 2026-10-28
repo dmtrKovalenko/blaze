@@ -70,10 +70,11 @@ features and edges `cargo build` with the load's `-p`, `--workspace`, `--exclude
 unifies features over every member, so a load of one member used to have edges to crates only
 another member's features reach (axum's examples to `mime_guess` through `tower-http/fs`) whose
 build scripts the build never ran, and `env!` of their variables failed. A lock file that is
-missing or that the manifests no longer agree with is written as cargo writes it (2026-10-26)
-when the resolve needs no registry version it does not have. What it does not read yet goes to
-cargo's `cargo metadata` with the reason printed: a registry version the lock file lacks
-(#321), `[replace]`, a registry with a git index.
+missing or that the manifests no longer agree with is written as cargo writes it (2026-10-26),
+a registry package it does not pin chosen from the registry's index as cargo chooses it
+(blaze-registry's `IndexRegistry`, #321). What it does not read yet goes to cargo's `cargo
+metadata` with the reason printed: `[replace]`, a registry with a git index, a git or vendored
+package the lock file does not pin.
 `RA_JIT_OWN_RESOLVE=0` sends every load to cargo.
 
 The unit graph is blaze's own (`crates/blaze-units`, 2026-10-27): a port of cargo's unit

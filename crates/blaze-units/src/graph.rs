@@ -977,6 +977,7 @@ impl<'a> State<'_, 'a> {
                     Kind::Target(triple) => Some(triple.clone()),
                 },
                 mode: unit.mode.schema(),
+                checked_as_test: unit.mode == Mode::Check { test: true },
                 features: unit.features.iter().map(|it| it.to_string()).collect(),
                 is_std: false,
                 dependencies,

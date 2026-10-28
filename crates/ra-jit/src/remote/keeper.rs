@@ -33,7 +33,7 @@ pub(super) fn push_every_from_env() -> anyhow::Result<Option<Duration>> {
         Ok(text) => {
             let every = parse_age(&text).filter(|it| !it.is_zero());
             Ok(Some(every.with_context(|| {
-                format!("RA_JIT_REMOTE_PUSH_EVERY=`{text}` is neither a time nor `off`")
+                format!("BLAZE_REMOTE_PUSH_EVERY=`{text}` is neither a time nor `off`")
             })?))
         }
     }

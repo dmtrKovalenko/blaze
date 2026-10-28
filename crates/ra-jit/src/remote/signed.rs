@@ -23,6 +23,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ra_jit_store::write_file_whole;
 use sha2::{Digest as _, Sha256};
 
+use crate::content::hex;
+
 /// The word the last line of a signed list starts with.
 const SIGNED: &str = "signed";
 
@@ -62,8 +64,8 @@ impl Trust {
         };
         let trusted = std::env::var("RA_JIT_REMOTE_TRUST").unwrap_or_default();
         let trusted = trusted.split(',').filter(|it| !it.is_empty()).map(|key| {
-            let bytes = unhex::<32>(key).context("RA_JIT_REMOTE_TRUST holds what is not a key")?;
-            VerifyingKey::from_bytes(&bytes).context("RA_JIT_REMOTE_TRUST holds what is not a key")
+            let bytes = unhex::<32>(key).context("BLAZE_REMOTE_TRUST holds what is not a key")?;
+            VerifyingKey::from_bytes(&bytes).context("BLAZE_REMOTE_TRUST holds what is not a key")
         });
         let unsigned = std::env::var_os("RA_JIT_REMOTE_UNSIGNED").is_some_and(|it| it == "1");
         Ok(Trust { signer, trusted: trusted.collect::<anyhow::Result<_>>()?, unsigned })
@@ -84,7 +86,7 @@ impl Trust {
     /// this one does would take nothing from an unsigned list.
     pub(crate) fn cannot_sign(&self) -> Option<&'static str> {
         (self.checks() && self.signer.is_none())
-            .then_some("RA_JIT_REMOTE_TRUST is set and RA_JIT_REMOTE_SIGN is not")
+            .then_some("BLAZE_REMOTE_TRUST is set and BLAZE_REMOTE_SIGN is not")
     }
 
     /// Why this machine may not write the list in `text` back, if it may not: the list is
@@ -95,7 +97,7 @@ impl Trust {
             return Ok(());
         }
         Err(NotRewritten(format!(
-            "`{name}` is signed, and this machine has no key in RA_JIT_REMOTE_SIGN: it is left \
+            "`{name}` is signed, and this machine has no key in BLAZE_REMOTE_SIGN: it is left \
              as it is"
         )))
     }
@@ -122,9 +124,9 @@ impl Trust {
         }
         if !self.unsigned {
             bail!(
-                "`{name}` is not taken: RA_JIT_REMOTE_TRUST names no key, and without one whoever \
+                "`{name}` is not taken: BLAZE_REMOTE_TRUST names no key, and without one whoever \
                  writes to the remote says what is run here. Name the keys of the machines that \
-                 push, or set RA_JIT_REMOTE_UNSIGNED=1 to take what is there"
+                 push, or set BLAZE_REMOTE_UNSIGNED=1 to take what is there"
             );
         }
         Ok(Opened { lines: split(text).0, turn: None })
@@ -320,10 +322,6 @@ fn signed_bytes(name: &str, turn: u64, body: &str) -> Vec<u8> {
     format!("ra-jit list 2\n{name}\n{turn}\n{body}").into_bytes()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
     let mut bytes = [0; N];
     if text.len() != N * 2 || !text.is_ascii() {
@@ -379,7 +377,7 @@ mod tests {
         let signed = sealed(1, "manifests/a", "one\n");
         for text in ["one\n", &signed] {
             let refused = trusting(None, &[]).open("manifests/a", text).err().unwrap().to_string();
-            assert!(refused.contains("RA_JIT_REMOTE_UNSIGNED=1"), "{refused}");
+            assert!(refused.contains("BLAZE_REMOTE_UNSIGNED=1"), "{refused}");
             let taken = Trust::of(None, &[], true).open("manifests/a", text).unwrap();
             assert!(taken.lines == "one\n" && taken.turn.is_none());
             // Adding to a list is not taking what it names.

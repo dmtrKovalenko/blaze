@@ -48,7 +48,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     Spliced, Stamp,
-    lasting::{Lasting, Own, is_lasting},
+    lasting::{Lasting, Own, is_lasting, left_behind},
 };
 
 /// What segments are aligned to on AArch64.
@@ -1320,6 +1320,9 @@ impl<'a> Patch<'a> {
                 None => None,
                 // The executable's is the same static with the same value: it is kept.
                 Some(_) if is_lasting(name) => None,
+                // One that says what a patch left behind is of that patch, which the executable
+                // was linked with, and says nothing of this one's.
+                Some(_) if left_behind(name).is_some() => None,
                 Some(Named::One(old)) if old.kind == SymbolKind::Text && code => Some(*old),
                 Some(Named::One(old)) if old.kind == SymbolKind::Data && !code => {
                     let new = InPlace { offset, size, old: *old };
@@ -2073,11 +2076,7 @@ pub(super) fn live(
     lasting: &mut Lasting,
 ) -> anyhow::Result<(ra_jit_live::format::Code, Vec<(u64, u64)>)> {
     let mut patch = Patch::read(patch, image)?;
-    let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
-    ensure!(
-        baked.iter().all(|it| defined.contains(&**it)),
-        "a function the executable was linked with a patch of is as it first was"
-    );
+    super::has_baked(baked, patch.replaced.iter().map(|it| it.name))?;
     lasting.place(&patch.lasting_own()?)?;
     patch.keep_lasting(|name| lasting.address(name))?;
     patch.place_live(image, originals, base, lasting)
@@ -2132,18 +2131,111 @@ pub(super) fn headerpad_wanted(commands: &[u8]) -> anyhow::Result<Option<(u64, b
         }
         command += u32_at(commands, command + 4)? as usize;
     }
+    Ok(room_wanted(len, unwind, frames).map(|(pad, needed)| (pad, needed > room)))
+}
+
+/// The `-headerpad` an executable whose load commands are `len` bytes, with an `__unwind_info`
+/// and an `__eh_frame` of those sizes, wants for splices ([`headerpad_short`]), and the room
+/// after its header that is the least a splice fits in.
+fn room_wanted(len: usize, unwind: Option<usize>, frames: Option<usize>) -> Option<(u64, usize)> {
     // Frames of the patch in front of the program's would take the table's 24-bit offsets
     // past 16 MB: both tables move.
     let both = |frames: usize| frames + frames / 4 > 0x00ff_ffff;
     let moved = match (unwind, frames) {
         (Some(unwind), Some(frames)) if both(frames) => unwind.next_multiple_of(8) + frames,
-        (unwind, frames) => match unwind.or(frames) {
-            Some(it) => it,
-            None => return Ok(None),
-        },
+        (unwind, frames) => unwind.or(frames)?,
     };
     let needed = (len + 2 * (SEGMENT + SECTION)).next_multiple_of(16) + moved;
-    Ok(Some(((needed + needed / 4 - len).next_multiple_of(PAGE as usize) as u64, needed > room)))
+    Some(((needed + needed / 4 - len).next_multiple_of(PAGE as usize) as u64, needed))
+}
+
+/// Where in an AArch64 object that starts with `commands`, its header and load commands, its
+/// `__eh_frame` and its `__compact_unwind` are: the offset in the file and the size of each it
+/// has. `None` for a file that is not such an object.
+pub(super) fn unwind_sections(commands: &[u8]) -> anyhow::Result<Option<[Option<(u64, u64)>; 2]>> {
+    let object = u32_at(commands, 0)? == macho::MH_MAGIC_64
+        && u32_at(commands, 4)? == macho::CPU_TYPE_ARM64
+        && u32_at(commands, 12)? == macho::MH_OBJECT;
+    if !object {
+        return Ok(None);
+    }
+    let (mut frames, mut compact) = (None, None);
+    let mut command = HEADER;
+    for _ in 0..u32_at(commands, 16)? {
+        if u32_at(commands, command)? == macho::LC_SEGMENT_64 {
+            for nth in 0..u32_at(commands, command + 64)? as usize {
+                let header = command + SEGMENT + nth * SECTION;
+                let at = || -> anyhow::Result<_> {
+                    let offset = u64::from(u32_at(commands, header + 48)?);
+                    Ok((offset, u64_at(commands, header + 40)?))
+                };
+                match commands.get(header..header + 16) {
+                    Some(b"__eh_frame\0\0\0\0\0\0") => frames = Some(at()?),
+                    Some(b"__compact_unwind") => compact = Some(at()?),
+                    _ => {}
+                }
+            }
+        }
+        command += u32_at(commands, command + 4)? as usize;
+    }
+    Ok(Some([frames, compact]))
+}
+
+/// What the objects of a link give the linker to lay out for the unwinder, added up over
+/// them: `__eh_frame` as it is, and a function of `__unwind_info` for each frame there and
+/// each entry of `__compact_unwind`. Read before the first link, for the executable to have
+/// the room for splices at once: one whose frames are far more than the default room makes a
+/// large program be linked twice (#173).
+#[derive(Debug, Default)]
+pub(super) struct Unwinding {
+    frames: usize,
+    functions: usize,
+}
+
+impl Unwinding {
+    /// The `__eh_frame` of an object: its bytes, and a function for each frame (FDE) in it.
+    pub(super) fn add_frames(&mut self, section: &[u8]) -> anyhow::Result<()> {
+        self.frames += section.len();
+        let mut at = 0;
+        while at + 8 <= section.len() {
+            let (len, id_at) = match u32_at(section, at)? {
+                0 => break,
+                0xffff_ffff => (usize::try_from(u64_at(section, at + 4)?)?, at + 12),
+                len => (len as usize, at + 4),
+            };
+            if u32_at(section, id_at)? != 0 {
+                self.functions += 1;
+            }
+            at = id_at + len;
+        }
+        Ok(())
+    }
+
+    /// The `__compact_unwind` of an object, `size` bytes: a function for each entry.
+    pub(super) fn add_compact(&mut self, size: u64) {
+        const ENTRY: u64 = 32;
+        self.functions += (size / ENTRY) as usize;
+    }
+
+    /// The `-headerpad` the executable linked of these objects wants for splices, at most:
+    /// ld64 lays a function's entry out in a regular page of `__unwind_info` (8 bytes, 511 to
+    /// the page, each page in the first-level index), each may have an LSDA, and the header,
+    /// its common encodings and personalities are under 1 KB; its `__eh_frame` is at most the
+    /// objects'. A link with `-no_compact_unwind` writes no table, so the frames are what
+    /// moves: the larger of the two. `None` when they have no unwind information.
+    pub(super) fn headerpad(&self) -> Option<u64> {
+        // The executable's load commands, which only a link knows: more than any program's
+        // has, and a quarter of it is all the pad depends on.
+        const COMMANDS: usize = 0x4000;
+        const PER_PAGE: usize = (0x1000 - 8) / 8;
+        let pages = self.functions.div_ceil(PER_PAGE);
+        let unwind = (self.functions != 0)
+            .then(|| 0x400 + (pages + 1) * 12 + pages * 0x1000 + self.functions * 8);
+        let frames = (self.frames != 0).then_some(self.frames);
+        let with_table = room_wanted(COMMANDS, unwind, frames);
+        let without = room_wanted(COMMANDS, None, frames);
+        with_table.max(without).map(|(pad, _)| pad)
+    }
 }
 
 /// The `LC_UUID` among the load commands `commands` start with.
@@ -2198,11 +2290,7 @@ pub(super) fn splice(
     };
     let mut from = start;
     let patch = Patch::read(patch, image)?;
-    let defined: FxHashSet<&[u8]> = patch.replaced.iter().map(|it| it.name).collect();
-    ensure!(
-        baked.iter().all(|it| defined.contains(&**it)),
-        "a function the executable was linked with a patch of is as it first was"
-    );
+    super::has_baked(baked, patch.replaced.iter().map(|it| it.name))?;
     let addition = patch.place(image)?;
     step("place", &mut from);
 
@@ -2288,8 +2376,8 @@ mod tests {
     use object::macho;
 
     use super::{
-        HEADER, PAGE, Pointer, SECTION, SEGMENT, Table, frames_behind, headerpad_short, put32,
-        put64, shifted, u32_at,
+        HEADER, PAGE, Pointer, SECTION, SEGMENT, Table, Unwinding, frames_behind, headerpad_short,
+        put32, put64, shifted, u32_at, unwind_sections,
     };
 
     /// The header and load commands of an executable of one segment, whose code starts
@@ -2354,6 +2442,49 @@ mod tests {
         let frames = 0xf0_0000;
         let pad = headerpad_short(&with_frames(0x1000, unwind, frames)).unwrap().unwrap();
         assert!(pad >= (unwind + frames) + (unwind + frames) / 4);
+    }
+
+    #[test]
+    fn a_first_link_has_the_room_its_objects_unwind_information_wants() {
+        // A common entry, three frames of 24 bytes and the terminator.
+        let mut section = Vec::new();
+        section.extend_from_slice(&12u32.to_le_bytes());
+        section.extend_from_slice(&[0; 12]);
+        for _ in 0..3 {
+            section.extend_from_slice(&20u32.to_le_bytes());
+            section.extend_from_slice(&(section.len() as u32).to_le_bytes());
+            section.extend_from_slice(&[0; 16]);
+        }
+        section.extend_from_slice(&[0; 4]);
+        let mut unwinding = Unwinding::default();
+        unwinding.add_frames(&section).unwrap();
+        unwinding.add_compact(2 * 32);
+        assert_eq!((unwinding.frames, unwinding.functions), (section.len(), 5));
+        assert_eq!(Unwinding::default().headerpad(), None);
+
+        // bun's base (#173): 20 MB of frames that ld64 makes no compact unwind of, which both
+        // move, are far more than the default room, and the first link has them already.
+        let (frames, functions) = (20 << 20, 700_000);
+        let bun = Unwinding { frames, functions };
+        let pad = bun.headerpad().unwrap();
+        let unwind = (functions * 8) as u64;
+        let linked = with_frames(0x1000, unwind, frames as u64);
+        let wanted = headerpad_short(&linked).unwrap().unwrap();
+        assert!(pad >= wanted && pad < 2 * wanted, "{pad:#x} for {wanted:#x}");
+        let room = (HEADER + SEGMENT + 3 * SECTION) as u32 + pad as u32;
+        assert_eq!(headerpad_short(&with_frames(room, unwind, frames as u64)).unwrap(), None);
+    }
+
+    #[test]
+    fn an_objects_unwind_sections_are_found_by_their_load_commands() {
+        let mut object = with_frames(0x1000, 0x40, 0x80);
+        put32(&mut object, 12, macho::MH_OBJECT);
+        let at = HEADER + SEGMENT + SECTION;
+        object[at..at + 16].copy_from_slice(b"__compact_unwind");
+        let [frames, compact] = unwind_sections(&object).unwrap().unwrap();
+        assert_eq!(frames, Some((0x1000 + 0x1000 + 0x40, 0x80)));
+        assert_eq!(compact, Some((0x1000 + 0x1000, 0x40)));
+        assert_eq!(unwind_sections(&with_frames(0x1000, 0x40, 0x80)).unwrap(), None);
     }
 
     /// One common entry (`zR`, addresses relative and 4 bytes) and one frame of the function

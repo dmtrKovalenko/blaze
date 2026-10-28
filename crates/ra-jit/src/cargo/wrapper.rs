@@ -641,9 +641,7 @@ impl Unit {
             copies,
             link_line,
             env: std::env::vars().filter(|(name, _)| names_a_place(name)).collect(),
-            crate_env: std::env::vars()
-                .filter(|(name, _)| super::own_script::read_by_crates(name))
-                .collect(),
+            crate_env: super::own_script::crate_env(),
         }
     }
 

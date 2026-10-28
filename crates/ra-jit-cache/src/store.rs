@@ -31,11 +31,16 @@ const MAGIC: &[u8; 16] = b"ra-jit-fn-cache2";
 /// The directory of the index, beside the directories of the codes.
 const INDEX: &str = "index";
 
+/// The setting `BLAZE_<name>`, else its old name `RA_JIT_<name>`, as blaze itself reads them.
+fn setting(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("BLAZE_{name}")).or_else(|| std::env::var_os(format!("RA_JIT_{name}")))
+}
+
 /// How many codes of a function its results are kept for: the code it has and the two before
 /// it, so that an edit taken back finds what the code before it computed.
 const CODES_KEPT: usize = 3;
 
-/// How much is kept on disk unless `RA_JIT_FN_CACHE_SIZE` says.
+/// How much is kept on disk unless `BLAZE_FN_CACHE_SIZE` says.
 const DEFAULT_SIZE: u64 = 512 << 20;
 
 /// How much the memory of a run holds before it starts over.
@@ -44,7 +49,7 @@ const MEMORY_SIZE: usize = 256 << 20;
 /// What a call is looked up by.
 pub struct Key {
     code: [u64; 2],
-    /// The function, for what `RA_JIT_FN_CACHE_LOG` prints.
+    /// The function, for what `BLAZE_FN_CACHE_LOG` prints.
     name: &'static str,
     args: Vec<u8>,
 }
@@ -154,12 +159,12 @@ impl Cache {
     }
 
     fn new() -> Option<Cache> {
-        let mode = std::env::var("RA_JIT_FN_CACHE").unwrap_or_default();
+        let mode = setting("FN_CACHE").and_then(|it| it.into_string().ok()).unwrap_or_default();
         if matches!(mode.as_str(), "off" | "0" | "false" | "no") {
             return None;
         }
         let disk = (mode != "memory").then(Disk::find).flatten();
-        let log = std::env::var_os("RA_JIT_FN_CACHE_LOG").is_some_and(|it| it != "0");
+        let log = setting("FN_CACHE_LOG").is_some_and(|it| it != "0");
         Some(Cache { disk, log, memory: Mutex::default() })
     }
 
@@ -193,11 +198,11 @@ struct Disk {
 }
 
 impl Disk {
-    /// `RA_JIT_FN_CACHE_DIR`, or `ra-jit/fn-cache` in the target directory the program is in:
+    /// `BLAZE_FN_CACHE_DIR`, or `ra-jit/fn-cache` in the target directory the program is in:
     /// the first directory above it with cargo's `CACHEDIR.TAG`. A program elsewhere keeps
     /// its results for the run alone.
     fn find() -> Option<Disk> {
-        let dir = match std::env::var_os("RA_JIT_FN_CACHE_DIR") {
+        let dir = match setting("FN_CACHE_DIR") {
             Some(dir) => PathBuf::from(dir),
             None => {
                 let exe = std::env::current_exe().ok()?;
@@ -206,8 +211,8 @@ impl Disk {
                 target.join("ra-jit").join("fn-cache")
             }
         };
-        let limit = std::env::var("RA_JIT_FN_CACHE_SIZE")
-            .ok()
+        let limit = setting("FN_CACHE_SIZE")
+            .and_then(|it| it.into_string().ok())
             .and_then(|it| parse_size(&it))
             .unwrap_or(DEFAULT_SIZE);
         Some(Disk { dir, limit, size: Mutex::new(None) })

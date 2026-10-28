@@ -512,7 +512,7 @@ impl LinkLine {
         command.push(shlex::try_quote(&format!("@{}", response.display()))?.into_owned());
         if self.flavor == Flavor::Apple {
             // Last, so that it is what the linker takes: it is at least what the line asks.
-            let asked = self.args.iter().filter_map(|it| headerpad_in(it)).last();
+            let asked = self.args.iter().filter_map(|it| headerpad_in(it)).next_back();
             command.push(shlex::try_quote(&headerpad_read(binary, asked)?)?.into_owned());
         }
         Ok(command.join(" "))

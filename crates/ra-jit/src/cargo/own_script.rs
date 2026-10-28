@@ -34,6 +34,45 @@ pub(crate) fn read_by_crates(name: &str) -> bool {
         || matches!(name, "CARGO_CRATE_NAME" | "CARGO_PRIMARY_PACKAGE" | "OUT_DIR" | "CARGO")
 }
 
+/// The variables of this process that the crate rustc compiles can read with `env!`: cargo's
+/// own ([`read_by_crates`]) and those the package's build script set with
+/// `cargo:rustc-env=NAME=VALUE`, which cargo passes in rustc's environment and the script's
+/// own output names, beside its `OUT_DIR`: `output` in cargo's layout of `target`, `run/stdout`
+/// in its build-dir layout. `mime_guess` reads `MIME_TYPES_GENERATED_PATH` so; without it a
+/// proc macro that links it (`rust-embed-impl`) was not built.
+pub(crate) fn crate_env() -> BTreeMap<String, String> {
+    crate_env_of(std::env::vars().collect())
+}
+
+/// [`crate_env`] of `vars`, the variables cargo gave rustc.
+fn crate_env_of(vars: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let from_script: Vec<String> = vars
+        .get("OUT_DIR")
+        .map(|out| {
+            let out = Path::new(out);
+            [out.with_file_name("output"), out.with_file_name("run").join("stdout")]
+                .iter()
+                .filter_map(|it| std::fs::read_to_string(it).ok())
+                .flat_map(|output| script_set_names(&output))
+                .collect()
+        })
+        .unwrap_or_default();
+    vars.into_iter()
+        .filter(|(name, _)| read_by_crates(name) || from_script.iter().any(|it| it == name))
+        .collect()
+}
+
+/// The names a build script's `output` sets with `cargo:rustc-env` or `cargo::rustc-env`.
+fn script_set_names(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("cargo::rustc-env=").or_else(|| line.strip_prefix("cargo:rustc-env="))
+        })
+        .filter_map(|it| it.split_once('=').map(|(name, _)| name.to_owned()))
+        .collect()
+}
+
 /// The cfgs rustc compiles a crate with beside the target's, given `args`: `--cfg`, and
 /// `debug_assertions` unless it optimizes or is told not to.
 pub(crate) fn cfg_of(args: &[String]) -> Vec<String> {
@@ -189,8 +228,7 @@ pub(crate) fn compile_as(
 ) -> Result<(), String> {
     let rustc = crate::answers::toolchain_rustc_of(rustc).ok_or("its toolchain is not known")?;
     let sysroot = rustc.parent().and_then(Path::parent).ok_or("its toolchain is not known")?;
-    let env: BTreeMap<String, String> =
-        std::env::vars().filter(|(name, _)| read_by_crates(name)).collect();
+    let env = crate_env();
     let asked = Asked { args, cwd };
     compile_in(sysroot, &asked, source, env, made, dir, &|name| std::env::var(name).ok())
 }
@@ -302,7 +340,7 @@ pub(crate) fn made_of(named: &Path, exe: &Path) -> Option<String> {
     (super::keyed::digest(exe.to_str()?) == digest).then(|| key.to_owned())
 }
 
-fn store() -> Option<&'static ra_jit_store::Store> {
+pub(crate) fn store() -> Option<&'static ra_jit_store::Store> {
     ra_jit_store::compiles_against(BUILDS);
     ra_jit_store::Store::global_or(super::daemon::store().as_deref())
 }
@@ -706,6 +744,47 @@ fn described(krate: &Described, member: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `mime_guess`'s build script sets `MIME_TYPES_GENERATED_PATH`, which its source reads with
+    /// `env!`: the crate is described with it, from the script's output in either of cargo's
+    /// layouts (`output` beside `out`, or `run/stdout` in the build-dir layout blaze's cargo
+    /// writes), and with no other variable of the process than cargo's own.
+    #[test]
+    fn a_crate_reads_what_its_build_script_set_in_either_layout() {
+        let root = std::env::temp_dir().join(format!("ra-jit-script-env-{}", std::process::id()));
+        let said = "cargo:rerun-if-changed=build.rs\n\
+                    cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/out/mime_types_generated.rs\n\
+                    cargo::rustc-env=WITH_EQUALS=a=b\n\
+                    cargo:rustc-cfg=feature=\"x\"\n";
+        let classic = root.join("classic");
+        std::fs::create_dir_all(classic.join("out")).unwrap();
+        std::fs::write(classic.join("output"), said).unwrap();
+        let build_dir = root.join("build-dir");
+        std::fs::create_dir_all(build_dir.join("out")).unwrap();
+        std::fs::create_dir_all(build_dir.join("run")).unwrap();
+        std::fs::write(build_dir.join("run/stdout"), said).unwrap();
+        for out in [classic.join("out"), build_dir.join("out")] {
+            let vars: BTreeMap<String, String> = [
+                ("OUT_DIR", out.to_str().unwrap()),
+                ("CARGO_PKG_NAME", "mime_guess"),
+                ("MIME_TYPES_GENERATED_PATH", "/out/mime_types_generated.rs"),
+                ("WITH_EQUALS", "a=b"),
+                ("HOME", "/home/someone"),
+                ("PATH", "/usr/bin"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+            let names: Vec<String> = crate_env_of(vars).into_keys().collect();
+            assert_eq!(
+                names,
+                ["CARGO_PKG_NAME", "MIME_TYPES_GENERATED_PATH", "OUT_DIR", "WITH_EQUALS"],
+                "{}",
+                out.display()
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn a_variable_read_as_rustc_would_read_it() {

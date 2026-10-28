@@ -421,6 +421,21 @@ impl Invocation {
         self.target().and_then(|it| unsupported_target(&it))
     }
 
+    /// The flags typed that pick targets, `--bin NAME` and the like with their values.
+    pub(crate) fn target_flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        let mut words = self.build_args.iter();
+        while let Some(word) = words.next() {
+            if TARGET_SELECTION.contains(&word.as_str()) {
+                flags.push(word.clone());
+                if VALUED.contains(&word.as_str()) {
+                    flags.extend(words.next().cloned());
+                }
+            }
+        }
+        flags
+    }
+
     /// Whether `flag` was typed.
     pub(crate) fn typed(&self, flag: &str) -> bool {
         self.build_args.iter().any(|it| it == flag)

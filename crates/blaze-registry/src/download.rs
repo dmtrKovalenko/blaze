@@ -190,14 +190,17 @@ impl Registry {
             );
         }
         let config = self.config()?.context("config.json not found")?;
-        if config.auth_required {
-            bail!("the registry requires authentication, which blaze does not do yet");
-        }
         let url =
             crate_url(&config.dl, &package.name, &package.version.to_string(), &package.checksum);
+        let token = match config.auth_required {
+            true => Some(self.sparse().context("a registry with a config.json")?.token(false)?),
+            false => None,
+        };
+        let headers: Vec<(&str, &str)> =
+            token.as_deref().map(|it| ("authorization", it)).into_iter().collect();
         let http = &self.context().http;
         let bytes = self.context().net.retry.run(|| {
-            let answer = http.get(&url, &[])?;
+            let answer = http.get(&url, &headers)?;
             if answer.status != 200 {
                 return Err(HttpNotSuccessful::new(&url, &answer).into());
             }

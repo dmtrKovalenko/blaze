@@ -1,8 +1,9 @@
 //! `units build|check|test|bench --host TRIPLE --host-cfg-file FILE [--target TRIPLE
-//! --target-cfg-file FILE] [FLAGS]`: the unit graph blaze makes for the cargo command of those
-//! flags, as `cargo <command> --unit-graph -Zunstable-options` prints it, from the current
-//! directory. `harness/resolve.py units` compares the two. Each cfg file is what
-//! `rustc --print cfg --target TRIPLE` prints, which the harness asks.
+//! --target-cfg-file FILE] [--rustc-version RELEASE] [FLAGS]`: the unit graph blaze makes for
+//! the cargo command of those flags, as `cargo <command> --unit-graph -Zunstable-options` prints
+//! it, from the current directory. `harness/resolve.py units` compares the two. Each cfg file is
+//! what `rustc --print cfg --target TRIPLE` prints, `--rustc-version` the `release` `rustc -vV`
+//! prints, which the harness asks.
 
 #![allow(clippy::print_stderr, clippy::print_stdout, reason = "a command line program")]
 
@@ -32,6 +33,7 @@ struct Flags {
     host_cfg_file: Option<PathBuf>,
     target: Option<String>,
     target_cfg_file: Option<PathBuf>,
+    rustc_version: Option<String>,
     packages: Vec<String>,
     workspace: bool,
     excludes: Vec<String>,
@@ -73,6 +75,7 @@ fn parse(args: &[String]) -> anyhow::Result<(String, Flags)> {
             "--host-cfg-file" => flags.host_cfg_file = Some(PathBuf::from(value()?)),
             "--target" => flags.target = Some(value()?),
             "--target-cfg-file" => flags.target_cfg_file = Some(PathBuf::from(value()?)),
+            "--rustc-version" => flags.rustc_version = Some(value()?),
             "-p" | "--package" => flags.packages.push(value()?),
             "--workspace" | "--all" => flags.workspace = true,
             "--exclude" => flags.excludes.push(value()?),
@@ -157,6 +160,7 @@ fn run() -> anyhow::Result<()> {
         }),
         offline: false,
         store: None,
+        rustc_version: flags.rustc_version.as_deref(),
     };
     let units = blaze_metadata::Units {
         intent,

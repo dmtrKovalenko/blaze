@@ -9,7 +9,8 @@ between ra-jit, the fork and the fork's upstream.
     vendor/subtree.py upstream rust-analyzer [REF]
         merge upstream rust-analyzer's REF (default: its newest weekly release tag) into vendor/
 
-`push` is what CI runs on every push to main (.github/workflows/fork-sync.yaml). It makes one
+`push` is what each fork runs every ten minutes (its own `sync from blaze` workflow, on its
+`fork-sync` branch, with its own token). It makes one
 fork commit for each commit on REV's first-parent line that changed the directory, with that
 commit's tree under the directory, author, dates and message, so running it twice, or here and
 in CI, makes the same commits. It starts after the newest commit whose directory is what the

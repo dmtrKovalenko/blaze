@@ -57,7 +57,7 @@ libstdc++).
 
 `ra-jit closure fetch [--host HOST] [ROOT...]`, every root of the host by default:
 
-1. Each root's `<hash>.narinfo` is read from cache.nixos.org (or `RA_JIT_NIX_CACHE`, an address
+1. Each root's `<hash>.narinfo` is read from cache.nixos.org (or `BLAZE_NIX_CACHE`, an address
    or a directory laid out as a cache is), then each path its `References` name, to the whole
    closure. A narinfo is taken only if its `Sig` by `cache.nixos.org-1` (public key
    `6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=`) holds for nix's fingerprint
@@ -101,7 +101,7 @@ only its packs. The gateway needs no change: these are ordinary packs.
 
 `ra-jit closure materialize [--host HOST] [ROOT...]` walks the roots' closure in the store and
 lays each store path out as `~/.blaze/nix/<hash>-<name>` (`BLAZE_HOME/nix`), printing each store
-path and its directory. With `RA_JIT_REMOTE` set it first reads which pack of the project
+path and its directory. With `BLAZE_REMOTE` set it first reads which pack of the project
 `nix-closure` holds which key, and the store fetches a pack when a key of it is first asked for.
 It never reads cache.nixos.org: a path the store lacks and no remote brings is an error that
 names it and says CI fills the remote with it.
@@ -127,7 +127,7 @@ In `crates/ra-jit/src/cargo/closure/mod.rs`:
   each with its NarHash and NarSize, from the store: what a key of a run that sees it names.
 - `materialize(path: &StorePath) -> anyhow::Result<PathBuf>`: the path laid out, as above.
 
-They use the process's store (`RA_JIT_CACHE`, else the daemon's) and whatever the store asks
+They use the process's store (`BLAZE_CACHE`, else the daemon's) and whatever the store asks
 for what it lacks: a process that is to take the closure from a remote opens it first, as
 `closure materialize` does with `remote::Shared::lazily(store, remote, "nix-closure")`.
 
@@ -144,7 +144,7 @@ network:
 | `closure fetch` again | 0.16 s | nothing downloaded: 200 manifests in the store |
 | what the store keeps | | 638.6 MB in 39 files |
 | `cache push DIR nix-closure` | 0.54 s | 37 packs, 638.6 MB |
-| `closure materialize`, empty store, `RA_JIT_REMOTE=DIR` | 29.7 s | 24,720 keys in 37 packs pulled; 2,550.5 MB laid out |
+| `closure materialize`, empty store, `BLAZE_REMOTE=DIR` | 29.7 s | 24,720 keys in 37 packs pulled; 2,550.5 MB laid out |
 | `closure materialize` again, all in place | 0.15 s | |
 | `closure materialize` from the filled store, no remote | 15.5 s | 2,550.5 MB laid out |
 
@@ -165,4 +165,4 @@ tree is the one whose NarHash cache.nixos.org signs. With an empty store and no 
 - A process takes keys it lacks from one remote project: the daemon pulls its own project, so
   for build scripts it runs, the closure's project is to be read beside it.
 - The store's garbage collection does not know the closure from other packs: on a small disk,
-  `RA_JIT_CACHE_MAX` (default a tenth of the disk) can be below the closure's packs.
+  `BLAZE_CACHE_MAX` (default a tenth of the disk) can be below the closure's packs.

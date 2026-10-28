@@ -8,7 +8,7 @@
 # It downloads the release built for this machine (macOS on Apple silicon, Linux on x86-64 or
 # ARM64), checks it against the checksums published with it, puts `blaze`, `cargo-blaze` and the
 # programs they run in ${CARGO_HOME:-~/.cargo}/bin, and has blaze download the Rust it builds
-# with, once (100 to 135 MB; none when rustup already has it). It never asks anything. Running it
+# with, once (125 to 160 MB; none when rustup already has it). It never asks anything. Running it
 # again installs the newest release over the one there.
 #
 #   --version V        install release V (or BLAZE_VERSION=V) instead of the newest

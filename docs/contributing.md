@@ -70,8 +70,9 @@ in ra-jit like any other file: one commit can change MIR lowering and the code g
 together. A branch that changes vendor/ merges into main like any other branch; there is
 nothing to port and no pointer to bump.
 
-The fork follows main by itself: on every push to main that changes `vendor/`, the
-`fork sync` workflow runs
+The fork follows main by itself: every ten minutes, a `sync from blaze` workflow in each
+fork (on its `fork-sync` branch, the default only so the schedule runs) checks out main and
+runs, with that fork's own token, so no secret for it exists in blaze
 
     vendor/subtree.py push rust-analyzer
     vendor/subtree.py push rustc_abi
@@ -151,7 +152,7 @@ it. The paths that remain may be fixed where they are wrong, and are otherwise o
    change generated code. The corpus with `--layouts`, `breakers.py` and
    `fuzz/fuzz.py smoke` are the ones that notice first.
 4. Land it on `main` through a pull request ([Landing a change](#landing-a-change)). The
-   `fork sync` workflow sends the merge to the fork.
+   forks' `sync from blaze` workflow sends the merge to the fork within ten minutes.
 
 This was done once, on 2026-10-20, for upstream `0b21bd6596`. The merge was clean; the one
 API change ra-jit had to follow was `CrateData::is_proc_macro` becoming `target_kind` (a

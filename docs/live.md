@@ -178,6 +178,12 @@ next before it read it) changes nothing, since no patch's code refers to a stati
 patch. The program lowers the `end` it publishes below them, so a daemon started again places
 nothing over them. A static of the executable keeps its address and its value; one whose
 declaration or first value an edit changes is another static, which starts from the new value.
+A static of the base whose new value is larger than the base's copy, or aligned to more, is
+named the same way, as one new since the base: it starts from its new value, as one written
+over the base's does, and every function and static of the base that refers to it goes in the
+patch, so that nothing that runs refers to the base's copy (`patch::Base::moved`,
+[#168](https://github.com/indexable-inc/blaze/issues/168)). When code the base has from the
+store refers to it, which no patch can tell, the edit is built in full.
 A lasting name already in the executable (one a splice of the whole object left there) is
 that executable's copy. A static that points into itself is refused (its first value would
 point into a patch), and so are two statics written the same in one place.

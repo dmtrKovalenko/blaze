@@ -30,15 +30,16 @@
 //! The arguments have to implement `serde::Serialize` and the result `Serialize` and
 //! `DeserializeOwned`. Results are kept under the target directory the program was built in,
 //! `target/ra-jit/fn-cache`, up to 512 MiB, the least recently used going first, and for no
-//! more than a function's last three codes. The environment of the program can change that:
+//! more than a function's last three codes. The environment of the program can change that
+//! (each setting is also read by its old name, `RA_JIT_` for `BLAZE_`):
 //!
-//! - `RA_JIT_FN_CACHE=off` calls every function every time; `memory` keeps results for the
+//! - `BLAZE_FN_CACHE=off` calls every function every time; `memory` keeps results for the
 //!   run alone.
-//! - `RA_JIT_FN_CACHE_DIR` is the directory to keep them in.
-//! - `RA_JIT_FN_CACHE_SIZE` is how much to keep there, in bytes, or with `K`, `M` or `G`.
-//! - `RA_JIT_FN_CACHE_LOG=1` says on stderr what became of each call.
+//! - `BLAZE_FN_CACHE_DIR` is the directory to keep them in.
+//! - `BLAZE_FN_CACHE_SIZE` is how much to keep there, in bytes, or with `K`, `M` or `G`.
+//! - `BLAZE_FN_CACHE_LOG=1` says on stderr what became of each call.
 //!
-//! `cargo ra-jit cache` lists what each function kept, and `cargo ra-jit cache clear` empties
+//! `cargo blaze cache` lists what each function kept, and `cargo blaze cache clear` empties
 //! the directory of a project (`--stale`: of all but what each function's code computed).
 
 pub use ra_jit_cache_macros::cache;

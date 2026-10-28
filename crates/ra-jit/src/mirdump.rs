@@ -145,7 +145,7 @@ impl<'a> Dump<'a> {
         let runtime = db.runtime_mir_body(def);
         self.timing.built += start.elapsed();
         if let Err(error) = &runtime {
-            let _ = writeln!(self.out, "// ra-jit: no MIR: {error:?}");
+            let _ = writeln!(self.out, "// blaze: no MIR: {error:?}");
             return None;
         }
         self.timing.bodies += 1;
@@ -164,7 +164,7 @@ impl<'a> Dump<'a> {
         let runtime = db.runtime_mir_body_for_closure(closure);
         self.timing.built += start.elapsed();
         if let Err(error) = &runtime {
-            let _ = writeln!(self.out, "// ra-jit: no MIR: {error:?}");
+            let _ = writeln!(self.out, "// blaze: no MIR: {error:?}");
             return None;
         }
         self.timing.bodies += 1;
@@ -187,7 +187,7 @@ impl<'a> Dump<'a> {
         }
         let def = InferBodyId::DefWithBodyId(func.into());
         let Some(body) = self.body(def) else {
-            let _ = writeln!(self.out, "// ra-jit: of fn {path}\n");
+            let _ = writeln!(self.out, "// blaze: of fn {path}\n");
             return;
         };
         let text = print_mir_body(self.db, body, &path);
@@ -211,7 +211,7 @@ impl<'a> Dump<'a> {
             let suffix = closure_path_suffix(db, closure).unwrap_or_else(|| "::{closure}".into());
             let name = format!("{path}{suffix}");
             let Some(body) = self.closure_body(closure) else {
-                let _ = writeln!(self.out, "// ra-jit: of fn {name}\n");
+                let _ = writeln!(self.out, "// blaze: of fn {name}\n");
                 continue;
             };
             let text = print_mir_body(self.db, body, &name);

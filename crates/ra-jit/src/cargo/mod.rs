@@ -13,7 +13,9 @@ mod client;
 pub(crate) mod closure;
 pub(crate) mod compile_time;
 mod directives;
+mod experimental;
 pub(crate) mod fetches;
+mod hermetic;
 pub(crate) mod layout;
 mod messages;
 pub(crate) mod metadata;
@@ -59,7 +61,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         crate::end_with_reader();
     }
     if let Asked::Build(_) = asked
-        && let Err(why) = toolchain::settle()
+        && let Err(why) = toolchain::settle(true)
     {
         say::error(&why);
         std::process::exit(FAILED);
@@ -76,7 +78,7 @@ pub(crate) fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> 
         Asked::Stop => stop()?,
         Asked::Enable => switch::enable()?,
         Asked::Disable => switch::disable()?,
-        Asked::Toolchain { path } => match toolchain::settle() {
+        Asked::Toolchain { path } => match toolchain::settle(false) {
             Ok(chosen) if path => {
                 println!("{}", chosen.dir().display());
                 0
@@ -243,7 +245,7 @@ fn blaze_tag() -> String {
 /// `RA_JIT_REMOTE_REQUIRED` makes that a failure of the build.
 fn remote_failed_it() -> Option<i32> {
     let down = crate::remote::noted_down().filter(|_| crate::remote::required())?;
-    say::error(&format!("the remote failed and RA_JIT_REMOTE_REQUIRED is set: {down}"));
+    say::error(&format!("the remote failed and BLAZE_REMOTE_REQUIRED is set: {down}"));
     Some(FAILED)
 }
 
@@ -452,7 +454,7 @@ fn loaded_by_cargo(asked: &Invocation, cwd: &Path, key: &str) -> anyhow::Result<
 /// What the store of compiled code holds and may hold, and where it is.
 fn store_status() -> String {
     let Some(dir) = daemon::store() else {
-        return "store: none (RA_JIT_CACHE says so)".to_owned();
+        return "store: none (BLAZE_CACHE says so)".to_owned();
     };
     let held = ra_jit_store::StoreDir::at(&dir).stats().map_or(0, |it| it.held());
     let most = match ra_jit_store::limit_for(&dir) {

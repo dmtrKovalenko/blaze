@@ -110,7 +110,13 @@ pub(crate) fn dir() -> Option<PathBuf> {
 fn store() -> anyhow::Result<&'static Store> {
     ra_jit_store::compiles_against(KEPT_AS);
     let store = Store::global_or(super::daemon::store().as_deref());
-    store.context("there is no store to keep or take the closure in: RA_JIT_CACHE turns it off")
+    store.context("there is no store to keep or take the closure in: BLAZE_CACHE turns it off")
+}
+
+/// Has blaze's store see what other processes put in it since this one opened it.
+pub(crate) fn refresh() -> anyhow::Result<()> {
+    store()?.refresh();
+    Ok(())
 }
 
 /// Every store path `roots` refer to, themselves included, each once and sorted by path, from
@@ -228,7 +234,7 @@ fn materialize_command(roots: &[StorePath]) -> anyhow::Result<()> {
         && !spec.is_empty()
         && spec != "off"
     {
-        let dir = super::daemon::store().context("RA_JIT_CACHE turns the store off")?;
+        let dir = super::daemon::store().context("BLAZE_CACHE turns the store off")?;
         crate::remote::Shared::lazily(&dir, &spec, PROJECT)?.pull()?;
     }
     let closure = closure_of(roots)?;

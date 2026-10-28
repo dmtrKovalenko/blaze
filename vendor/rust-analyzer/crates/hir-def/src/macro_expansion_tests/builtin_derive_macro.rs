@@ -889,6 +889,73 @@ impl <T: $crate::marker::ConstParamTy_, > $crate::marker::ConstParamTy_ for Requ
 }
 
 #[test]
+fn from_expansion() {
+    check(
+        r#"
+//- minicore: derive_from
+
+use core::from::From;
+
+#[derive(From)]
+struct Meters(u32);
+
+#[derive(From)]
+struct Named<'a, T: Clone, const N: usize> where T: Copy { inner: &'a [T; N] }"#,
+        expect![[r#"
+
+use core::from::From;
+
+#[derive(From)]
+struct Meters(u32);
+
+#[derive(From)]
+struct Named<'a, T: Clone, const N: usize> where T: Copy { inner: &'a [T; N] }
+impl <> $crate::convert::From<u32> for Meters< > where {
+    #[inline] fn from(value: u32) -> Self {
+        Self (value)
+    }
+}
+impl <'a, T, const N: usize, > $crate::convert::From<&'a[T;
+N]> for Named<'a, T, N, > where T: Copy, T: Clone, {
+    #[inline] fn from(value:&'a[T;
+    N]) -> Self {
+        Self {
+            inner: value
+        }
+    }
+}"#]],
+    );
+}
+
+#[test]
+fn from_errors() {
+    check_errors(
+        r#"
+//- minicore: derive_from
+
+use core::from::From;
+
+#[derive(From)]
+struct Empty;
+
+#[derive(From)]
+struct Two(u8, u8);
+
+#[derive(From)]
+enum Either { A(u8) }
+
+#[derive(From)]
+union Bits { a: u8 }
+"#,
+        expect![[r#"
+            24..53: `#[derive(From)]` used on a struct with no fields
+            55..90: `#[derive(From)]` used on a struct with multiple fields
+            92..129: `#[derive(From)]` used on an enum
+            131..167: `#[derive(From)]` used on a union"#]],
+    );
+}
+
+#[test]
 fn coerce_shared_errors() {
     check_errors(
         r#"

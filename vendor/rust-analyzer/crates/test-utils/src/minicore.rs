@@ -32,6 +32,7 @@
 //!     deref: sized
 //!     deref_pat: deref
 //!     derive:
+//!     derive_from: derive, from
 //!     discriminant:
 //!     drop: sized
 //!     env: option
@@ -395,6 +396,13 @@ pub mod clone {
     // endregion:derive
 }
 // endregion:clone
+
+// region:derive_from
+pub mod from {
+    #[rustc_builtin_macro]
+    pub macro From($item:item) {}
+}
+// endregion:derive_from
 
 pub mod convert {
     // region:from

@@ -10,12 +10,10 @@ cd my-project
 cargo blaze build
 ```
 
-The first build runs cargo, with cargo's usual output, while a background process, the daemon,
-loads your project beside it. The build then waits for the daemon to build your program, under
-a second after cargo on ripgrep and about 4 seconds on nushell:
+The first build starts a background process, the daemon, which loads your project and compiles
+every crate of it from source. No `cargo build` and no rustc run:
 
 ```
-     Waiting for blaze to load the workspace
     Finished `dev` profile [ra-jit] target(s) in 41.20s
 ```
 
@@ -36,13 +34,12 @@ $ cargo blaze build
   left to cargo, and why.
 - `cargo blaze stop` stops the daemon. It also stops by itself after 30 minutes without a build.
 
-Any other subcommand goes to cargo unchanged. When blaze can't be sure its result would be the
-same as cargo's, it lets cargo do that build and prints one line saying why
-(`ra-jit: bug: <reason>; building with cargo, ...`). Each is a bug: ra-jit is never to build
-with cargo ([#84](https://github.com/indexable-inc/ra-jit/issues/84)), and the line names the
-step of [the plan](no-rustc.md) that removes it. That happens after a change to `Cargo.toml`,
-`Cargo.lock` or what a build script reads, when a test is added or removed, and for a few flags
-such as `--message-format` and cargo's own `-Z`. The full list is in [cargo.md](cargo.md#when-cargo-builds-instead).
+Every other subcommand is blaze's own too (`fmt`, `clippy`, `doc`, `tree` and the rest); one blaze
+has not written yet fails and says so. None of them runs cargo. A build blaze can't do yet fails
+with the reason, `blaze does not build ... yet`, and is not handed to cargo: so far that is a few
+flags such as `--message-format`, cargo's own `-Z` and several `--target`s at once, and code blaze
+can't compile. Each is a bug ([#84](https://github.com/indexable-inc/ra-jit/issues/84),
+[the plan](no-rustc.md)).
 rustc's `-Z` flags in `RUSTFLAGS` or `rustflags`, such as `-Zthreads=8`, are another matter: rustc
 still gets them, and what blaze does with each is in [support.md](support.md#-z-flags-for-rustc).
 
@@ -110,9 +107,11 @@ and comes with the next release. How it works, and how fast from a keystroke to 
   code both build; code that needs what that nightly lacks, such as a feature it removed, fails
   with rustc's error (see [install.md](install.md#what-you-need) and
   [support.md](support.md#toolchain)).
-- **Not every build is blaze's.** The changes listed above go to cargo, and so does code blaze
-  can't compile yet. `cargo blaze status` counts both; in the benchmark tables, `(c)` marks an
-  edit that went to cargo.
+- **Not everything builds yet.** Under `cargo blaze`, the flags listed above and code blaze can't
+  compile yet fail the build with the reason; nothing goes to cargo. Plain cargo after
+  `cargo blaze enable` still has rustc build what blaze does not, and `cargo blaze status` counts
+  those builds. In the benchmark tables, `(c)` marks an edit that went to cargo when it was
+  measured.
 - **Errors.** An edit with a type error fails to build, as it would under cargo. The borrow checker
   is new: 0.1.0 has none, so an edit with a borrow error builds and runs; the one on `main` finds
   about two thirds of rustc's borrow errors. Keep `cargo check` or your CI as the final word.

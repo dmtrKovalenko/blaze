@@ -10,7 +10,8 @@ with fixed `Date` and `Server` headers), as `mock` (with an API), `auth` (`auth-
 `BIN cargo ARGS` (BIN: `ra-jit`, default `target/release/ra-jit`), each with a `$CARGO_HOME` of
 its own made from the same files, and compares the exit status, standard output and error (the
 homes and the port named alike), every request the registry got (method, path, `Authorization`,
-`Content-Type`, `Accept` and body), and the bytes and mode of the credentials files left.
+`Content-Type`, `Accept` and body), the bytes and mode of the credentials files left, and what a
+credential provider of the home's (`provider.py`) was asked.
 A few cases ask crates.io itself, read-only and with no token (`--no-network` leaves them out).
 """
 import argparse, http.server, json, os, shutil, subprocess, sys, tempfile, threading, tomllib, urllib.parse
@@ -121,6 +122,62 @@ credential-provider = "cargo:token"
 token = "mock-token"
 """
 
+# A credential provider in each $CARGO_HOME, as a credential process (`--cargo-plugin`) or as
+# `cargo:token-from-stdout`'s command (`stdout`): it keeps what it was given in `provider.log`
+# and answers as its first argument says.
+PROVIDER = r'''#!/usr/bin/env python3
+import json, os, sys
+log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "provider.log")
+def keep(line):
+    with open(log, "a") as f:
+        f.write(line + "\n")
+if sys.argv[1:2] == ["stdout"]:
+    keep(json.dumps({"argv": sys.argv[2:], "index": os.environ.get("CARGO_REGISTRY_INDEX_URL"),
+                     "name": os.environ.get("CARGO_REGISTRY_NAME_OPT")}))
+    mode = sys.argv[2] if len(sys.argv) > 2 else ""
+    if mode == "fail":
+        sys.exit(3)
+    print("line-one\nline-two" if mode == "two" else "stdout-token")
+    sys.exit(0)
+keep(json.dumps({"argv": sys.argv[1:]}))
+line = sys.stdin.readline
+if os.path.basename(__file__) == "provider-v2.py":
+    print(json.dumps({"v": [2]}), flush=True)
+    sys.exit(0)
+print(json.dumps({"v": [1]}), flush=True)
+request = line()
+keep(request.rstrip("\n"))
+request = json.loads(request)
+mode = (request.get("args") or ["token"])[0]
+answers = {
+    "not-found": {"Err": {"kind": "not-found"}},
+    "url": {"Err": {"kind": "url-not-supported"}},
+    "unsupported": {"Err": {"kind": "operation-not-supported"}},
+    "other": {"Err": {"kind": "other", "message": "the vault is locked", "caused-by": ["no key", "none at all"]}},
+    "never": {"Ok": {"kind": "get", "token": "never-token", "cache": "never", "operation_independent": True}},
+    "expires": {"Ok": {"kind": "get", "token": "expiring-token", "cache": "expires", "expiration": 4102444800,
+                       "operation_independent": False}},
+}
+if mode == "garbage":
+    print("no json", flush=True)
+elif mode in answers:
+    print(json.dumps(answers[mode]), flush=True)
+elif request["kind"] == "get":
+    print(json.dumps({"Ok": {"kind": "get", "token": "process-token", "cache": "session",
+                             "operation_independent": True}}), flush=True)
+else:
+    print(json.dumps({"Ok": {"kind": request["kind"]}}), flush=True)
+sys.stdin.read()
+sys.exit(3 if mode == "exit" else 0)
+'''
+
+
+def providers(*listed):
+    return "\n[registry]\nglobal-credential-providers = [" + ", ".join(json.dumps(p) for p in listed) + "]\n"
+
+
+PROC = "@HOME@/provider.py"
+STDOUT = "cargo:token-from-stdout @HOME@/provider.py stdout"
 M = ["--registry", "mock"]
 # (name, arguments, standard input, where it runs, files of $CARGO_HOME, extra
 # config.toml, environment, network). The credentials of a case in UNORDERED are compared as
@@ -200,6 +257,54 @@ CASES = [
     ("logout of crates.io, not logged in", ["logout"], None, "plain", {}, "", {}, False),
     ("logout, a word", ["logout", "x"], None, "plain", {}, "", {}, False),
     ("logout, verbose", ["logout", "-v", *M], None, "plain", {"credentials.toml": CREDENTIALS}, "", {}, False),
+    ("owner, a credential process", ["owner", *M, "-l", "krate"], None, "plain", {}, providers(PROC), {}, False),
+    ("owner, a credential process's arguments", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(PROC + " token extra"), {}, False),
+    ("owner, verbose, a credential process", ["owner", "-v", *M, "-l", "krate"], None, "plain", {}, providers(PROC), {}, False),
+    ("owner, a credential process with no token", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(PROC + " not-found"), {}, False),
+    ("owner, a credential process not for the registry, then cargo:token", ["owner", *M, "-l", "krate"], None, "plain",
+     {"credentials.toml": CREDENTIALS}, providers("cargo:token", PROC + " url"), {}, False),
+    ("owner, a credential process that fails", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(PROC + " other"), {}, False),
+    ("owner, a credential process that does not do owners", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(PROC + " unsupported"), {}, False),
+    ("owner, a credential process of protocol 2", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers("@HOME@/provider-v2.py"), {}, False),
+    ("owner, a credential process that answers no JSON", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(PROC + " garbage"), {}, False),
+    ("owner, a credential process that exits with 3", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(PROC + " exit"), {}, False),
+    ("owner, a credential process that is not there", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers("@HOME@/nothing"), {}, False),
+    ("owner, a token never kept", ["owner", *M, "-a", "x", "-r", "y", "-l", "krate"], None, "plain", {},
+     providers(PROC + " never"), {}, False),
+    ("owner, a token that expires", ["owner", *M, "-l", "krate"], None, "plain", {}, providers(PROC + " expires"), {}, False),
+    ("owner, a credential-alias", ["owner", *M, "-l", "krate"], None, "plain", {},
+     "\n[credential-alias]\nmine = \"@HOME@/provider.py token aliased\"\n" + providers("mine"), {}, False),
+    ("owner, the registry's own credential process", ["owner", *M, "-l", "krate"], None, "plain",
+     {"credentials.toml": CREDENTIALS.replace('credential-provider = "cargo:token"\n', "")}, "",
+     {"CARGO_REGISTRIES_MOCK_CREDENTIAL_PROVIDER": PROC}, False),
+    ("search, an auth-required registry, a credential process", ["search", "--registry", "auth", "foo"], None, "plain", {},
+     providers(PROC), {}, False),
+    ("yank, a credential process", ["yank", *M, "krate@1.0.0"], None, "plain", {}, providers(PROC), {}, False),
+    ("login, a credential process", ["login", *M], "tok\n", "plain", {}, providers(PROC), {}, False),
+    ("login, a credential process, its arguments", ["login", *M, "--", "a", "b"], None, "plain", {},
+     providers(PROC), {}, False),
+    ("logout, a credential process", ["logout", *M], None, "plain", {}, providers(PROC), {}, False),
+    ("logout, a credential process with no token", ["logout", *M], None, "plain", {}, providers(PROC + " not-found"), {}, False),
+    ("owner, cargo:token-from-stdout", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(STDOUT + " {index_url}"), {}, False),
+    ("owner, cargo:token-from-stdout of two lines", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(STDOUT + " two"), {}, False),
+    ("owner, cargo:token-from-stdout that fails", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers(STDOUT + " fail"), {}, False),
+    ("owner, cargo:token-from-stdout with no command", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers("cargo:token-from-stdout"), {}, False),
+    ("login, cargo:token-from-stdout", ["login", *M], "tok\n", "plain", {}, providers(STDOUT), {}, False),
+    ("owner, cargo:paseto", ["owner", *M, "-l", "krate"], None, "plain", {}, providers("cargo:paseto"), {}, False),
+    ("owner, the built-in providers of other platforms", ["owner", *M, "-l", "krate"], None, "plain", {},
+     providers("cargo:macos-keychain", "cargo:wincred"), {}, False),
     ("search crates.io", ["search", "serde_json", "--limit", "2"], None, "plain", {}, "", {}, True),
     ("owner on crates.io, no token", ["owner", "--list", "serde"], None, "plain", {}, "", {}, True),
     ("owner on crates.io, registry.default set", ["owner", "--registry", "crates-io", "-l", "serde"], None, "plain", {},
@@ -213,7 +318,7 @@ UNORDERED = {"login, over kept credentials"}
 
 def credentials(top):
     out = {}
-    for name in ("credentials", "credentials.toml"):
+    for name in ("credentials", "credentials.toml", "provider.log"):
         path = os.path.join(top, name)
         if os.path.exists(path):
             with open(path, "rb") as f:
@@ -250,15 +355,20 @@ def main():
             shutil.rmtree(top, ignore_errors=True)
             os.makedirs(top)
             with open(os.path.join(top, "config.toml"), "w") as f:
-                f.write(home(port, extra.replace("PORT", str(port))))
+                f.write(home(port, extra.replace("PORT", str(port)).replace("@HOME@", top)))
             for file, text in files.items():
                 with open(os.path.join(top, file), "w") as f:
                     f.write(text)
+            for file in ("provider.py", "provider-v2.py"):
+                with open(os.path.join(top, file), "w") as f:
+                    f.write(PROVIDER)
+                os.chmod(os.path.join(top, file), 0o755)
+            case_env = {k: v.replace("@HOME@", top) for k, v in env.items()}
             with LOCK:
                 REQUESTS.clear()
             argv = (["cargo"] if who == "cargo" else [opts.blaze, "cargo"]) + args
             done = subprocess.run(argv, cwd=os.path.join(work, where), input=stdin or "", capture_output=True,
-                                  text=True, env={**base, "CARGO_HOME": top, **env})
+                                  text=True, env={**base, "CARGO_HOME": top, **case_env})
             name_home = lambda text: text.replace(top, "@home").replace(str(port), "PORT")
             with LOCK:
                 requests = [[name_home(str(x)) for x in r] for r in REQUESTS]

@@ -12,6 +12,7 @@ use anyhow::Context as _;
 use super::{
     affected::{self, Pick},
     cli::Invocation,
+    experimental,
     results::Results,
     sandboxed, say,
     state::{Held, Kind, Program, State, as_built},
@@ -171,12 +172,12 @@ fn started_running(command: &mut Command, program: &Path) -> std::io::Result<std
     command.spawn()
 }
 
-/// Runs the test executables one after another, each in the directory of its package and in
-/// a sandbox ([`sandboxed`]) unless its package or the command takes it out, and stops at the
-/// first that fails unless told not to. The result is cargo's exit status. Under
-/// `RA_JIT_TESTS=affected` each runs only the tests that have not passed with what they are a
-/// function of as it is now, as the store keeps them ([`results`]); `verify` runs those too and
-/// says whether they passed again ([`affected`]).
+/// Runs the test executables one after another, each in the directory of its package, and in
+/// a sandbox ([`sandboxed`]) when its workspace or package opts in and neither it nor the
+/// command takes it out, and stops at the first that fails unless told not to. The result is
+/// cargo's exit status. Under `RA_JIT_TESTS=affected` each runs only the tests that have not
+/// passed with what they are a function of as it is now, as the store keeps them
+/// ([`results`]); `verify` runs those too and says whether they passed again ([`affected`]).
 pub(crate) fn tests(
     asked: &Invocation,
     state: &State,
@@ -189,25 +190,37 @@ pub(crate) fn tests(
     let mut opt_outs: BTreeMap<&Path, sandboxed::OptOut> = BTreeMap::new();
     for test in &programs {
         if !opt_outs.contains_key(test.package_dir.as_path()) {
-            opt_outs.insert(&test.package_dir, sandboxed::opt_out(&test.package_dir)?);
+            opt_outs.insert(&test.package_dir, sandboxed::of_tests(&test.package_dir)?);
         }
     }
     let sandboxing = sandboxed::on();
     if sandboxing
-        && opt_outs.values().any(|it| !it.all)
+        && opt_outs.values().any(sandboxed::OptOut::sandboxed)
         && let Err(why) = crate::sandbox::available()
     {
-        say::error(&format!("every test runs in a sandbox, which can't be made here: {why}"));
+        say::error(&format!("the tests run in a sandbox, which can't be made here: {why}"));
         say::note(&format!(
             "`{}=off` runs the tests of this command outside a sandbox, as cargo does",
-            sandboxed::VAR
+            crate::sandbox::VAR_BLAZE
         ));
         return Ok(FAILED);
+    }
+    let not_opted_in = opt_outs.values().find(|it| !it.all && !it.sandboxed());
+    if affected::on()
+        && sandboxing
+        && !opt_outs.values().any(sandboxed::OptOut::sandboxed)
+        && let Some(it) = not_opted_in
+    {
+        say::note(&format!(
+            "no test is sandboxed, so none is kept as passed and every test runs: sandboxed \
+             tests are an experiment a workspace opts into, with {}",
+            it.experiments.how_to(experimental::SANDBOXED_TESTS)
+        ));
     }
     let mut results = affected::on().then(Results::open).flatten();
     if affected::on() && results.is_none() {
         say::note(
-            "no store (`RA_JIT_CACHE=off`): no test's pass is kept, and every test the daemon \
+            "no store (`BLAZE_CACHE=off`): no test's pass is kept, and every test the daemon \
              built runs",
         );
     }
@@ -216,7 +229,7 @@ pub(crate) fn tests(
     let no_test = BTreeSet::new();
     for test in programs {
         let opt_out = &opt_outs[test.package_dir.as_path()];
-        let sandboxed_here = sandboxing && !opt_out.all;
+        let sandboxed_here = sandboxing && opt_out.sandboxed();
         let source = test.source.strip_prefix(&test.package_dir).unwrap_or(&test.source);
         let unit = if matches!(test.kind, Kind::Test | Kind::Bench) { "" } else { "unittests " };
         let shown = shown_path(&test.executable, cwd);
@@ -236,9 +249,13 @@ pub(crate) fn tests(
         };
         let identity = env.as_deref().filter(|_| affected::on()).map(sandboxed::identity_of);
         let manifest = opt_out.manifest.display();
-        let why_outside = match sandboxing {
-            true => format!("`tests = false` under `{}` in {manifest}", sandboxed::TABLE),
-            false => format!("`{}=off`", sandboxed::VAR),
+        let why_outside = match (sandboxing, opt_out.all) {
+            (false, _) => format!("`{}=off`", crate::sandbox::VAR_BLAZE),
+            (true, true) => format!("`tests = false` under `{}` in {manifest}", sandboxed::TABLE),
+            (true, false) => format!(
+                "its workspace has not opted into sandboxed tests ({})",
+                opt_out.experiments.how_to(experimental::SANDBOXED_TESTS)
+            ),
         };
         let sandbox = identity.as_deref().ok_or(why_outside.as_str());
         let outside = if sandboxed_here { &opt_out.tests } else { &no_test };

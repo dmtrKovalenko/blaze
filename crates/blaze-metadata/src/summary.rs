@@ -7,8 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use blaze_resolve::workspace_resolve::Patch;
 use blaze_resolve::{
-    DepKind, Dependency, GitReference, InternedString, MemRegistry, Platform, QueryKind, Registry,
-    SourceId, Summary,
+    DepKind, Dependency, GitReference, InternedString, Platform, SourceId, Summary,
 };
 use serde_json::Value;
 use url::Url;
@@ -188,9 +187,8 @@ fn root_table(root: &Path) -> Result<toml::Table> {
     Ok(toml::from_str(&text)?)
 }
 
-/// The root manifest's `[patch]`, without entries that name an alternative registry or whose
-/// package `registry` does not have (a patch the graph does not use).
-pub(crate) fn patch_tables(root: &Path, registry: &MemRegistry) -> Result<Vec<(Url, Vec<Patch>)>> {
+/// The root manifest's `[patch]`, without entries that name an alternative registry.
+pub(crate) fn patch_tables(root: &Path) -> Result<Vec<(Url, Vec<Patch>)>> {
     let manifest_path = root.join("Cargo.toml");
     let manifest = root_table(root)?;
     let mut tables = Vec::new();
@@ -206,10 +204,6 @@ pub(crate) fn patch_tables(root: &Path, registry: &MemRegistry) -> Result<Vec<(U
         let mut patches = Vec::new();
         for (name, entry) in table.as_table().into_iter().flatten() {
             let Some(dep) = patch_dependency(root, name, entry)? else { continue };
-            let listed = ready(registry.query_vec(&dep, QueryKind::Exact))?;
-            if listed.is_empty() {
-                continue;
-            }
             patches.push(Patch { dep, loc: manifest_path.display().to_string() });
         }
         tables.push((url, patches));
@@ -220,14 +214,4 @@ pub(crate) fn patch_tables(root: &Path, registry: &MemRegistry) -> Result<Vec<(U
 /// Whether the root manifest has a `[replace]` table, which blaze does not read yet.
 pub(crate) fn has_replace(root: &Path) -> Result<bool> {
     Ok(root_table(root)?.contains_key("replace"))
-}
-
-/// The output of a future that is ready at once, as [`MemRegistry`]'s are.
-fn ready<T>(future: impl std::future::Future<Output = T>) -> T {
-    let mut future = std::pin::pin!(future);
-    let cx = &mut std::task::Context::from_waker(std::task::Waker::noop());
-    match future.as_mut().poll(cx) {
-        std::task::Poll::Ready(output) => output,
-        std::task::Poll::Pending => unreachable!("a MemRegistry query is ready at once"),
-    }
 }

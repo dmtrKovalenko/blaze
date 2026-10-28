@@ -502,8 +502,7 @@ pub(crate) fn available() -> Result<(), String> {
             if !cfg!(any(target_os = "linux", target_os = "macos")) {
                 return Err(format!("there is no sandbox on {} yet", std::env::consts::OS));
             }
-            let exe =
-                std::env::current_exe().map_err(|it| format!("ra-jit is not found ({it})"))?;
+            let exe = std::env::current_exe().map_err(|it| format!("blaze is not found ({it})"))?;
             let out = std::process::Command::new(exe)
                 .args([COMMAND, "--probe"])
                 .stdin(std::process::Stdio::null())
@@ -531,7 +530,7 @@ fn probe() -> Result<(), String> {
         true => {
             " (AppArmor keeps users from making namespaces; \
              `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` lets them, \
-             or an AppArmor profile that allows `userns` for ra-jit)"
+             or an AppArmor profile that allows `userns` for blaze)"
         }
         false => "",
     };

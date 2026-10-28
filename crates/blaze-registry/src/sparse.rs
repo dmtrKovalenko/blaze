@@ -1,12 +1,13 @@
 //! A registry served over HTTP, read file by file as cargo 1.99's `HttpRegistry`
 //! (`src/sources/registry/http_remote.rs`) reads it: `config.json`, then each package's file,
 //! asked for again only with `If-None-Match` or `If-Modified-Since` once it is in the cache,
-//! and only when the index is to be updated.
+//! and only when the index is to be updated. A registry that requires authentication gets the
+//! token of [`Auth`] in `Authorization` once `config.json` says so or answers 401.
 
 use std::{
     path::PathBuf,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -15,9 +16,11 @@ use anyhow::{Context, bail};
 use rustc_hash::FxHashSet;
 use serde_derive::Deserialize;
 
+use blaze_source::SourceId;
+
 use crate::{
-    SourceId,
-    http::{Http, HttpNotSuccessful, Retry},
+    auth::{Auth, Named, Operation},
+    http::{Http, HttpNotSuccessful, Response, Retry},
 };
 
 /// The `config.json` at the root of an index.
@@ -68,6 +71,15 @@ pub struct SparseIndex {
     /// The files asked for since the index was last updated.
     fresh: Mutex<FxHashSet<String>>,
     config: Mutex<Option<RegistryConfig>>,
+    auth: Option<Arc<Auth>>,
+    /// The registry's name in the configuration, found once a token is first asked for.
+    name: OnceLock<Option<String>>,
+    /// Whether requests carry the token.
+    auth_required: AtomicBool,
+    /// The `login_url` of the last 401's `www-authenticate: Cargo` challenge.
+    login_url: Mutex<Option<String>>,
+    /// The headers of the last 401, which the providers are given.
+    auth_error_headers: Mutex<Vec<String>>,
 }
 
 impl SparseIndex {
@@ -77,6 +89,7 @@ impl SparseIndex {
         http: Arc<dyn Http>,
         retry: Retry,
         offline: bool,
+        auth: Option<Arc<Auth>>,
     ) -> anyhow::Result<SparseIndex> {
         let url = source.url().as_str();
         if !url.ends_with('/') {
@@ -93,6 +106,11 @@ impl SparseIndex {
             update: AtomicBool::new(false),
             fresh: Mutex::default(),
             config: Mutex::default(),
+            auth,
+            name: OnceLock::new(),
+            auth_required: AtomicBool::new(false),
+            login_url: Mutex::default(),
+            auth_error_headers: Mutex::default(),
         })
     }
 
@@ -148,7 +166,20 @@ impl SparseIndex {
             *config = Some(found.clone());
             return Ok(Some(found));
         }
-        let read = match self.fetch(RegistryConfig::NAME, None)? {
+        if on_disk().is_some_and(|it| it.auth_required) {
+            self.auth_required.store(true, Ordering::Relaxed);
+        }
+        let fetched = match crate::block_on(self.fetch(RegistryConfig::NAME, None)) {
+            Err(e)
+                if !self.auth_required.load(Ordering::Relaxed)
+                    && e.downcast_ref::<HttpNotSuccessful>().is_some_and(|it| it.code == 401) =>
+            {
+                self.auth_required.store(true, Ordering::Relaxed);
+                crate::block_on(self.fetch(RegistryConfig::NAME, None))
+            }
+            fetched => fetched,
+        };
+        let read = match fetched? {
             LoadResponse::Data { raw, .. } => {
                 let read: RegistryConfig = serde_json::from_slice(&raw)
                     .with_context(|| format!("the config.json of {}", self.base))?;
@@ -165,15 +196,17 @@ impl SparseIndex {
     }
 
     /// An index file, `path` under the index's URL: [`LoadResponse::CacheValid`] when the
-    /// cached copy of `index_version` is fresh or the server says it has not changed.
-    pub fn load(&self, path: &str, index_version: Option<&str>) -> anyhow::Result<LoadResponse> {
+    /// cached copy of `index_version` is fresh or the server says it has not changed. Asked of
+    /// the server, it waits without holding the thread, so that the files of a resolver's round
+    /// are fetched together.
+    pub async fn load(
+        &self,
+        path: &str,
+        index_version: Option<&str>,
+    ) -> anyhow::Result<LoadResponse> {
         let Some(config) = self.config()? else { return Ok(LoadResponse::NotFound) };
         if config.auth_required {
-            bail!(
-                "{} requires authentication, which blaze does not do yet \
-                 (`registry.global-credential-providers`)",
-                self.base
-            );
+            self.auth_required.store(true, Ordering::Relaxed);
         }
         if index_version.is_some() {
             if self.is_fresh(path) {
@@ -188,26 +221,40 @@ impl SparseIndex {
                 "last-modified" => Some(("if-modified-since", value.trim())),
                 _ => None,
             });
-        self.fetch(path, condition)
+        self.fetch(path, condition).await
     }
 
-    fn fetch(&self, path: &str, condition: Option<(&str, &str)>) -> anyhow::Result<LoadResponse> {
+    async fn fetch(
+        &self,
+        path: &str,
+        condition: Option<(&str, &str)>,
+    ) -> anyhow::Result<LoadResponse> {
         if self.offline {
             return Ok(LoadResponse::NotFound);
         }
         let url = format!("{}{path}", self.base);
+        let token = match self.auth_required.load(Ordering::Relaxed) {
+            true => Some(self.token(true)?),
+            false => None,
+        };
         let mut headers = vec![("cargo-protocol", "version=1"), ("accept", "text/plain")];
         headers.extend(condition);
-        let answer = self.retry.run(|| {
-            let answer = self
-                .http
-                .get(&url, &headers)
-                .with_context(|| format!("download of {path} failed"))?;
-            match answer.status {
-                200 | 304 | 404 => Ok(answer),
-                _ => Err(HttpNotSuccessful::new(&url, &answer).into()),
-            }
-        });
+        headers.extend(token.as_deref().map(|it| ("authorization", it)));
+        let answer = self
+            .retry
+            .run_async(&*self.http, || {
+                let answer = self.http.get_async(&url, &headers);
+                async {
+                    let answer =
+                        answer.await.with_context(|| format!("download of {path} failed"))?;
+                    match answer.status {
+                        200 | 304 | 404 => Ok(answer),
+                        401 => Err(self.unauthorized(&url, &answer)?),
+                        _ => Err(HttpNotSuccessful::new(&url, &answer).into()),
+                    }
+                }
+            })
+            .await;
         self.fresh().insert(path.to_owned());
         let answer = answer?;
         Ok(match answer.status {
@@ -224,5 +271,55 @@ impl SparseIndex {
             304 => LoadResponse::CacheValid,
             _ => LoadResponse::NotFound,
         })
+    }
+
+    fn named<'a>(&'a self, auth: &Auth) -> anyhow::Result<Named<'a>> {
+        let name = match self.name.get() {
+            Some(name) => name,
+            None => {
+                let found = auth.name_of(&self.source)?;
+                self.name.get_or_init(|| found)
+            }
+        };
+        Ok(Named { source: &self.source, name: name.as_deref() })
+    }
+
+    /// The token sent to the registry: for an index file `after_401`, with what the last 401
+    /// said, as cargo asks for it; for a download, with nothing of it.
+    pub(crate) fn token(&self, after_401: bool) -> anyhow::Result<String> {
+        let auth = self.auth.as_deref().with_context(|| {
+            format!(
+                "{} requires authentication, and blaze-registry was given no configuration to \
+                 find its token in",
+                self.base
+            )
+        })?;
+        let registry = self.named(auth)?;
+        if !after_401 {
+            return auth.token(registry, None, Operation::Read, &[], true);
+        }
+        let login_url = self.login_url.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let headers =
+            self.auth_error_headers.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        auth.token(registry, login_url.as_deref(), Operation::Read, &headers, true)
+    }
+
+    /// A 401: its headers and its `Cargo` challenge's `login_url` kept for the next request,
+    /// and, when a token was sent, cargo's words of a token refused over the answer.
+    fn unauthorized(&self, url: &str, answer: &Response) -> anyhow::Result<anyhow::Error> {
+        let headers = answer.headers.iter().map(|(name, value)| format!("{name}: {value}"));
+        *self.auth_error_headers.lock().unwrap_or_else(PoisonError::into_inner) = headers.collect();
+        for (_, challenges) in answer.headers.iter().filter(|(it, _)| it == "www-authenticate") {
+            if let Some(found) = crate::auth::login_url(challenges)? {
+                *self.login_url.lock().unwrap_or_else(PoisonError::into_inner) = Some(found);
+            }
+        }
+        let err = anyhow::Error::from(HttpNotSuccessful::new(url, answer));
+        if !self.auth_required.load(Ordering::Relaxed) {
+            return Ok(err);
+        }
+        let auth = self.auth.as_deref().context("a token was sent")?;
+        let login_url = self.login_url.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        Ok(err.context(auth.rejected(self.named(auth)?, login_url.as_deref())?))
     }
 }

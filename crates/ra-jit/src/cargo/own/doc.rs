@@ -18,7 +18,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::args::{Args, Flag, switch, valued};
 use crate::{
-    cargo::{metadata, say},
+    cargo::{metadata, say, state::package_dir},
     plan::Selection,
 };
 
@@ -313,10 +313,6 @@ fn selected<'a>(
         return Err("the workspace has no package to document".to_owned());
     }
     Ok(defaults)
-}
-
-fn package_dir(package: &Package) -> PathBuf {
-    package.manifest_path.parent().map(|it| it.as_std_path().to_owned()).unwrap_or_default()
 }
 
 /// The crates of `packages` to document: each one's library, and its binaries unless `--lib`

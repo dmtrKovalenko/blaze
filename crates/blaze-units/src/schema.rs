@@ -28,6 +28,10 @@ pub struct Unit {
     /// build script or proc macro and what they depend on).
     pub platform: Option<String>,
     pub mode: Mode,
+    /// Whether a `check` unit is checked as a test, with `--test`: cargo prints it as any
+    /// other `check`, so it is not in the JSON.
+    #[serde(skip)]
+    pub checked_as_test: bool,
     pub features: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_std: bool,

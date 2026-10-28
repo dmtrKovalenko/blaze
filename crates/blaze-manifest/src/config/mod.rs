@@ -256,8 +256,8 @@ pub struct Config {
     /// The files are read at the first value asked for, and again at the next while they fail:
     /// a broken config file is an error only to what reads configuration, as in cargo.
     values: OnceCell<FxHashMap<String, ConfigValue>>,
-    /// `$CARGO_HOME/credentials.toml` over the files' values, once [`Config::load_credentials`]
-    /// read it: what is asked of the configuration is looked up there first, as in cargo.
+    /// `$CARGO_HOME/credentials.toml`, once [`Config::load_credentials`] read it: kept apart
+    /// from the files' values, as cargo keeps it, for [`Config::credentials_token`] only.
     credentials: OnceCell<FxHashMap<String, ConfigValue>>,
     build_config: OnceCell<CargoBuildConfig>,
     target_cfgs: OnceCell<Vec<(String, target::TargetCfgConfig)>>,
@@ -318,6 +318,15 @@ impl Config {
         }
         let values = self.load_values()?;
         Ok(self.values.get_or_init(|| values))
+    }
+
+    /// The same configuration read again, for a thread of its own to read: what reading the
+    /// files warns of is this one's to say, not the copy's.
+    pub fn reload(&self) -> anyhow::Result<Config> {
+        let copy = Config::load(&self.cwd, self.env.clone(), &self.cli)?;
+        _ = copy.values();
+        copy.warnings.take();
+        Ok(copy)
     }
 
     /// The configuration this process sees: its current directory and environment.
@@ -503,21 +512,17 @@ impl Config {
                 )?
             } else {
                 let doc = cli_dotted_keys(arg)?;
-                for secret in ["token", "secret-key"] {
-                    if doc.get("registry").and_then(|v| v.get(secret)).is_some() {
-                        bail!(
-                            "registry.{secret} cannot be set through --config for security reasons"
-                        );
-                    }
-                    if let Some((k, _)) = doc
-                        .get("registries")
-                        .and_then(|v| v.as_table())
-                        .and_then(|t| t.iter().find(|(_, v)| v.get(secret).is_some()))
-                    {
-                        bail!(
-                            "registries.{k}.{secret} cannot be set through --config for security reasons"
-                        );
-                    }
+                if doc.get("registry").and_then(|v| v.get("token")).is_some() {
+                    bail!("registry.token cannot be set through --config for security reasons");
+                }
+                if let Some((k, _)) = doc
+                    .get("registries")
+                    .and_then(|v| v.as_table())
+                    .and_then(|t| t.iter().find(|(_, v)| v.get("token").is_some()))
+                {
+                    bail!(
+                        "registries.{k}.token cannot be set through --config for security reasons"
+                    );
                 }
                 let value = CV::from_toml(Definition::Cli(None), toml::Value::Table(doc))
                     .with_context(|| format!("failed to convert --config argument `{arg}`"))?;
@@ -561,11 +566,6 @@ impl Config {
 
     /// The merged value at `key` from files and `--config`, without the environment.
     pub fn get_cv(&self, key: &ConfigKey) -> anyhow::Result<Option<ConfigValue>> {
-        if let Some(credentials) = self.credentials.get()
-            && let Some(found) = Self::get_cv_in(key, credentials)?
-        {
-            return Ok(Some(found));
-        }
         Self::get_cv_in(key, self.values()?)
     }
 
@@ -867,38 +867,49 @@ impl Config {
     }
 
     /// Reads `$CARGO_HOME/credentials.toml` (or the old `credentials`) once, as cargo's
-    /// `load_credentials`: a top-level `token` is the old spelling of `registry.token`, and each
-    /// of its tables goes over the files' table of the same name.
+    /// `load_credentials`: a top-level `token` is the old spelling of `registry.token`.
     pub fn load_credentials(&self) -> anyhow::Result<()> {
-        if self.credentials.get().is_some() {
-            return Ok(());
+        self.credentials().map(|_| ())
+    }
+
+    fn credentials(&self) -> anyhow::Result<&FxHashMap<String, ConfigValue>> {
+        if let Some(credentials) = self.credentials.get() {
+            return Ok(credentials);
         }
         let mut credentials = FxHashMap::default();
         if let Some(path) = self.get_file_path(&self.home, "credentials") {
-            let mut value = self.load_file(&path, &mut FxHashSet::default(), true, false)?;
-            let CV::Table(map, def) = &mut value else { unreachable!() };
+            let value = self.load_file(&path, &mut FxHashSet::default(), true, false)?;
+            let CV::Table(mut map, def) = value else { unreachable!() };
             if let Some(token) = map.remove("token") {
-                let def = def.clone();
                 map.entry("registry".to_owned()).or_insert_with(|| {
                     CV::Table(FxHashMap::from_iter([("token".to_owned(), token)]), def)
                 });
             }
-            let CV::Table(map, _) = value else { unreachable!() };
-            let base = self.values()?;
-            for (key, value) in map {
-                let entry = match base.get(&key) {
-                    Some(base) => {
-                        let mut entry = base.clone();
-                        entry.merge(value, true)?;
-                        entry
-                    }
-                    None => value,
-                };
-                credentials.insert(key, entry);
-            }
+            credentials = map;
         }
-        _ = self.credentials.set(credentials);
-        Ok(())
+        Ok(self.credentials.get_or_init(|| credentials))
+    }
+
+    /// The token of `table` (`registry` for crates.io, `registries.<name>`) as cargo's
+    /// `registry_credentials` takes it: `credentials.toml`'s, unless the configuration's
+    /// comes from a place cargo ranks above that file (its environment variable).
+    pub fn credentials_token(&self, table: &str) -> anyhow::Result<OptValue<String>> {
+        let key = ConfigKey::parse(&format!("{table}.token"));
+        let from_file = match Self::get_cv_in(&key, self.credentials()?)? {
+            Some(CV::String(val, definition)) => Some(Value { val, definition }),
+            Some(cv) => return Err(ConfigError::expected(&key, "a string", &cv).into()),
+            None => None,
+        };
+        let configured = self.get::<OptValue<String>>(&format!("{table}.token"))?;
+        Ok(match (configured, from_file) {
+            (Some(configured), Some(from_file))
+                if configured.definition.is_higher_priority(&from_file.definition) =>
+            {
+                Some(configured)
+            }
+            (_, Some(from_file)) => Some(from_file),
+            (configured, None) => configured,
+        })
     }
 
     /// Writes `token` for `registry` (crates.io when `None`) to the credentials file, or with
@@ -974,9 +985,7 @@ impl Config {
                     let table = table
                         .as_table_mut()
                         .with_context(|| format!("expected `{what}` to be a table"))?;
-                    for key in ["token", "secret-key", "secret-key-subject"] {
-                        table.remove(key);
-                    }
+                    table.remove("token");
                 }
             }
         }

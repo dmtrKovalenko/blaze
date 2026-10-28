@@ -11,7 +11,7 @@ use semver::{Version, VersionReq};
 use serde::de::{self, Deserializer};
 use serde_derive::Deserialize;
 
-use crate::SourceId;
+use blaze_source::SourceId;
 
 /// The newest schema version of an index line (its `v`) that cargo 1.99 reads without
 /// `-Zbindeps`. A line of a newer one is [`Status::Unsupported`].
@@ -319,7 +319,7 @@ fn entry(package: IndexPackage) -> anyhow::Result<IndexEntry> {
 
 /// As cargo's `registry_dependency_into_dep`, to the errors it can return.
 fn dependency(dep: RegistryDependency) -> anyhow::Result<IndexDependency> {
-    let registry = dep.registry.as_deref().map(SourceId::for_registry).transpose()?;
+    let registry = dep.registry.as_deref().map(crate::registry_source).transpose()?;
     let package = dep.package.unwrap_or_else(|| dep.name.clone());
     let req = VersionReq::parse(&dep.req).with_context(|| {
         format!("failed to parse the version requirement `{}` for dependency `{package}`", dep.req)
@@ -466,8 +466,16 @@ impl Summaries {
     /// The versions that match `req`, read; one whose line is not what it was when its version
     /// was read is left out, as cargo leaves it out.
     pub fn matching<'a>(&'a self, req: &'a VersionReq) -> impl Iterator<Item = IndexLine> + 'a {
+        self.select(|version| req.matches(version))
+    }
+
+    /// The versions `keep` keeps, read as [`Summaries::matching`] reads them.
+    pub fn select<'a>(
+        &'a self,
+        mut keep: impl FnMut(&Version) -> bool + 'a,
+    ) -> impl Iterator<Item = IndexLine> + 'a {
         self.lines()
-            .filter(|(version, _)| req.matches(version))
+            .filter(move |(version, _)| keep(version))
             .filter_map(|(_, line)| parse_line(line).ok())
     }
 

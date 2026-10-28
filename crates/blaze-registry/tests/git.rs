@@ -7,10 +7,11 @@ use std::{
 };
 
 use blaze_registry::{
-    Context, GitReference, SourceId,
+    Context,
     git::{self, Checkout},
     http::{Http, Response},
 };
+use blaze_source::{GitReference, SourceId};
 
 struct NoNetwork;
 
@@ -140,10 +141,10 @@ fn checks_out_as_cargo() {
     let home = repos.work.join("home");
     let context = context(&home, false);
     let id = source(&repos, GitReference::DefaultBranch);
-    let ident = git::ident(&id);
+    let ident = id.git_ident();
     assert!(ident.starts_with("upstream-"), "{ident}");
 
-    let checkout = git::fetch(&context, &id, None).unwrap();
+    let checkout = git::fetch(&context, id, None).unwrap();
     let short = &repos.head[..7];
     assert_eq!(
         checkout,
@@ -180,35 +181,31 @@ fn checks_out_as_cargo() {
     assert!(checkout.package("ignored", &version("0.0.0")).is_err());
 
     let tag =
-        git::fetch(&context, &source(&repos, GitReference::Tag("v1".to_owned())), None).unwrap();
+        git::fetch(&context, source(&repos, GitReference::Tag("v1".to_owned())), None).unwrap();
     assert_eq!(tag.rev, repos.first);
     let branch =
-        git::fetch(&context, &source(&repos, GitReference::Branch("dev".to_owned())), None)
-            .unwrap();
+        git::fetch(&context, source(&repos, GitReference::Branch("dev".to_owned())), None).unwrap();
     assert_eq!(branch.rev, repos.dev);
     assert_eq!(
         std::fs::read_to_string(branch.root.join("src/lib.rs")).unwrap(),
         "pub fn dev() {}\n"
     );
-    let short_rev = git::fetch(
-        &context,
-        &source(&repos, GitReference::Rev(repos.first[..10].to_owned())),
-        None,
-    )
-    .unwrap();
+    let short_rev =
+        git::fetch(&context, source(&repos, GitReference::Rev(repos.first[..10].to_owned())), None)
+            .unwrap();
     assert_eq!(short_rev.rev, repos.first);
     let annotated =
-        git::fetch(&context, &source(&repos, GitReference::Rev("v1".to_owned())), None).unwrap();
+        git::fetch(&context, source(&repos, GitReference::Rev("v1".to_owned())), None).unwrap();
     assert_eq!(annotated.rev, repos.first, "an annotated tag is its commit");
 
     // The lock file's commit is what is checked out, whatever the branch says now.
-    let locked = git::fetch(&context, &id, Some(&repos.dev)).unwrap();
+    let locked = git::fetch(&context, id, Some(&repos.dev)).unwrap();
     assert_eq!(locked.rev, repos.dev);
 
     // A checkout that was not finished is made again.
     std::fs::remove_file(checkout.root.join(".cargo-ok")).unwrap();
     std::fs::write(checkout.root.join("src/lib.rs"), "edited").unwrap();
-    git::fetch(&context, &id, Some(&repos.head)).unwrap();
+    git::fetch(&context, id, Some(&repos.head)).unwrap();
     assert_eq!(
         std::fs::read_to_string(checkout.root.join("src/lib.rs")).unwrap(),
         "pub fn first() {}\n"
@@ -220,13 +217,13 @@ fn offline_uses_what_is_there() {
     let repos = repos("offline");
     let home = repos.work.join("home");
     let id = source(&repos, GitReference::Branch("dev".to_owned()));
-    git::fetch(&context(&home, false), &id, None).unwrap();
+    git::fetch(&context(&home, false), id, None).unwrap();
     std::fs::rename(&repos.upstream, repos.work.join("gone")).unwrap();
 
     let offline = context(&home, true);
-    assert_eq!(git::fetch(&offline, &id, Some(&repos.dev)).unwrap().rev, repos.dev);
-    assert_eq!(git::fetch(&offline, &id, None).unwrap().rev, repos.dev);
-    let error = format!("{:#}", git::fetch(&offline, &id, Some(&repos.head)).unwrap_err());
+    assert_eq!(git::fetch(&offline, id, Some(&repos.dev)).unwrap().rev, repos.dev);
+    assert_eq!(git::fetch(&offline, id, None).unwrap().rev, repos.dev);
+    let error = format!("{:#}", git::fetch(&offline, id, Some(&repos.head)).unwrap_err());
     assert!(error.starts_with("can't checkout from '"), "{error}");
     assert!(error.ends_with("': you are in the offline mode (--offline)"), "{error}");
 }

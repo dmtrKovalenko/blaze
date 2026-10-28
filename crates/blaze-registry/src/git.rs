@@ -13,7 +13,9 @@ use std::{
 use anyhow::{Context as _, bail};
 use url::Url;
 
-use crate::{Context, GitReference, SourceId, SourceKind, http::Transport, short_hash};
+use blaze_source::{GitReference, SourceId, SourceKind};
+
+use crate::{Context, http::Transport};
 
 const CHECKOUT_READY_LOCK: &str = ".cargo-ok";
 /// cargo's `__CARGO_PACKFILE_LIMIT`: a database with more packs than this is `git gc --auto`ed.
@@ -27,23 +29,15 @@ pub struct Checkout {
     pub rev: String,
 }
 
-/// `<name>-<hash>`, the name of a repository's database and of its checkouts' directory: the
-/// last segment of its canonical URL and a hash of that URL (cargo's `ident`).
-pub fn ident(id: &SourceId) -> String {
-    let last = id.canonical_url().path_segments().and_then(|mut it| it.next_back()).unwrap_or("");
-    let last = if last.is_empty() { "_empty" } else { last };
-    format!("{last}-{}", short_hash(id.canonical_url().as_str()))
-}
-
 /// The commit `precise` of the git source `id` (the lock file's), or what its reference names
 /// now when there is none, fetched into its database when the database does not have it, and
 /// checked out with its submodules.
-pub fn fetch(context: &Context, id: &SourceId, precise: Option<&str>) -> anyhow::Result<Checkout> {
+pub fn fetch(context: &Context, id: SourceId, precise: Option<&str>) -> anyhow::Result<Checkout> {
     let SourceKind::Git(reference) = id.kind() else { bail!("{id} is not a git source") };
     let git = context.cargo_home.join("git");
     std::fs::create_dir_all(&git).with_context(|| format!("failed to create {}", git.display()))?;
     exclude_from_backups(&git);
-    let ident = ident(id);
+    let ident = id.git_ident();
     let (db, rev) = fetch_db(context, id.url().as_str(), &ident, reference, precise, false)?;
     let short = short_id(&db, &rev)?;
     let root = git.join("checkouts").join(&ident).join(short);
@@ -419,7 +413,7 @@ fn update_submodule(
     let (db, rev) = fetch_db(
         context,
         &child_url,
-        &ident(&id),
+        &id.git_ident(),
         &GitReference::Rev(head.clone()),
         Some(&head),
         true,
@@ -641,15 +635,6 @@ fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The directory cargo 1.99 made for zed's `async-process` dependency
-    /// (`git+https://github.com/zed-industries/async-process.git?rev=0b6d671…`).
-    #[test]
-    fn names_directories_as_cargo() {
-        let url = Url::parse("https://github.com/zed-industries/async-process.git").unwrap();
-        let rev = GitReference::Rev("0b6d6713570af61806e1e5cb40e0f757cb93fd9d".to_owned());
-        assert_eq!(ident(&SourceId::for_git(&url, rev).unwrap()), "async-process-b80486ce8f827270");
-    }
 
     #[test]
     fn submodule_urls() {

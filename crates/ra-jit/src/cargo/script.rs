@@ -10,6 +10,7 @@
 //! the daemon's, is [`script_sandbox::run`]'s, in the sandbox tests run in.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     io::Write as _,
     path::{Path, PathBuf},
@@ -21,7 +22,11 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use super::{directives, keyed, own_script, sandboxed, script_sandbox, wasi_script};
+use super::{
+    directives,
+    hermetic::{self, InView},
+    keyed, own_script, sandboxed, script_sandbox, wasi_script,
+};
 
 /// The variable that names the script itself to `ra-jit build-script`.
 pub(crate) const REAL: &str = "RA_JIT_BUILD_SCRIPT";
@@ -158,14 +163,88 @@ pub(crate) fn run_as_cargo_does(
         {
             wasi_script::as_cargo_does(&running, &plan, mode, &places)?;
         }
-        let link_dirs = match &plan {
-            script_sandbox::Plan::Sandboxed { link_dirs, .. } => link_dirs.clone(),
+        let (link_dirs, in_view) = match &plan {
+            script_sandbox::Plan::Sandboxed { link_dirs, in_view, .. } => {
+                (link_dirs.clone(), in_view.clone())
+            }
             script_sandbox::Plan::Outside(..) => {
                 script_sandbox::keep_reads(&out_dir, None);
                 script.env_clear().envs(plan.env().iter().map(|(k, v)| (k, v)));
                 return become_it(&mut script);
             }
         };
+        let directives =
+            directives::Ran { package_dir: &cwd, out_dir: &out_dir, link_dirs: &link_dirs };
+        if let Some(in_view) = &in_view {
+            let key = view_key(&real, &cwd, &args, plan.env(), &places, in_view)?;
+            // What a run left that names where it ran in a file that is no text is kept for
+            // this place alone.
+            let mut here = keyed::Key::new(IN_VIEW);
+            here.field(&key);
+            for (place, _) in &places.0 {
+                here.field(place);
+            }
+            let here = here.done();
+            let checking = keyed::check();
+            let get =
+                |key: &[u8; 32]| store.and_then(|it| it.get(key)).and_then(|it| Kept::read(&it));
+            let found = get(&key).map(|it| it.placed(&places)).or_else(|| get(&here));
+            if let Some(kept) = &found
+                && !checking
+            {
+                let unset = unset_now(&kept.stdout, &ran.env, &plan, &declared);
+                if !unset.is_empty() {
+                    declared.extend(unset);
+                    continue;
+                }
+                kept.restore(&out_dir)?;
+                script_sandbox::keep_reads(&out_dir, None);
+                if std::env::var_os("RA_JIT_STATS").is_some() {
+                    eprintln!("blaze: a run the store kept, of its closure");
+                }
+                std::io::stdout().write_all(&hermetic::for_cargo(&kept.stdout))?;
+                std::io::stderr().write_all(&kept.stderr)?;
+                return Ok(());
+            }
+            let script_sandbox::Ran { output, .. } =
+                script_sandbox::run(&running, &plan, Stdio::inherit())?;
+            let unset = match output.status.success() {
+                true => unset_now(&output.stdout, &ran.env, &plan, &declared),
+                false => Vec::new(),
+            };
+            let refused = directives::refused(&output.stdout, &directives);
+            if unset.is_empty() {
+                std::io::stdout().write_all(&hermetic::for_cargo(&output.stdout))?;
+                std::io::stderr().write_all(&output.stderr)?;
+                if output.status.success() && !refused.is_empty() {
+                    eprintln!("error: {}", directives::refused_error(package, &refused));
+                    std::process::exit(1);
+                }
+            }
+            script_sandbox::keep_reads(&out_dir, None);
+            let made = (output.status.success() && refused.is_empty())
+                .then(|| Kept::of(&output.stdout, &output.stderr, &out_dir))
+                .flatten();
+            if checking && let (Some(kept), Some(made)) = (&found, &made) {
+                same_as_kept(package, kept, made, &out_dir);
+            }
+            if let (Some(store), Some(made)) = (store, made) {
+                store.settled();
+                match made.unplaced(&places) {
+                    Some(unplaced) => store.insert(&key, &unplaced.bytes()),
+                    None => store.insert(&here, &made.bytes()),
+                }
+                store.flush();
+            }
+            if !unset.is_empty() {
+                std::fs::remove_dir_all(&out_dir)
+                    .and_then(|()| std::fs::create_dir_all(&out_dir))
+                    .with_context(|| format!("emptying {}", out_dir.display()))?;
+                declared.extend(unset);
+                continue;
+            }
+            std::process::exit(output.status.code().unwrap_or(1))
+        }
         let key = |places: Option<&Places>| run_key(&real, &cwd, &args, plan.env(), places);
         let keys = store.zip(key(Some(&places))).zip(key(None));
         // A run another checkout or target directory kept, or, when what it left names where it
@@ -185,7 +264,7 @@ pub(crate) fn run_as_cargo_does(
         if let Some((kept, reads)) = &found
             && !checking
         {
-            let unset = script_sandbox::not_given(&kept.stdout, &ran.env, &plan);
+            let unset = unset_now(&kept.stdout, &ran.env, &plan, &declared);
             if !unset.is_empty() {
                 declared.extend(unset);
                 continue;
@@ -205,14 +284,8 @@ pub(crate) fn run_as_cargo_does(
         let script_sandbox::Ran { output, reads } =
             script_sandbox::run(&running, &plan, Stdio::inherit())?;
         let unset = match output.status.success() {
-            true => script_sandbox::not_given(&output.stdout, &ran.env, &plan),
+            true => unset_now(&output.stdout, &ran.env, &plan, &declared),
             false => Vec::new(),
-        };
-        let directives = directives::Ran {
-            package_dir: &cwd,
-            out_dir: &out_dir,
-            env: plan.env(),
-            link_dirs: &link_dirs,
         };
         let refused = directives::refused(&output.stdout, &directives);
         if unset.is_empty() {
@@ -229,24 +302,8 @@ pub(crate) fn run_as_cargo_does(
         let made = (output.status.success() && refused.is_empty())
             .then(|| Kept::of(&output.stdout, &output.stderr, &out_dir))
             .flatten();
-        if checking
-            && let (Some((kept, _)), Some(made)) = (&found, &made)
-            && kept != made
-        {
-            let what = match kept.stdout == made.stdout {
-                true => "wrote something else in its OUT_DIR",
-                false => "printed something else",
-            };
-            eprintln!(
-                "error: {}=check: the build script of `{package}` {what} than the run the store kept \
-             of it with the same inputs ({})",
-                keyed::CHECK,
-                out_dir.display()
-            );
-            std::process::exit(1);
-        }
-        if checking && found.is_some() && std::env::var_os("RA_JIT_STATS").is_some() {
-            eprintln!("blaze: a run the store kept is what this one did");
+        if checking && let (Some((kept, _)), Some(made)) = (&found, &made) {
+            same_as_kept(package, kept, made, &out_dir);
         }
         if let (Some(((store, shared), here)), Some(made), Some(mut reads)) = (keys, made, reads) {
             reads.extend(watched(&output.stdout, &cwd));
@@ -279,6 +336,79 @@ pub(crate) fn run_as_cargo_does(
     }
 }
 
+/// What a run that printed `stdout` said it reads and was not given
+/// ([`script_sandbox::not_given`]), but for what it was `declared` already: a variable it is
+/// given and still lacks can't be given, and a run again would be the same.
+fn unset_now(
+    stdout: &[u8],
+    env: &[(String, String)],
+    plan: &script_sandbox::Plan,
+    declared: &[String],
+) -> Vec<String> {
+    let mut unset = script_sandbox::not_given(stdout, env, plan);
+    unset.retain(|it| !declared.contains(it));
+    unset
+}
+
+/// With [`keyed::CHECK`]: ends the process, failed, when `made`, what a run of `package`'s
+/// script into `out_dir` did, is not `kept`, what the store kept of a run with its inputs.
+fn same_as_kept(package: &str, kept: &Kept, made: &Kept, out_dir: &Path) {
+    if kept != made {
+        let what = match kept.stdout == made.stdout {
+            true => "wrote something else in its OUT_DIR",
+            false => "printed something else",
+        };
+        eprintln!(
+            "error: {}=check: the build script of `{package}` {what} than the run the store kept \
+             of it with the same inputs ({})",
+            keyed::CHECK,
+            out_dir.display()
+        );
+        std::process::exit(1);
+    }
+    if std::env::var_os("RA_JIT_STATS").is_some() {
+        eprintln!("blaze: a run the store kept is what this one did");
+    }
+}
+
+/// What a run in its closure is kept under: what its script was built from, the toolchain its
+/// `RUSTC` answers for, its arguments and its environment, which [`hermetic::env_in`] made of
+/// cargo's and the closure (each with what stands for the places of this checkout), and what
+/// [`hermetic::key_of`] adds: its package's source, the closure's NarHashes and its
+/// dependencies' `OUT_DIR`s. Nothing of what it was seen reading: it sees nothing else.
+fn view_key(
+    real: &Path,
+    cwd: &Path,
+    args: &[OsString],
+    env: &[(String, String)],
+    places: &Places,
+    in_view: &InView,
+) -> anyhow::Result<[u8; 32]> {
+    let mut key = keyed::Key::new(IN_VIEW);
+    key.field(script_of(real).context("a build script that can't be read")?.as_bytes());
+    key.field(sysroot_of(env).as_deref().map(keyed::toolchain).unwrap_or_default().as_bytes());
+    for arg in args {
+        key.field(&places.unplace(arg.as_encoded_bytes()));
+    }
+    let mut env: Vec<&(String, String)> = env
+        .iter()
+        .filter(|(name, _)| !UNREAD.contains(&name.as_str()) && name != crate::as_rustc::TOOLCHAIN)
+        .collect();
+    env.sort();
+    for (name, value) in env {
+        key.field(name.as_bytes());
+        match name.as_str() {
+            // Which cargo runs is not seen: the run has no cargo to run.
+            "CARGO" => key.field(b"cargo"),
+            _ => key.field(&places.unplace(value.as_bytes())),
+        };
+    }
+    let unplace = |bytes: &[u8]| places.unplace(bytes);
+    let InView { closure, hidden, deps } = in_view;
+    hermetic::key_of(&mut key, cwd, hidden, closure, deps, &unplace)?;
+    Ok(key.done())
+}
+
 /// The files a run that printed `stdout` in `cwd` named in `rerun-if-changed`, each file below
 /// one that is a directory: inputs of the run whether or not the sandbox saw them read.
 fn watched(stdout: &[u8], cwd: &Path) -> Vec<String> {
@@ -303,6 +433,9 @@ fn watched(stdout: &[u8], cwd: &Path) -> Vec<String> {
 /// the sandbox saw it read ([`keyed`]), 5 since what one printed is checked before it is kept
 /// ([`directives`]).
 pub(super) const RUNS: &str = "build script runs 5";
+
+/// The kind of the key of a run that saw its closure alone ([`view_key`]).
+const IN_VIEW: &str = "build script runs in their closure 1";
 
 /// The variables of a run that change nothing it prints or writes: the jobs it may start, and
 /// the directories the shell that ran cargo was in, which cargo leaves as they were (it runs
@@ -627,13 +760,13 @@ fn take<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
 }
 
 #[cfg(unix)]
-pub(super) fn is_executable(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
-pub(super) fn is_executable(_: &std::fs::Metadata) -> bool {
+pub(crate) fn is_executable(_: &std::fs::Metadata) -> bool {
     false
 }
 
@@ -859,7 +992,13 @@ fn rerun_into(
         return Err("printed something else".to_owned());
     }
     if digest_of(again_dir) != digest_of(out_dir) {
-        return Err("wrote something else".to_owned());
+        let names = different_files(again_dir, out_dir);
+        let more = names.len().saturating_sub(5);
+        let mut names = names.into_iter().take(5).collect::<Vec<_>>().join(", ");
+        if more > 0 {
+            names = format!("{names} and {more} more");
+        }
+        return Err(format!("wrote something else ({names})"));
     }
     Ok(())
 }
@@ -882,6 +1021,38 @@ fn digest_of(dir: &Path) -> Vec<u8> {
         }
     }
     hash.finalize().to_vec()
+}
+
+/// The files below `dir` and `other` whose contents differ, or that only one of them has.
+fn different_files(dir: &Path, other: &Path) -> Vec<String> {
+    let files = |root: &Path| {
+        let mut files = BTreeMap::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(below) = pending.pop() {
+            let entries = std::fs::read_dir(&below).into_iter().flatten().flatten();
+            let mut paths: Vec<PathBuf> = entries.map(|it| it.path()).collect();
+            paths.sort();
+            for path in paths {
+                match path.is_dir() {
+                    true => pending.push(path),
+                    false => {
+                        let name = path.strip_prefix(root).unwrap_or(&path).to_owned();
+                        files.insert(name, std::fs::read(&path).unwrap_or_default());
+                    }
+                }
+            }
+        }
+        files
+    };
+    let ours = files(dir);
+    let theirs = files(other);
+    ours.keys()
+        .chain(theirs.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| ours.get(*name) != theirs.get(*name))
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[cfg(all(test, unix))]
@@ -957,7 +1128,10 @@ mod tests {
         std::fs::write(other.join("made.rs"), "fn made() {}").unwrap();
         assert_eq!(rerun_matches(&out_dir, &other), Ok(()));
         std::fs::write(other.join("made.rs"), "fn made_for_the_load() {}").unwrap();
-        assert_eq!(rerun_matches(&out_dir, &other), Err("wrote something else".to_owned()));
+        assert_eq!(
+            rerun_matches(&out_dir, &other),
+            Err("wrote something else (made.rs)".to_owned())
+        );
     }
 
     #[test]
@@ -1149,10 +1323,24 @@ mod tests {
     }
 
     #[test]
+    fn a_rerun_names_each_file_that_differs() {
+        let out_dir = ran("different", "fn made() {}");
+        let other = ran("different-other", "fn made() {}");
+        std::fs::write(out_dir.join("made.rs"), "fn made() {}").unwrap();
+        std::fs::write(other.join("made.rs"), "fn made_other() {}").unwrap();
+        std::fs::write(out_dir.join("also.rs"), "fn also() {}").unwrap();
+        std::fs::write(other.join("also.rs"), "fn also_other() {}").unwrap();
+        assert_eq!(
+            rerun_matches(&out_dir, &other),
+            Err("wrote something else (also.rs, made.rs)".to_owned())
+        );
+    }
+
+    #[test]
     fn a_rerun_that_writes_something_else_is_told() {
         let out_dir = ran("other", "fn made() {}");
         std::fs::write(out_dir.join("made.rs"), "fn made_before() {}").unwrap();
-        assert_eq!(rerun_is_same(&out_dir), Err("wrote something else".to_owned()));
+        assert_eq!(rerun_is_same(&out_dir), Err("wrote something else (made.rs)".to_owned()));
         assert_eq!(std::fs::read(out_dir.join("made.rs")).unwrap(), b"fn made_before() {}");
     }
 }

@@ -13,9 +13,11 @@
 //! - `<sha256>.pack` is a sealed pack: the magic, an index of where each value is, then the
 //!   values in blocks of about [`BLOCK`] bytes, each compressed on its own with zstd. It is
 //!   named by the hash of its bytes and never changes, so the same file can be on any
-//!   machine or in a bucket. The hash is checked the first time a process reads the pack,
-//!   and the checksum of a value every time it is read. A pack that fails either is
-//!   removed, and what was in it is compiled again.
+//!   machine or in a bucket. Opening the store reads the index of each pack and none of
+//!   its values. The hash is checked by a daemon once it starts ([`check_packs`]), by any
+//!   other process the first time it finds a key in the pack, and the checksum of a value
+//!   every time it is read. A pack that fails either is removed, and what was in it is
+//!   compiled again.
 //! - `<pid>-<nanos>.open` is the pack one daemon appends to, which it holds locked: the
 //!   magic, then records, as they come and not compressed. It is sealed into a pack of its
 //!   own and removed. An open pack nobody holds was left by a daemon that ended, and
@@ -46,7 +48,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -237,7 +239,7 @@ impl Limit {
             Ok(text) if text == "off" => Ok(Limit::Off),
             Ok(text) => parse_size(&text)
                 .map(Limit::Bytes)
-                .ok_or_else(|| format!("RA_JIT_CACHE_MAX=`{text}` is neither a size nor `off`")),
+                .ok_or_else(|| format!("BLAZE_CACHE_MAX=`{text}` is neither a size nor `off`")),
         }
     }
 
@@ -339,6 +341,19 @@ pub fn seal_open() {
 pub fn settled() {
     if let Some(store) = Store::global() {
         store.settled();
+    }
+}
+
+/// Checks every sealed pack of the store of this process against its name, and removes those
+/// that are not what they say: what a daemon does once it starts, so that a damaged pack is
+/// gone whatever its builds read. Any other process checks a pack the first time it finds a
+/// key in it, as each build script of a cold build does in a store it shares.
+pub fn check_packs() {
+    // Unset, the store is the one a later `Store::global_or` names, which opens it.
+    if std::env::var_os("RA_JIT_CACHE").is_some()
+        && let Some(store) = Store::global()
+    {
+        store.check_all();
     }
 }
 
@@ -1285,6 +1300,8 @@ pub struct Store {
     lasting: Identity,
     tuning: Tuning,
     sealed: RwLock<Sealed>,
+    /// The number the next pack read is known by.
+    numbers: AtomicU32,
     unpacked: Mutex<Unpacked>,
     writer: Mutex<Writer>,
     hits: AtomicUsize,
@@ -1310,7 +1327,7 @@ impl Tuning {
         let seal_at = match std::env::var("RA_JIT_CACHE_SEAL_AT") {
             Err(_) => SEAL_AT,
             Ok(text) => parse_size(&text).filter(|&it| it != 0).ok_or_else(|| {
-                io::Error::other(format!("RA_JIT_CACHE_SEAL_AT=`{text}` is not a size"))
+                io::Error::other(format!("BLAZE_CACHE_SEAL_AT=`{text}` is not a size"))
             })?,
         };
         Ok(Tuning { seal_at, limit })
@@ -1320,15 +1337,155 @@ impl Tuning {
 /// The sealed packs this process has read.
 #[derive(Default)]
 struct Sealed {
-    packs: FxHashMap<String, Arc<Pack>>,
-    index: FxHashMap<[u8; KEY], Place>,
+    /// By the number this process gave each, which is never given again.
+    packs: FxHashMap<u32, Arc<Pack>>,
+    named: FxHashMap<String, u32>,
+    /// Where each key of the packs is, in runs sorted by the start of the key, each run at
+    /// least twice as long as the one after it. A key that several packs hold is in each.
+    runs: Vec<Vec<Slot>>,
 }
 
-/// A sealed pack that was what its name says when it was first read.
+/// What this process keeps of a key of a sealed pack: the first bytes of the key, the pack and
+/// which of its entries it is. The rest of the entry, the whole key with it, is read from the
+/// pack when the key is looked up: a store of millions of values is millions of these in
+/// every process that opens it, as each build script of a cold build is.
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    start: u64,
+    pack: u32,
+    entry: u32,
+}
+
+impl Slot {
+    fn start(key: &[u8; KEY]) -> u64 {
+        u64::from_be_bytes(key[..8].try_into().expect("eight bytes"))
+    }
+}
+
+impl Sealed {
+    /// The packs that may hold `key` and which of their entries it would be.
+    fn candidates(&self, key: &[u8; KEY]) -> Vec<(Arc<Pack>, u32)> {
+        let start = Slot::start(key);
+        let mut found = Vec::new();
+        for run in &self.runs {
+            let from = run.partition_point(|it| it.start < start);
+            for slot in run[from..].iter().take_while(|it| it.start == start) {
+                if let Some(pack) = self.packs.get(&slot.pack) {
+                    found.push((pack.clone(), slot.entry));
+                }
+            }
+        }
+        found
+    }
+
+    /// Takes in packs read from the directory, but those another thread took in first.
+    fn add(&mut self, read: Vec<(Pack, Vec<Slot>)>) {
+        let mut pieces = Vec::new();
+        for (pack, slots) in read {
+            if self.named.contains_key(&pack.name) {
+                continue;
+            }
+            self.named.insert(pack.name.clone(), pack.number);
+            self.packs.insert(pack.number, Arc::new(pack));
+            pieces.push(slots);
+        }
+        if pieces.is_empty() {
+            return;
+        }
+        self.runs.push(sorted(pieces));
+        while let [.., before, last] = &self.runs[..]
+            && before.len() < 2 * last.len()
+        {
+            let (last, before) = (self.runs.pop().unwrap(), self.runs.pop().unwrap());
+            self.runs.push(merged(before, last));
+        }
+    }
+
+    /// Forgets the packs named `gone`.
+    fn remove(&mut self, gone: &FxHashSet<&String>) {
+        let numbers: FxHashSet<u32> =
+            gone.iter().filter_map(|name| self.named.remove(*name)).collect();
+        self.packs.retain(|number, _| !numbers.contains(number));
+        for run in &mut self.runs {
+            run.retain(|it| !numbers.contains(&it.pack));
+        }
+        self.runs.retain(|it| !it.is_empty());
+    }
+}
+
+/// The slots of each piece in one run, sorted by the start of their key. The keys are hashes,
+/// so their first byte spreads them evenly: the slots are put by it into as many buckets,
+/// which are sorted on several threads.
+fn sorted(pieces: Vec<Vec<Slot>>) -> Vec<Slot> {
+    let bucket = |slot: &Slot| (slot.start >> 56) as usize;
+    let mut ends = [0usize; 256];
+    for slot in pieces.iter().flatten() {
+        ends[bucket(slot)] += 1;
+    }
+    let mut total = 0;
+    let mut next = [0usize; 256];
+    for (end, next) in ends.iter_mut().zip(&mut next) {
+        *next = total;
+        total += *end;
+        *end = total;
+    }
+    let mut run = vec![Slot::default(); total];
+    for piece in pieces {
+        for slot in piece {
+            let at = &mut next[bucket(&slot)];
+            run[*at] = slot;
+            *at += 1;
+        }
+    }
+    let mut buckets = Vec::with_capacity(256);
+    let mut rest = &mut run[..];
+    let mut taken = 0;
+    for end in ends {
+        let (bucket, after) = std::mem::take(&mut rest).split_at_mut(end - taken);
+        buckets.push(bucket);
+        (rest, taken) = (after, end);
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let threads = threads.min(total / (64 << 10) + 1);
+    let buckets = Mutex::new(buckets);
+    let next = || buckets.lock().unwrap_or_else(PoisonError::into_inner).pop();
+    let sort = || {
+        while let Some(bucket) = next() {
+            bucket.sort_unstable_by_key(|it| it.start);
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            scope.spawn(sort);
+        }
+        sort();
+    });
+    run
+}
+
+/// Two runs made one, sorted as they are.
+fn merged(a: Vec<Slot>, b: Vec<Slot>) -> Vec<Slot> {
+    let mut run = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
+    while let (Some(&x), Some(&y)) = (a.peek(), b.peek()) {
+        run.push(if x.start <= y.start { a.next() } else { b.next() }.expect("peeked"));
+    }
+    run.extend(a);
+    run.extend(b);
+    run
+}
+
+/// A sealed pack whose index was read. Its bytes are checked against its name the first time
+/// a key is found in it, and its values against their checksums each time they are read.
 struct Pack {
     name: String,
+    number: u32,
     file: File,
     blocks: Vec<Block>,
+    /// Where its entries start in it.
+    entries_at: u64,
+    /// Whether its bytes are what its name says, once a key was found in it.
+    checked: OnceLock<bool>,
     /// Whether a value of it was read since its time of last use was last set.
     used: AtomicBool,
     /// Whether it was found to have changed since it was first read.
@@ -1345,6 +1502,9 @@ struct Place {
     checksum: u32,
 }
 
+const UNSEALED: &str = "is not what was sealed under that name";
+const VALUE_CHANGED: &str = "has a value that is not what was written";
+
 impl Pack {
     /// The index of a pack whose bytes are what its name says, or what is wrong with it.
     /// Its values are checked as they are read.
@@ -1353,52 +1513,69 @@ impl Pack {
             return Err("is not a pack of this format");
         }
         if named(&Sha256::digest(bytes)) != name {
-            return Err("is not what was sealed under that name");
+            return Err(UNSEALED);
         }
         Index::read(bytes).ok_or("has an index that is not what was written")
     }
 
-    /// As [`Self::check`] of the bytes of `file`, read through a buffer: a process holds of a
-    /// pack its index, not the pack. Every process that opens the store reads every pack,
-    /// as each of the build scripts cargo starts at once in a cold build does.
-    fn check_file(name: &str, file: &mut File) -> io::Result<Result<Index, &'static str>> {
-        use io::Read;
-        const UNSEALED: &str = "is not what was sealed under that name";
+    /// The index at the start of `file`, if it is laid out as a sealed pack's: what opening
+    /// the store reads of each pack. Its bytes are checked against its name later
+    /// ([`Self::hashes_to`]), when a key is found in it.
+    fn read_index(file: &File) -> io::Result<Result<Index, &'static str>> {
+        let eof = |e: &io::Error| e.kind() == io::ErrorKind::UnexpectedEof;
         let mut head = vec![0; HEAD];
-        match file.read_exact(&mut head) {
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Err(UNSEALED)),
+        match read_at(file, &mut head, 0) {
+            Err(e) if eof(&e) => return Ok(Err(UNSEALED)),
             read => read?,
         }
         let Some(length) = Index::length(&head) else {
             return Ok(Err("is not a pack of this format"));
         };
-        if length as u64 > file.metadata()?.len() {
+        let len = file.metadata()?.len();
+        if length as u64 > len {
             return Ok(Err(UNSEALED));
         }
         head.resize(length, 0);
-        match file.read_exact(&mut head[HEAD..]) {
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Err(UNSEALED)),
+        match read_at(file, &mut head[HEAD..], HEAD as u64) {
+            Err(e) if eof(&e) => return Ok(Err(UNSEALED)),
             read => read?,
         }
-        let mut hasher = Sha256::new();
-        hasher.update(&head);
-        let mut len = head.len() as u64;
-        let mut buffer = vec![0; 1 << 20];
-        loop {
-            match file.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => {
-                    hasher.update(&buffer[..n]);
-                    len += n as u64;
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if named(&hasher.finalize()) != name {
-            return Ok(Err(UNSEALED));
-        }
         Ok(Index::read_head(&head, len).ok_or("has an index that is not what was written"))
+    }
+
+    /// Whether the bytes of `file` are what `name` says, read through a buffer.
+    fn hashes_to(name: &str, file: &File) -> io::Result<bool> {
+        let len = file.metadata()?.len();
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0; (1 << 20).min(len as usize)];
+        let mut at = 0;
+        while at < len {
+            let piece = &mut buffer[..(len - at).min(1 << 20) as usize];
+            read_at(file, piece, at)?;
+            hasher.update(&*piece);
+            at += piece.len() as u64;
+        }
+        Ok(named(&hasher.finalize()) == name)
+    }
+
+    /// Where the value of `key` is, if it is the key of entry `entry`.
+    fn place(self: &Arc<Pack>, entry: u32, key: &[u8; KEY]) -> Option<Place> {
+        let mut bytes = [0; ENTRY];
+        read_at(&self.file, &mut bytes, self.entries_at + u64::from(entry) * ENTRY as u64).ok()?;
+        if bytes[..KEY] != key[..] {
+            return None;
+        }
+        let field = |n: usize| u32_at(&bytes, KEY + 4 * n);
+        let (block, at, len, checksum) = (field(0)?, field(1)?, field(2)?, field(3)?);
+        // As the index was when it was read, unless the pack changed since.
+        let raw = self.blocks.get(block as usize)?.raw;
+        (u64::from(at) + u64::from(len) <= u64::from(raw)).then(|| Place {
+            pack: self.clone(),
+            block,
+            at,
+            len,
+            checksum,
+        })
     }
 
     /// As [`Self::check`], with every value read and checked.
@@ -1534,6 +1711,7 @@ impl Store {
             lasting: Identity::lasting(),
             tuning,
             sealed: RwLock::default(),
+            numbers: AtomicU32::new(0),
             unpacked: Mutex::default(),
             writer: Mutex::default(),
             hits: AtomicUsize::new(0),
@@ -1596,7 +1774,7 @@ impl Store {
     /// daemon or any other, and forgets the ones that were taken out of it.
     pub fn refresh(&self) {
         let Ok(names) = self.dir.packs() else { return };
-        let known: FxHashSet<String> = self.sealed().packs.keys().cloned().collect();
+        let known: FxHashSet<String> = self.sealed().named.keys().cloned().collect();
         let names: FxHashSet<String> = names.into_iter().collect();
         let added: Vec<&String> = names.difference(&known).collect();
         let read = self.read_packs(&added);
@@ -1605,22 +1783,16 @@ impl Store {
             return;
         }
         let mut sealed = self.sealed_mut();
-        // First, so that a key of a pack that went is found in the one that took it in.
         if !gone.is_empty() {
-            sealed.packs.retain(|name, _| !gone.contains(name));
-            sealed.index.retain(|_, place| !gone.contains(&place.pack.name));
+            sealed.remove(&gone);
         }
-        for (pack, entries) in read {
-            for Entry { key, block, at, len, checksum } in entries {
-                let place = Place { pack: pack.clone(), block, at, len, checksum };
-                sealed.index.entry(key).or_insert(place);
-            }
-            sealed.packs.insert(pack.name.clone(), pack);
+        if !read.is_empty() {
+            sealed.add(read);
         }
     }
 
-    /// Reads and checks packs, several at a time: hashing them is most of starting up.
-    fn read_packs(&self, names: &[&String]) -> Vec<(Arc<Pack>, Vec<Entry>)> {
+    /// Reads the indexes of packs, several at a time.
+    fn read_packs(&self, names: &[&String]) -> Vec<(Pack, Vec<Slot>)> {
         let next = AtomicUsize::new(0);
         let read = Mutex::new(Vec::new());
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
@@ -1640,13 +1812,13 @@ impl Store {
         read.into_inner().unwrap_or_default()
     }
 
-    /// The pack and where its values are, if it is what its name says. One that is not is
+    /// The pack and its index, if it has one laid out as a sealed pack's. One that has not is
     /// removed.
-    fn read_pack(&self, name: &str) -> Option<(Arc<Pack>, Vec<Entry>)> {
+    fn read_pack(&self, name: &str) -> Option<(Pack, Vec<Slot>)> {
         // To write as well where that is allowed, which is what Windows asks of whoever
         // sets a file's time of last use.
         let opened = self.dir.open(name, true).or_else(|_| self.dir.open(name, false));
-        let mut file = match opened {
+        let file = match opened {
             Ok(file) => file,
             Err(e) if not_the_users(&e) => {
                 self.discard(name, &e.to_string());
@@ -1655,11 +1827,23 @@ impl Store {
             // Evicted since it was listed.
             Err(_) => return None,
         };
-        match Pack::check_file(name, &mut file).ok()? {
+        match Pack::read_index(&file).ok()? {
             Ok(Index { blocks, entries }) => {
-                let (used, changed) = (AtomicBool::new(false), AtomicBool::new(false));
-                let pack = Pack { name: name.to_owned(), file, blocks, used, changed };
-                Some((Arc::new(pack), entries))
+                let number = self.numbers.fetch_add(1, Ordering::Relaxed);
+                let slots = (entries.iter().zip(0..))
+                    .map(|(it, entry)| Slot { start: Slot::start(&it.key), pack: number, entry })
+                    .collect();
+                let pack = Pack {
+                    name: name.to_owned(),
+                    number,
+                    file,
+                    entries_at: (HEAD + BLOCK_HEADER * blocks.len()) as u64,
+                    blocks,
+                    checked: OnceLock::new(),
+                    used: AtomicBool::new(false),
+                    changed: AtomicBool::new(false),
+                };
+                Some((pack, slots))
             }
             Err(why) => {
                 self.discard(name, why);
@@ -1726,9 +1910,7 @@ impl Store {
             self.collect();
         }
         self.refresh();
-        let sealed = self.sealed();
-        self.writer().keys.retain(|key| !sealed.index.contains_key(key));
-        drop(sealed);
+        self.writer().keys.retain(|key| self.found(key).is_none());
         let corrupt = self.corrupt.swap(0, Ordering::Relaxed);
         if corrupt != 0 {
             eprintln!("store: {corrupt} packs or values were not what was written, and are gone");
@@ -1748,10 +1930,20 @@ impl Store {
         }
     }
 
-    /// Where the value of a key as it is on disk is. A key no sealed pack has is asked of
-    /// whoever fetches packs for this process, and looked for again in what arrived.
+    /// Where the value of a key as it is on disk is, in a pack whose bytes are what its name
+    /// says. A key no sealed pack has is asked of whoever fetches packs for this process, and
+    /// looked for again in what arrived.
     fn place(&self, key: &[u8; KEY]) -> Option<Place> {
-        let known = || self.sealed().index.get(key).cloned();
+        let known = || {
+            let mut found = self.found(key);
+            while let Some(place) = found {
+                if self.checked(&place.pack) {
+                    return Some(place);
+                }
+                found = self.found(key);
+            }
+            None
+        };
         if let Some(place) = known() {
             return Some(place);
         }
@@ -1760,6 +1952,61 @@ impl Store {
         }
         self.refresh();
         known()
+    }
+
+    /// Where the index of a sealed pack says the value of a key as it is on disk is, the pack
+    /// unchecked.
+    fn found(&self, key: &[u8; KEY]) -> Option<Place> {
+        let candidates = self.sealed().candidates(key);
+        (candidates.into_iter())
+            .filter(|(pack, _)| !pack.changed.load(Ordering::Relaxed))
+            .find_map(|(pack, entry)| pack.place(entry, key))
+    }
+
+    /// As [`check_packs`], of the packs this store has read, several at a time.
+    pub fn check_all(&self) {
+        let packs: Vec<Arc<Pack>> = self.sealed().packs.values().cloned().collect();
+        self.check(&packs, std::thread::available_parallelism().map_or(1, |it| it.get()));
+    }
+
+    /// Checks `packs` as [`Self::checked`] does, on up to `threads` threads.
+    fn check(&self, packs: &[Arc<Pack>], threads: usize) {
+        let next = AtomicUsize::new(0);
+        let work = || {
+            while let Some(pack) = packs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                self.checked(pack);
+            }
+        };
+        match threads.min(packs.len()) {
+            0 => {}
+            1 => work(),
+            threads => std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(work);
+                }
+            }),
+        }
+    }
+
+    /// Whether the bytes of `pack` are what its name says, read the first time this is asked.
+    /// One that is not is removed.
+    fn checked(&self, pack: &Arc<Pack>) -> bool {
+        *pack.checked.get_or_init(|| match Pack::hashes_to(&pack.name, &pack.file) {
+            Ok(true) => true,
+            Ok(false) => {
+                self.forget(pack, UNSEALED);
+                false
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.forget(pack, UNSEALED);
+                false
+            }
+            Err(e) => {
+                pack.changed.store(true, Ordering::Relaxed);
+                eprintln!("store: {} not read: {e}", pack.name);
+                false
+            }
+        })
     }
 
     /// Whether a sealed pack has a value for the key.
@@ -1794,7 +2041,7 @@ impl Store {
         let place = self.place(&key)?;
         let value = self.value(&place).filter(|it| checksum(&key, it) == place.checksum);
         if value.is_none() {
-            self.forget(&place.pack);
+            self.forget(&place.pack, VALUE_CHANGED);
             return None;
         }
         place.pack.used.store(true, Ordering::Relaxed);
@@ -1821,11 +2068,21 @@ impl Store {
         keys: &[[u8; KEY]],
         threads: usize,
     ) -> Vec<Option<Vec<u8>>> {
-        let places: Vec<Option<([u8; KEY], Place)>> = keys
-            .iter()
-            .map(|key| {
-                let key = identity.key(key);
-                Some((key, self.place(&key)?))
+        let on_disk: Vec<[u8; KEY]> = keys.iter().map(|key| identity.key(key)).collect();
+        let found: Vec<Option<Place>> = on_disk.iter().map(|key| self.found(key)).collect();
+        // The packs they are in are checked at once, rather than each by the key that is first
+        // found in it.
+        let mut packs: Vec<Arc<Pack>> = (found.iter().flatten())
+            .filter(|it| it.pack.checked.get().is_none())
+            .map(|it| it.pack.clone())
+            .collect();
+        packs.sort_unstable_by_key(|it| it.number);
+        packs.dedup_by_key(|it| it.number);
+        self.check(&packs, threads);
+        let places: Vec<Option<([u8; KEY], Place)>> = (on_disk.into_iter().zip(found))
+            .map(|(key, found)| match found {
+                Some(place) if self.checked(&place.pack) => Some((key, place)),
+                _ => Some((key, self.place(&key)?)),
             })
             .collect();
         let mut by_block: FxHashMap<(usize, u32), Vec<usize>> = FxHashMap::default();
@@ -1879,7 +2136,7 @@ impl Store {
                     place.pack.used.store(true, Ordering::Relaxed);
                     values[at] = Some(value);
                 }
-                None => self.forget(&place.pack),
+                None => self.forget(&place.pack, VALUE_CHANGED),
             }
         }
         values
@@ -1927,16 +2184,15 @@ impl Store {
         self.unpacked.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stops reading a pack that changed after it was first read, and removes it.
-    fn forget(&self, pack: &Arc<Pack>) {
+    /// Stops reading a pack that is not what was written, and removes it.
+    fn forget(&self, pack: &Arc<Pack>, why: &str) {
         // Only the first to find it says so.
         if pack.changed.swap(true, Ordering::Relaxed) {
             return;
         }
         // The pack stays known, so that it is not read again should it not be removable.
-        self.sealed_mut().index.retain(|_, place| !Arc::ptr_eq(&place.pack, pack));
         self.unpacked().forget(pack);
-        self.discard(&pack.name, "has a value that is not what was written");
+        self.discard(&pack.name, why);
     }
 
     /// The code of a function by what it was compiled from, counted as found or not.
@@ -1961,7 +2217,7 @@ impl Store {
     }
 
     fn insert_on_disk(&self, key: [u8; KEY], value: &[u8]) {
-        if self.sealed().index.contains_key(&key) {
+        if self.found(&key).is_some() {
             return;
         }
         let Ok(len) = u32::try_from(value.len()) else { return };
@@ -2492,6 +2748,86 @@ mod tests {
             store.flush();
             assert_eq!(store.get(&[1; KEY]).as_deref(), Some(&b"one"[..]));
             assert!(StoreDir::at(&dir).verify().unwrap().corrupt.is_empty());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pack_is_checked_when_a_key_is_found_in_it_not_when_the_store_opens() {
+        let dir = scratch("lazy");
+        let pack = sealed(&dir);
+        change(&pack, |bytes| {
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+        });
+        let store = open(&dir, EAGER);
+        assert!(pack.exists());
+        assert!(!store.has(&[3; KEY]));
+        assert!(pack.exists());
+        // The other key's value is fine, and still not trusted.
+        assert!(!store.has(&[1; KEY]));
+        assert!(!pack.exists());
+        assert_eq!(store.get(&[2; KEY]), None);
+        // A daemon checks them all once it starts.
+        std::fs::remove_dir_all(&dir).unwrap();
+        let pack = sealed(&dir);
+        change(&pack, |bytes| {
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+        });
+        let daemon = open(&dir, EAGER);
+        assert!(pack.exists());
+        daemon.check_all();
+        assert!(!pack.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A sealed pack in `dir` of `keys`, as they are on disk, each with a value of its own.
+    fn pack_of_keys(dir: &Path, keys: &[[u8; KEY]]) -> PathBuf {
+        let store = StoreDir::at(dir);
+        store.claim().unwrap();
+        let mut sealing = Sealing::new();
+        for key in keys {
+            sealing.add(key, &key[KEY - 8..], checksum(key, &key[KEY - 8..]));
+        }
+        let pack = sealing.finish();
+        let name = named(&Sha256::digest(&pack));
+        store.write_whole(&name, &pack).unwrap();
+        dir.join(name)
+    }
+
+    #[test]
+    fn keys_that_start_the_same_are_told_apart() {
+        let dir = scratch("starts");
+        let key = |n: u8| {
+            let mut key = [9; KEY];
+            key[KEY - 1] = n;
+            key
+        };
+        let pack = pack_of_keys(&dir, &(0..40).map(key).collect::<Vec<_>>());
+        let store = open(&dir, EAGER);
+        for n in (0..40).rev() {
+            assert_eq!(store.get_on_disk(key(n)).as_deref(), Some(&key(n)[KEY - 8..]), "{n}");
+        }
+        assert_eq!(store.get_on_disk(key(40)), None);
+        assert!(pack.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opening_a_store_holds_sixteen_bytes_a_key() {
+        use ra_jit_fuzz as fuzz;
+        let dir = scratch("held");
+        let count = 100_000u32;
+        let keys: Vec<[u8; KEY]> =
+            (0..count).map(|n| Sha256::digest(n.to_le_bytes()).into()).collect();
+        let (half, rest) = keys.split_at(keys.len() / 2);
+        pack_of_keys(&dir, half);
+        pack_of_keys(&dir, rest);
+        let (largest, store) = fuzz::largest_allocation(|| open(&dir, EAGER));
+        assert!(largest <= 16 * count as usize, "{largest} bytes for {count} keys");
+        for key in keys.iter().step_by(997) {
+            assert_eq!(store.get_on_disk(*key).as_deref(), Some(&key[KEY - 8..]));
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3044,13 +3380,16 @@ mod tests {
             }
             sealed += usize::from(Pack::check(&name, &bytes).is_ok());
             assert!(Pack::check(&named(&[0; 32]), &bytes).is_err());
-            let file = dir.join("pack");
-            std::fs::write(&file, &bytes).unwrap();
-            let read =
-                |name: &str| Pack::check_file(name, &mut File::open(&file).unwrap()).unwrap();
-            let entries = |it: Result<Index, &str>| it.map(|it| it.entries.len()).ok();
-            assert_eq!(entries(read(&name)), entries(Pack::check(&name, &bytes)));
-            assert!(read(&named(&[0; 32])).is_err());
+            let path = dir.join("pack");
+            std::fs::write(&path, &bytes).unwrap();
+            let file = File::open(&path).unwrap();
+            let read = Pack::read_index(&file).unwrap();
+            let entries = |it: Option<Index>| it.map(|it| it.entries.len());
+            assert_eq!(entries(read.ok()), entries(Index::read(&bytes)));
+            let sealed = Pack::read_index(&file).unwrap().ok();
+            let sealed = sealed.filter(|_| Pack::hashes_to(&name, &file).unwrap());
+            assert_eq!(entries(sealed), entries(Pack::check(&name, &bytes).ok()));
+            assert!(!Pack::hashes_to(&named(&[0; 32]), &file).unwrap());
         }
         std::fs::remove_dir_all(&dir).unwrap();
         eprintln!("pack: {whole} whole, {cut} not, {sealed} laid out as sealed");

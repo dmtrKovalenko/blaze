@@ -64,7 +64,7 @@ fn wrapped(server: Command) -> std::io::Result<Command> {
         std::io::Error::other(format!(
             "a proc-macro server runs in a sandbox, which can't be made for it: {why}; `{}=off` \
              runs proc-macro servers, build scripts and tests outside a sandbox",
-            sandboxed::VAR
+            crate::sandbox::VAR_BLAZE
         ))
     };
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -73,7 +73,7 @@ fn wrapped(server: Command) -> std::io::Result<Command> {
     match spec_of(&server) {
         Ok(spec) => {
             let exe = std::env::current_exe()
-                .map_err(|why| refused(format!("finding ra-jit itself: {why}")))?;
+                .map_err(|why| refused(format!("finding blaze itself: {why}")))?;
             let mut command = Command::new(exe);
             // The server by where it is: the path it was named by may go through a link in a
             // directory the sandbox has empty (a toolchain linked into `/tmp`), and the
@@ -91,10 +91,41 @@ fn wrapped(server: Command) -> std::io::Result<Command> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_server_is_given_the_toolchain_s_variables_and_no_secret() {
+        for name in [
+            "PATH",
+            "HOME",
+            "RUSTUP_TOOLCHAIN",
+            "RA_JIT_CACHE",
+            "RUST_ANALYZER_INTERNALS_DO_NOT_USE",
+        ] {
+            assert!(super::given_to_server(name), "{name}");
+        }
+        for name in ["GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "OPENSSL_DIR"] {
+            assert!(!super::given_to_server(name), "{name}");
+        }
+    }
+}
+
+/// Whether the variable `name` of this process's environment is given to a proc-macro server:
+/// what finds the toolchain and how a failure is shown ([`sandboxed::KEPT`]) and ra-jit's and
+/// rust-analyzer's own. Nothing else (a CI's secrets): what a macro reads with `env!` or
+/// `std::env::var` is its crate's environment (`CARGO_*`, `OUT_DIR`, a build script's
+/// `rustc-env`), which each expansion is sent with.
+fn given_to_server(name: &str) -> bool {
+    sandboxed::KEPT.contains(&name)
+        || name.starts_with("RA_JIT_")
+        || name.starts_with("RUST_ANALYZER_")
+}
+
 /// The file of the spec `server` runs in, written where only this user reads it: the
-/// environment is all of this process's with what the command sets.
+/// environment is what [`given_to_server`] keeps of this process's, with what the command sets.
 fn spec_of(server: &Command) -> anyhow::Result<PathBuf> {
-    let mut env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let mut env: std::collections::BTreeMap<String, String> =
+        std::env::vars().filter(|(name, _)| given_to_server(name)).collect();
     for (name, value) in server.get_envs() {
         let Some(name) = name.to_str() else { continue };
         match value.and_then(|it| it.to_str()) {

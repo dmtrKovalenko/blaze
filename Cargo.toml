@@ -5,12 +5,15 @@ members = ["crates/*"]
 exclude = ["crates/ra-jit-wasm", "demo", "harness", "vendor/proc-macro-srv", "vendor/rust-analyzer"]
 resolver = "2"
 
+[workspace.metadata.blaze]
+experimental = ["sandboxed-tests"]
+
 # hir-ty-codegen's build script checks the pinned LLVM `nix develop` names (its `llvm` feature).
 [workspace.metadata.blaze.sandbox]
 build-script-env = ["LLVM_SYS_231_PREFIX"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.20261027.0"
 rust-version = "1.101"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -65,6 +68,8 @@ salsa-macros = { path = "vendor/salsa-macros" }
 salsa-macro-rules = { path = "vendor/salsa-macro-rules" }
 # Links the pinned LLVM statically, with a static libstdc++ on Linux (vendor/llvm-sys/SOURCE.md).
 llvm-sys = { path = "vendor/llvm-sys" }
+# Statics that name one section share it, as in LLVM's objects (vendor/cranelift-object/SOURCE.md).
+cranelift-object = { path = "vendor/cranelift-object" }
 
 # line-index = { path = "lib/line-index" }
 # la-arena = { path = "lib/la-arena" }
@@ -95,6 +100,7 @@ blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-lints = { path = "crates/blaze-lints" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-metadata = { path = "crates/blaze-metadata" }
+blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-tree = { path = "crates/blaze-tree" }

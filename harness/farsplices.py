@@ -48,8 +48,11 @@ STEPS = [
     ("a function a long jump fits", [(MAIN, "wrapping_mul(31)", "wrapping_mul(33)")], False, "spliced"),
     ("again", [(MAIN, "wrapping_mul(33)", "wrapping_mul(35)")], False, "spliced"),
     ("the caller of one in the executable", [(MAIN, "near() + 1", "near() + 2")], False, "spliced"),
+    # `ret` alone: 4 bytes but for what ra-jit fills it up with.
     ("a function shorter than the long jump", [(MAIN, "fn nothing() {}", 'fn nothing() { println!("something"); }')], False, "spliced"),
     ("an edit after that", [(MAIN, "wrapping_mul(35)", "wrapping_mul(37)")], False, "spliced"),
+    # `mov w0, #40` and `ret` under LLVM: 8 bytes but for the filling.
+    ("a function of two instructions", [(MAIN, "    40\n}", "    42\n}")], False, "spliced"),
 ]
 
 if __name__ == "__main__":

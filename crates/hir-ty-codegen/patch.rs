@@ -30,7 +30,7 @@ use super::{
     Result, Roots, SymbolResolver, TheirStatics, Walked, async_blocks,
     cached::WrittenItem,
     compiled_instance, compiled_root, compiled_static, declaration_location,
-    fragment::{CompiledFunction, DataRequest, FuncTarget, Requests, TextPart},
+    fragment::{CompiledFunction, CompiledStatic, DataRequest, FuncTarget, Requests, TextPart},
     home::{body_file, body_files, mentioned_crates, written_in},
     instance_serial, is_thread_local, left_to_rustc, root_serial, row_location, source_location,
     stable::StableNames,
@@ -552,6 +552,9 @@ pub(super) struct BaseStatic {
     /// rustc's copy, which has state that rustc's code shares with ours: a patch can't give
     /// it another first value.
     pub(super) shared: bool,
+    /// The size and alignment of its value, `None` for one that did not compile: a value
+    /// larger or aligned to more does not fit where the base has it.
+    layout: Option<(u64, u64)>,
 }
 
 /// What a function left to rustc keeps the rest of the build from doing.
@@ -1165,6 +1168,10 @@ pub(super) struct Unchanged {
     /// compiles none of it, and code that refers to one of those again would reach the base's
     /// copy, which is of the source before.
     pub(super) behind: FxHashMap<Node, Vec<Node>>,
+    /// The statics of `changed` whose value no longer fits where the base has them: each is
+    /// a static of the patch's own, and everything of the base that refers to it is in the
+    /// patch too, referring to that ([`Base::moved`]).
+    pub(super) moved: FxHashSet<StaticId>,
 }
 
 pub(super) struct Patch {
@@ -1396,19 +1403,19 @@ impl Base {
             .collect::<Option<FxIndexMap<_, _>>>()?;
         // One that does not compile is never what it was: a change to the file declines.
         let nothing = Mark { serial: 0, locations: 0, lines: 0 };
-        let base_static = |id: StaticId,
-                           data,
-                           compiled: Option<&super::fragment::CompiledStatic>,
-                           shared| BaseStatic {
-            symbol: decls.get_data_decl(data).linkage_name(data).into_owned(),
-            writable: compiled.is_some_and(|it| it.writable),
-            mark: compiled.map_or(nothing, |it| Mark::new(db, static_serial(db, id), &it.requests)),
-            krate: id.krate(db),
-            file: body_file(db, id.into()),
-            parents: Vec::new(),
-            theirs: false,
-            shared,
-        };
+        let base_static =
+            |id: StaticId, data, compiled: Option<&CompiledStatic>, shared| BaseStatic {
+                symbol: decls.get_data_decl(data).linkage_name(data).into_owned(),
+                writable: compiled.is_some_and(|it| it.writable),
+                mark: compiled
+                    .map_or(nothing, |it| Mark::new(db, static_serial(db, id), &it.requests)),
+                krate: id.krate(db),
+                file: body_file(db, id.into()),
+                parents: Vec::new(),
+                theirs: false,
+                shared,
+                layout: compiled.map(CompiledStatic::layout),
+            };
         let mut statics = cg
             .statics
             .iter()
@@ -1672,6 +1679,7 @@ impl Base {
                 theirs: false,
                 // rustc's copy, which rustc's code writes when the static has state.
                 shared: is_thread_local(db, id) || compiled.is_some_and(|it| it.writable),
+                layout: compiled.map(CompiledStatic::layout),
             };
             self.statics.insert(id, known);
         }
@@ -2544,6 +2552,59 @@ impl Base {
         false
     }
 
+    /// Those of `changed` whose value no longer fits where the base has it, with what of the
+    /// base refers to each. The patch has a copy of its own of such a static, so what refers
+    /// to the base's goes in the patch to refer to that; why not, when something no patch
+    /// compiles again refers to one.
+    fn moved(
+        &self,
+        db: &dyn HirDatabase,
+        changed: &[StaticId],
+    ) -> std::result::Result<(FxHashSet<StaticId>, Vec<Node>), &'static str> {
+        let (mut moved, mut referrers) = (FxHashSet::default(), Vec::new());
+        for &id in changed {
+            let Some(was) = self.statics.get(&id) else { continue };
+            let now = probe(|| compiled_static(db, id).as_ref().ok().map(CompiledStatic::layout));
+            // One with no value now is refused as it is compiled.
+            let fits = match (was.layout, now.flatten()) {
+                (_, None) => true,
+                (None, Some(_)) => false,
+                (Some((size, align)), Some((now, aligned))) => now <= size && aligned <= align,
+            };
+            if fits {
+                continue;
+            }
+            if self.reached_from_store.contains(&Node::Static(id)) {
+                return Err(
+                    "a static that outgrew the base's copy is referred to by code from the store",
+                );
+            }
+            for parent in &was.parents {
+                match parent {
+                    Node::Root(_) => {}
+                    Node::Instance(instance) => {
+                        let known = self.instances.get(instance);
+                        if known.is_none_or(|it| it.mark.is_none() || it.forwarded) {
+                            return Err("a static that outgrew the base's copy is referred to by \
+                                        an instance the patch can't compile again");
+                        }
+                    }
+                    Node::Static(it) => {
+                        let known = self.statics.get(it);
+                        if known.is_none_or(|it| it.theirs || it.shared) || is_thread_local(db, *it)
+                        {
+                            return Err("a static that outgrew the base's copy is stored in one \
+                                        the patch can't write");
+                        }
+                    }
+                }
+                referrers.push(parent.clone());
+            }
+            moved.insert(id);
+        }
+        Ok((moved, referrers))
+    }
+
     /// Each of `dropped` by the instances and statics of the base above it that the edit left
     /// as they were, up to what it changed: what refers to one of those reaches the base's
     /// copy of the dropped one through it.
@@ -2698,6 +2759,22 @@ impl Base {
                 }
             }
         }
+        let (moved, referrers) = match self.moved(db, &changed_statics) {
+            Ok(it) => it,
+            Err(why) => return Ok(Err(why)),
+        };
+        for node in referrers {
+            match node {
+                Node::Root(root) if !gone.contains(&root) && !changed_roots.contains(&root) => {
+                    changed_roots.push(root)
+                }
+                Node::Instance(instance) if !changed_instances.contains(&instance) => {
+                    changed_instances.push(instance)
+                }
+                Node::Static(id) if !changed_statics.contains(&id) => changed_statics.push(id),
+                _ => {}
+            }
+        }
         // What the edit took away is still in the base, where nothing refers to it any more.
         let unchanged = Unchanged {
             changed: changed_roots
@@ -2709,6 +2786,7 @@ impl Base {
             broken: broken.iter().map(|it| it.0.clone()).collect(),
             gone,
             behind: FxHashMap::default(),
+            moved,
         };
         // Nothing tells what in rustc's code refers to what.
         if let Some((_, why)) =

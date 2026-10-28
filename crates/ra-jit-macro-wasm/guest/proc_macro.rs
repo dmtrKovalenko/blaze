@@ -1333,4 +1333,9 @@ pub mod __blaze {
     pub fn list(text: &str) {
         unsafe { sys::output(text.as_ptr(), text.len()) };
     }
+
+    /// As [`list`], of the bytes of the static the module also carries in a custom section.
+    pub fn list_bytes(text: &[u8]) {
+        unsafe { sys::output(text.as_ptr(), text.len()) };
+    }
 }

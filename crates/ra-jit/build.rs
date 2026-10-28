@@ -187,11 +187,11 @@ impl Sha256 {
             self.compress(&block);
             self.pending.clear();
         }
-        let mut blocks = bytes.chunks_exact(64);
-        for block in &mut blocks {
-            self.compress(block.try_into().unwrap());
+        let (blocks, rest) = bytes.as_chunks::<64>();
+        for block in blocks {
+            self.compress(block);
         }
-        self.pending.extend_from_slice(blocks.remainder());
+        self.pending.extend_from_slice(rest);
     }
 
     fn finish(mut self) -> [u8; 32] {
@@ -201,16 +201,16 @@ impl Sha256 {
         tail.extend_from_slice(&bits.to_be_bytes());
         self.update(&tail);
         let mut out = [0; 32];
-        for (word, at) in self.state.iter().zip(out.chunks_exact_mut(4)) {
-            at.copy_from_slice(&word.to_be_bytes());
+        for (word, at) in self.state.iter().zip(out.as_chunks_mut::<4>().0) {
+            *at = word.to_be_bytes();
         }
         out
     }
 
     fn compress(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
-        for (word, at) in w.iter_mut().zip(block.chunks_exact(4)) {
-            *word = u32::from_be_bytes(at.try_into().unwrap());
+        for (word, at) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*at);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);

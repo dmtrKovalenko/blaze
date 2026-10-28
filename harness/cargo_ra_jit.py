@@ -909,6 +909,7 @@ def daemon(work):
     manners(work, ws, env, here, check, edit)
     abuse(work, ws, tree, env, check, status, alive)
     in_place(work, check)
+    cleaned(work, check)
     through_link(work, check)
     script_links_proc_macro(work, check)
     pinned(work, check)
@@ -1179,6 +1180,48 @@ def in_place(work, check):
     started("`cargo ra-jit run`", Side(os.path.join(work, "in-place-run"), env, True), by_run)
     subprocess.run([RA_JIT, "disable"], env=plain_env, capture_output=True)
     subprocess.run([RA_JIT, "stop"], env=env, capture_output=True)
+
+
+# A program with a build script whose output it includes: a clean takes that away too.
+CLEANED = {
+    "Cargo.toml": '[package]\nname = "cleaned"\nversion = "0.1.0"\nedition = "2021"\n',
+    "build.rs": 'fn main() {\n    let out = std::env::var("OUT_DIR").unwrap();\n    std::fs::write(format!("{out}/said.rs"), "const SAID: &str = \\"from the script\\";").unwrap();\n}\n',
+    "src/main.rs": 'include!(concat!(env!("OUT_DIR"), "/said.rs"));\n\nfn main() {\n    println!("hello {SAID}");\n}\n',
+}
+
+
+def cleaned(work, check):
+    """A clean while the daemon runs (#721): `cargo ra-jit clean`, `cargo clean` and `rm -rf
+    target` take away what its worker wrote under the target directory, the standard
+    library's unit among them, and tell it nothing. The next build is the same worker's,
+    which writes again what is gone, and so is an edit after it."""
+    ws = os.path.realpath(os.path.join(work, "cleaned"))
+    for file, text in CLEANED.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, file)), exist_ok=True)
+        open(os.path.join(ws, file), "w").write(text)
+    env = base_env(os.path.join(work, "home-cleaned"))
+    here = Side(ws, env, True)
+    workers = lambda: re.findall(r"worker: pid (\d+)", here.cargo("status")[1].stdout)
+    _, first = here.cargo("run")
+    wait_warm(here, ws)
+    before = workers()
+    check("a program with a build script's output is the daemon's", first.returncode == 0 and how_built(first.stderr) == "daemon" and "hello from the script" in first.stdout, f"exit {first.returncode}, {first.stderr.strip()[-300:]!r}")
+    cleans = [
+        ("`cargo ra-jit clean`", lambda: here.cargo("clean")),
+        ("`cargo clean`", lambda: timed(["cargo", "clean"], ws, env)),
+        ("`rm -rf target`", lambda: shutil.rmtree(os.path.join(ws, "target"))),
+    ]
+    for at, (name, clean) in enumerate(cleans):
+        clean()
+        _, again = here.cargo("run")
+        held = again.returncode == 0 and how_built(again.stderr) == "daemon" and "hello from the script" in again.stdout and workers() == before
+        check(f"a build after {name} while the daemon runs is the same worker's, and runs", held, f"exit {again.returncode}, workers {before} then {workers()}, {again.stderr.strip()[-300:]!r}")
+        rewrite(os.path.join(ws, "src/main.rs"), "hello", f"edit {at}")
+        _, edited = here.cargo("run")
+        held = edited.returncode == 0 and how_built(edited.stderr) == "daemon" and f"edit {at} from the script" in edited.stdout
+        check("and an edit after it", held, f"exit {edited.returncode}, {edited.stderr.strip()[-300:]!r}")
+        rewrite(os.path.join(ws, "src/main.rs"), f"edit {at}", "hello")
+    here.cargo("stop")
 
 
 USE_AFTER_MOVE = """
@@ -1893,7 +1936,8 @@ def main():
             md.write("\n## Plain cargo after `ra-jit enable`\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["plain"]))
         if result.get("upgraded"):
             md.write("\n## After an upgrade, and a project pinned to another release\n\n" + "".join(f"- {'ok' if held else 'NOT'}: {name} {detail}\n" for name, held, detail in result["upgraded"]))
-    if "--keep" not in argv:
+    # A failed run keeps its workers' logs for CI's upload (ra-jit-platform.yaml's cargo-ra-jit-logs).
+    if "--keep" not in argv and not result["wrong"]:
         shutil.rmtree(work, ignore_errors=True)
     print("PASS" if not result["wrong"] else "FAIL:\n" + "\n".join(result["wrong"]))
     sys.exit(1 if result["wrong"] else 0)

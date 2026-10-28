@@ -8,9 +8,12 @@ The lock files are the bench projects' (bench.py's PROJECTS, each at its pinned 
 Cargo.lock, or the one cargo makes when it has none; not bun's, whose tree bunprep.py makes),
 one for each of the N most downloaded crates of crates.io (default 300: a project depending on
 its newest version, locked by cargo), one of git dependencies of every kind of reference, and
-one of a few crates from a second sparse registry,
+one of a few crates from each of two more sparse registries,
 which this script serves on 127.0.0.1 from crates.io's index and files under a `dl` with no
-markers. The pinned nightly's cargo fetches every lock file (`cargo fetch --locked`) into a CARGO_HOME of its
+markers. The second of them requires a token (`auth-required`, a 401 with a `Cargo`
+challenge to whatever does not send it, `config.json` too), which both homes have in
+credentials.toml with `cargo:token` in `registry.global-credential-providers`: every request
+to it but the first `config.json` has to carry the token, for cargo and blaze alike. The pinned nightly's cargo fetches every lock file (`cargo fetch --locked`) into a CARGO_HOME of its
 own, and blaze-registry's `fetch` example (FETCH, or built here) into another. Every package
 either unpacked into registry/src is compared: equal when it has the same directory in both and
 the same tree (every path, its kind and mode, a file's size, sha256 and mtime, a link's target;
@@ -40,6 +43,14 @@ AGENT = "blaze harness/fetchdiff.py (https://github.com/indexable-inc/blaze)"
 MIRROR_PORT = 48273
 MIRROR = f"sparse+http://127.0.0.1:{MIRROR_PORT}/index/"
 MIRROR_CRATES = {"serde": "1", "regex": "1", "tokio": "1", "clap": "4", "rand": "0.9"}
+AUTH_MIRROR = f"sparse+http://127.0.0.1:{MIRROR_PORT}/auth/index/"
+AUTH_TOKEN = "fetchdiff-token"
+AUTH_CRATES = {"itoa": "1", "ryu": "1", "memchr": "2"}
+AUTH_CONFIG = (f'[registries.mirror]\nindex = "{MIRROR}"\n\n[registries.authmirror]\nindex = "{AUTH_MIRROR}"\n\n'
+               '[registry]\nglobal-credential-providers = ["cargo:token"]\n')
+AUTH_CREDENTIALS = f'[registries.authmirror]\ntoken = "{AUTH_TOKEN}"\n'
+# Requests to the registry that requires a token: (client, path, whether it had the token).
+AUTH_ASKED = []
 GIT_DEPS = [
     'curl-sys = { git = "https://github.com/alexcrichton/curl-rust", branch = "main" }',
     'anyhow = { git = "https://github.com/dtolnay/anyhow", tag = "1.0.80" }',
@@ -78,13 +89,29 @@ class Mirror(http.server.BaseHTTPRequestHandler):
     crates.io's (whose dependencies name no registry, so this one), its `dl` has no markers."""
 
     def do_GET(self):
+        path = self.path
+        if path.startswith("/auth/"):
+            sent = self.headers.get("authorization") == AUTH_TOKEN
+            client = "blaze" if self.headers.get("user-agent", "").startswith("blaze/") else "cargo"
+            AUTH_ASKED.append((client, path, sent))
+            if not sent:
+                body = b"this registry wants a token"
+                self.send_response(401)
+                self.send_header("www-authenticate", f'Cargo login_url="http://127.0.0.1:{MIRROR_PORT}/me"')
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                return self.wfile.write(body)
+            path = path[len("/auth"):]
         try:
-            if self.path == "/index/config.json":
-                body = json.dumps({"dl": f"http://127.0.0.1:{MIRROR_PORT}/dl"}).encode()
-            elif self.path.startswith("/index/"):
-                body = get("https://index.crates.io/" + self.path[len("/index/"):])
-            elif self.path.startswith("/dl/") and self.path.endswith("/download"):
-                name, version = self.path.split("/")[2:4]
+            if path == "/index/config.json":
+                config = {"dl": f"http://127.0.0.1:{MIRROR_PORT}{self.path[:len(self.path) - len(path)]}/dl"}
+                if self.path != path:
+                    config["auth-required"] = True
+                body = json.dumps(config).encode()
+            elif path.startswith("/index/"):
+                body = get("https://index.crates.io/" + path[len("/index/"):])
+            elif path.startswith("/dl/") and path.endswith("/download"):
+                name, version = path.split("/")[2:4]
                 body = get(f"https://static.crates.io/crates/{name}/{name}-{version}.crate")
             else:
                 return self.send_error(404)
@@ -265,6 +292,17 @@ def compare(cargo_home, blaze_home):
     return total, unequal, dirs
 
 
+def auth_asked(client):
+    """What `client` asked of the registry that requires a token, and whether that was as it
+    should be: `config.json` first with no token and then with it, everything else with it."""
+    asked = [(path, sent) for who, path, sent in AUTH_ASKED if who == client]
+    config = [sent for path, sent in asked if path.endswith("/config.json")]
+    good = (bool(asked) and all(sent for path, sent in asked if not path.endswith("/config.json"))
+            and all(config[1:]) and (config[:1] != [False] or len(config) > 1))
+    return {"asked": len(asked), "with_token": sum(sent for _, sent in asked),
+            "crates": sum(path.endswith("/download") for path, _ in asked), "as_cargo_sends": good}
+
+
 def fresh(*homes):
     for home in homes:
         shutil.rmtree(home, ignore_errors=True)
@@ -354,7 +392,9 @@ def main():
     run = Run(blaze_fetch(args.blaze))
     cargo_home, blaze_home = os.path.join(work, "cargo-home"), os.path.join(work, "blaze-home")
     fresh(cargo_home, blaze_home)
-    write(os.path.join(cargo_home, "config.toml"), f'[registries.mirror]\nindex = "{MIRROR}"\n')
+    for home in cargo_home, blaze_home:
+        write(os.path.join(home, "config.toml"), AUTH_CONFIG)
+        write(os.path.join(home, "credentials.toml"), AUTH_CREDENTIALS)
     cargo = Cargo(cargo_home)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", MIRROR_PORT), Mirror)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -390,6 +430,12 @@ def main():
         run.failed["mirror"] = error
     else:
         locks["mirror"] = dir
+    dir = os.path.join(work, "authmirror")
+    deps = "".join(f'{name} = {{ version = "{req}", registry = "authmirror" }}\n' for name, req in AUTH_CRATES.items())
+    if error := project(dir, deps, cargo):
+        run.failed["authmirror"] = error
+    else:
+        locks["authmirror"] = dir
 
     # Git dependencies of every kind of reference: a branch (with a submodule), a tag, a tag
     # named as `rev`, the default branch, and a repository on no forge (a file URL), which
@@ -405,11 +451,16 @@ def main():
         locks["gitdeps"] = dir
 
     registry, git = set(), set()
+    auth = {}
     for name, dir in locks.items():
+        if name == "authmirror":
+            AUTH_ASKED.clear()
         if run.both(name, dir, cargo, blaze_home):
             found, from_git = packages(os.path.join(dir, "Cargo.lock"))
             registry |= found
             git |= from_git
+        if name == "authmirror":
+            auth = {client: auth_asked(client) for client in ("cargo", "blaze")}
     total, unequal, dirs = compare(cargo_home, blaze_home)
     git_total, git_unequal, git_dirs = compare_git(cargo_home, blaze_home)
     dirs.update({f"git/{part}": it for part, it in git_dirs.items()})
@@ -441,7 +492,7 @@ def main():
         "packages": total, "equal": total - len(unequal), "dirs": dirs,
         "checkouts": git_total, "checkouts_equal": git_total - len(git_unequal), "checkouts_unequal": git_unequal,
         "replaced": {**replaced, "equal": replaced["total"] - len(replaced["unequal"])},
-        "vendored": vendor, "dirs_equal": dirs_equal, "blaze": run.blaze, "seconds": run.seconds,
+        "vendored": vendor, "auth": auth, "dirs_equal": dirs_equal, "blaze": run.blaze, "seconds": run.seconds,
         "unequal": unequal, "failed": run.failed,
     }
     with open(os.path.join(work, "fetchdiff.json"), "w") as f:
@@ -451,6 +502,9 @@ def main():
           f"lock files)")
     print(f"{git_total - len(git_unequal)}/{git_total} git checkouts equal ({len(git)} git packages in the lock files)")
     print(f"crates.io replaced by a mirror: {result['replaced']['equal']}/{replaced['total']} equal")
+    for client, it in auth.items():
+        print(f"registry that requires a token, {client}: {it['asked']} requests, {it['with_token']} with the token, "
+              f"{it['crates']} .crate files, {'as cargo sends it' if it['as_cargo_sends'] else 'NOT as cargo sends it'}")
     for name, (count, equal) in vendor.items():
         print(f"vendored {name}: {equal}/{count} read where cargo vendor put them, every file checked")
     for part, (a, b) in dirs.items():
@@ -460,6 +514,7 @@ def main():
     for package, found in [*unequal.items(), *git_unequal.items(), *replaced["unequal"].items()][:20]:
         print(f"  {package}: {found[0]}" + (f" (and {len(found) - 1} more)" if len(found) > 1 else ""))
     bad = unequal or git_unequal or replaced["unequal"] or not dirs_equal or any(c != e for c, e in vendor.values())
+    bad = bad or len(auth) != 2 or not all(it["as_cargo_sends"] and it["crates"] for it in auth.values())
     sys.exit(1 if bad else 0)
 
 

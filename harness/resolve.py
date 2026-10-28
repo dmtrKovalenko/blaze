@@ -548,7 +548,8 @@ def unit_runs(root, units, cargo_home, work):
     host_cfg = os.path.join(work, "host-cfg")
     with open(host_cfg, "w") as f:
         f.write(subprocess.run(rustc + ["--print", "cfg", "--target", host], capture_output=True, text=True, check=True).stdout)
-    told_host = ["--host", host, "--host-cfg-file", host_cfg]
+    release = next(line[len("release: "):] for line in told.splitlines() if line.startswith("release: "))
+    told_host = ["--host", host, "--host-cfg-file", host_cfg, "--rustc-version", release]
 
     def norm(text):
         for path, name in ((os.path.realpath(cargo_home), "$CARGO_HOME"), (cargo_home, "$CARGO_HOME"), (os.path.realpath(root), "$ROOT"), (root, "$ROOT")):

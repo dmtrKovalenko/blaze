@@ -3,7 +3,7 @@
 against cargo's, over a corpus. cargo is the oracle; blaze never runs it outside this harness.
 
 usage: own_metadata.py CORPUS [PART...] [--work DIR] [--jobs N] [--out FILE] [--limit N] [--keep]
-                       [--only NAME,...]
+                       [--only NAME,...] [--fresh]
 
 CORPUS and its parts are those of harness/resolve_graph.py. Each case with a Cargo.lock is
 fetched under `--work` (default $TMPDIR/blaze-own-metadata) and checked twice, both for the
@@ -17,6 +17,11 @@ host and with the lock file it ships:
   all its units) and the packages each one's units depend on; and with `--programs`, the
   binaries it links (the unit graph's roots that are executables), as blaze's whole build
   takes them.
+
+With `--fresh`, every case, with a Cargo.lock or not, is checked once instead, with none:
+`fresh`, the example and `cargo metadata --format-version 1 --filter-platform HOST` each
+resolving the workspace against the live index and writing a Cargo.lock, the JSON and the
+lock files compared. The index may change between the two runs, which a difference names.
 
 A case is equal, different, blaze-failed or cargo-failed; the first difference or error of
 each that is not equal is printed, and `--out` writes them all as JSON.
@@ -37,13 +42,15 @@ def build_blaze():
 
 
 def host(work):
-    triple = next(l.split()[1] for l in subprocess.run([*RUSTC, "-vV"], capture_output=True,
-                  text=True, check=True).stdout.splitlines() if l.startswith("host:"))
+    """The host's triple, its `cfg` file and the oracle rustc's release, which a resolve that
+    honours `rust-version` prefers when no member names one."""
+    said = dict(l.split(": ", 1) for l in subprocess.run([*RUSTC, "-vV"], capture_output=True,
+                text=True, check=True).stdout.splitlines() if ": " in l)
     cfg = os.path.join(work, "host.cfg")
     with open(cfg, "w") as f:
         f.write(subprocess.run([*RUSTC, "--print", "cfg"], capture_output=True, text=True,
                                check=True).stdout)
-    return triple, cfg
+    return said["host"], cfg, said["release"]
 
 
 def unit_graph(graph):
@@ -115,7 +122,7 @@ def rustflags(case_dir, triple):
 
 def case_cfg(case, platform):
     """The host's `cfg` for the case: rustc's with the case's rustflags."""
-    triple, cfg = platform
+    triple, cfg, _ = platform
     flags = rustflags(case["dir"], triple)
     if not flags:
         return cfg
@@ -142,7 +149,7 @@ def one(case, blaze, homes, platform):
     try:
         for mode in ["metadata", "build"]:
             out = {"part": case["part"], "name": case["name"], "mode": mode}
-            flags = ["--filter-platform", triple, "--cfg-file", cfg]
+            flags = ["--filter-platform", triple, "--cfg-file", cfg, "--rustc-version", platform[2]]
             ours = run([blaze, *flags, *(["--build"] if mode == "build" else [])], homes["blaze"])
             put_back()
             if mode == "metadata":
@@ -185,6 +192,50 @@ def one(case, blaze, homes, platform):
     return results
 
 
+def fresh(case, blaze, homes, platform):
+    """Both resolve the case with no lock file, each writing one; the shipped one is put back."""
+    lock = os.path.join(case["dir"], "Cargo.lock")
+    shipped = lock + ".shipped"
+    had = os.path.exists(lock)
+    if had:
+        os.replace(lock, shipped)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CARGO_") or k == "CARGO_ORACLE"}
+    triple, cfg = platform[0], case_cfg(case, platform)
+    run = lambda cmd, home: subprocess.run(cmd, cwd=case["dir"], env={**env, "CARGO_HOME": home},
+                                           capture_output=True, text=True, errors="replace")
+    written = lambda: open(lock).read() if os.path.exists(lock) else None
+    out = {"part": case["part"], "name": case["name"], "mode": "fresh"}
+    try:
+        ours = run([blaze, "--filter-platform", triple, "--cfg-file", cfg, "--rustc-version",
+                    platform[2]], homes["blaze"])
+        ours_lock = written()
+        if os.path.exists(lock):
+            os.remove(lock)
+        cargo = run([*rg.CARGO, "metadata", "--format-version", "1", "--filter-platform", triple],
+                    homes["cargo"])
+        cargo_lock = written()
+    finally:
+        if os.path.exists(lock):
+            os.remove(lock)
+        if had:
+            os.replace(shipped, lock)
+        if cfg != platform[1]:
+            os.remove(cfg)
+    if cargo.returncode:
+        lines = [l for l in cargo.stderr.splitlines() if l.startswith("error")]
+        return [{**out, "class": "cargo-failed", "why": (lines or [cargo.stderr.strip()])[0][:300]}]
+    if ours.returncode:
+        why = (ours.stderr.strip().splitlines() or ["no output"])[-1][:300]
+        return [{**out, "class": "blaze-failed", "why": why}]
+    ours_text = ours.stdout.replace(homes["blaze"], homes["cargo"])
+    diff = rg.first_difference(json.loads(ours_text), json.loads(cargo.stdout))
+    if not diff and ours_lock != cargo_lock:
+        a, b = (ours_lock or "").splitlines(), (cargo_lock or "").splitlines()
+        at = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+        diff = f"Cargo.lock line {at + 1}: {a[at:at + 1]} != {b[at:at + 1]}"
+    return [{**out, "class": "different" if diff else "equal", "why": diff}]
+
+
 def main():
     argv = sys.argv[1:]
     work = rg.option(argv, "--work", os.path.join(tempfile.gettempdir(), "blaze-own-metadata"))
@@ -194,6 +245,7 @@ def main():
     limit = int(limit) if limit else None
     keep = "--keep" in argv and not argv.remove("--keep")
     only = rg.option(argv, "--only")
+    fresh_only = "--fresh" in argv and not argv.remove("--fresh")
     corpus = json.load(open(argv.pop(0)))
     parts = argv or rg.PARTS
     blaze = build_blaze()
@@ -212,7 +264,9 @@ def main():
         except Exception as e:
             return [{"part": case["part"], "name": case["name"], "mode": "fetch",
                      "class": "cargo-failed", "why": f"fetch: {e}"[:300]}]
-        if not os.path.exists(os.path.join(case["dir"], "Cargo.lock")):
+        if fresh_only:
+            results = fresh(case, blaze, homes, platform)
+        elif not os.path.exists(os.path.join(case["dir"], "Cargo.lock")):
             results = []
         else:
             results = one(case, blaze, homes, platform)
@@ -227,7 +281,7 @@ def main():
                 results.append(r)
                 if r["class"] != "equal":
                     print(f"{r['class']:13} {r['mode']:8} {r['part']}/{r['name']}: {r['why']}", flush=True)
-    for mode in ["metadata", "build"]:
+    for mode in ["fresh"] if fresh_only else ["metadata", "build"]:
         counts = {c: sum(1 for r in results if r["mode"] == mode and r["class"] == c) for c in CLASSES}
         print(f"{mode}: " + ", ".join(f"{n} {c}" for c, n in counts.items()))
     if out_file:

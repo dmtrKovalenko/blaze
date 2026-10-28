@@ -285,8 +285,6 @@ pub struct RegistryConfig {
     pub index: Option<String>,
     pub token: OptValue<Secret<String>>,
     pub credential_provider: Option<PathAndArgs>,
-    pub secret_key: OptValue<Secret<String>>,
-    pub secret_key_subject: Option<String>,
     pub min_publish_age: Option<String>,
     #[serde(rename = "protocol")]
     _protocol: Option<String>,
@@ -299,8 +297,6 @@ pub struct GlobalRegistryConfig {
     pub index: Option<String>,
     pub token: OptValue<Secret<String>>,
     pub credential_provider: Option<PathAndArgs>,
-    pub secret_key: OptValue<Secret<String>>,
-    pub secret_key_subject: Option<String>,
     pub min_publish_age: Option<String>,
     pub global_min_publish_age: Option<String>,
     #[serde(rename = "default")]
@@ -315,8 +311,6 @@ impl GlobalRegistryConfig {
             index: self.index,
             token: self.token,
             credential_provider: self.credential_provider,
-            secret_key: self.secret_key,
-            secret_key_subject: self.secret_key_subject,
             min_publish_age: self.min_publish_age,
             _protocol: None,
         }

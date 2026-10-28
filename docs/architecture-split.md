@@ -380,7 +380,7 @@ import are left out):
 
 ### 4.2 Fork sync and upstream merges afterwards
 
-- `fork sync` keeps working as it does: it pushes one fork commit per first-parent commit of
+- Fork sync (each fork's `sync from blaze` workflow) keeps working as it does: it pushes one fork commit per first-parent commit of
   `main` that changes `vendor/` (read: `vendor/subtree.py` docstring). Step 2 removes the
   `#[path] codegen` line and `hir-ty`'s codegen dependencies from the fork; step 4 adds
   `crates/hir-ty-borrowck` to it and removes the other `#[path]`. From then on the fork's

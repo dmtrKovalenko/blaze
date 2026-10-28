@@ -17,16 +17,17 @@
 #   red: one issue, "Release train is red", opened or added to with the jobs that failed and the
 #       commits since the last green train; the next green train closes it
 #
-# On every push to main and by hand. One train runs at a time; a push while it runs waits, and a
+# When it runs on pushes to main (off for now, see `on:`), one train runs at a time; a push while it runs waits, and a
 # newer push replaces the one waiting, so the train runs on the newest commit of main as soon
 # as the one before is done. A run cancelled by each push (`cancel-in-progress`) would never end
 # while main takes a merge every few minutes, and a train takes about 45. The group is per ref:
 # a train run by hand on a branch (contributing.md: before landing what the fast tier does not
 # cover) neither waits behind main's nor takes the place of main's waiting one.
 name: train
+# By hand only for now (2026-10-27): on every push it never finished (a run waited hours on
+# nushell while every newer one was cancelled) and was red for reasons the merge gate (`ci`)
+# does not share. Releases are cut by hand until it is turned back on.
 on:
-  push:
-    branches: ["main"]
   workflow_dispatch:
 
 concurrency:

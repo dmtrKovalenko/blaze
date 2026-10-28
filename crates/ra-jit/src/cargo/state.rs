@@ -309,7 +309,7 @@ fn without_tests(file: &Path) -> Option<String> {
     let text = std::fs::read_to_string(file).ok()?;
     if file.extension().is_none_or(|it| it != "rs") {
         let hash = sha2::Sha256::digest(&text);
-        return Some(hash[..16].iter().map(|it| format!("{it:02x}")).collect());
+        return Some(crate::content::hex(&hash[..16]));
     }
     let parse = syntax::SourceFile::parse(&text, syntax::Edition::CURRENT);
     let mut bytes = text.clone().into_bytes();
@@ -334,7 +334,7 @@ fn without_tests(file: &Path) -> Option<String> {
     let lines: Vec<&str> = blanked.lines().map(str::trim_end).collect();
     let kept = lines.len() - lines.iter().rev().take_while(|it| it.is_empty()).count();
     let hash = sha2::Sha256::digest(lines[..kept].join("\n"));
-    Some(hash[..16].iter().map(|it| format!("{it:02x}")).collect())
+    Some(crate::content::hex(&hash[..16]))
 }
 
 /// When the file was last written, as a stamp. `None` when it is not there.
@@ -401,7 +401,7 @@ pub(crate) fn checked(asked: &Invocation) -> anyhow::Result<daemon::Ahead> {
         env: worker_env(),
         whole: false,
     };
-    Ok(daemon::Ahead { config, crates, root })
+    Ok(daemon::Ahead { config, crates, root, targets: asked.target_flags() })
 }
 
 impl Built {

@@ -227,6 +227,7 @@ fn remove(read: &Read, list: bool) -> anyhow::Result<()> {
         platform: None,
         offline: read.has("--offline") || read.has("--frozen"),
         store: None,
+        rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let unused = blaze_metadata::relock(&asked, "remove", locked)?;
     if gc_unused_patches(&ctx, ws.root_manifest(), &unused)? {

@@ -6,13 +6,14 @@
 //! from where is said at the top of each module; the plan is `docs/self-contained.md`.
 
 pub mod api;
+pub mod auth;
 pub mod directory;
 pub mod download;
 pub mod git;
 pub mod http;
 pub mod index;
+pub mod query;
 pub mod registry;
-mod source_id;
 pub mod sources;
 pub mod sparse;
 
@@ -23,13 +24,24 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context as _;
+use blaze_source::SourceId;
+
 pub use download::{Blobs, Package};
+pub use query::IndexRegistry;
 pub use registry::Registry;
-pub use source_id::{
-    CRATES_IO_HTTP_INDEX, CRATES_IO_INDEX, CRATES_IO_REGISTRY, GitReference, SourceId, SourceKind,
-    short_hash,
-};
 pub use sources::{Locked, SourceConfig, SourceDef, SourceMap, Sources};
+
+/// A remote registry named by its index URL alone: sparse when it starts with `sparse+`, else
+/// a git index.
+pub fn registry_source(url: &str) -> anyhow::Result<SourceId> {
+    SourceId::for_registry(&url::Url::parse(url).with_context(|| format!("`{url}` is not a URL"))?)
+}
+
+/// The directory of a path, directory or local-registry source.
+pub(crate) fn path_of(id: SourceId) -> anyhow::Result<PathBuf> {
+    id.url().to_file_path().map_err(|()| anyhow::anyhow!("{} is not a directory", id.url()))
+}
 
 /// What fetching reads of cargo's configuration (`[net]`, `[http]`, `--offline`), as a plain
 /// struct: `crates/blaze-manifest` fills it from `.cargo/config.toml`, `CARGO_*` variables and
@@ -62,11 +74,21 @@ pub struct Context {
     /// Whether a `.crate` is also written to cargo's cache,
     /// `$CARGO_HOME/registry/cache/<registry>/`, so that cargo finds it there offline.
     pub keep_crate_files: bool,
+    /// Where a registry that requires authentication gets its token; with none, such a registry
+    /// is refused.
+    pub auth: Option<Arc<auth::Auth>>,
 }
 
 impl Context {
     pub fn new(cargo_home: PathBuf, http: Arc<dyn http::Http>) -> Context {
-        Context { cargo_home, net: NetConfig::default(), http, store: None, keep_crate_files: true }
+        Context {
+            cargo_home,
+            net: NetConfig::default(),
+            http,
+            store: None,
+            keep_crate_files: true,
+            auth: None,
+        }
     }
 }
 
@@ -108,6 +130,25 @@ impl PackageCacheLock {
             file.lock().with_context(|| format!("failed to lock `{}`", path.display()))?;
         }
         Ok(PackageCacheLock { _file: file })
+    }
+}
+
+/// Runs `future` to its end on this thread, parked while it waits.
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let mut future = std::pin::pin!(future);
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        std::thread::park();
     }
 }
 

@@ -2,11 +2,13 @@
 //! which compares it with cargo's.
 //!
 //! usage: metadata [--manifest-path P] [--filter-platform TRIPLE --cfg-file F] [--features F]
+//!                 [--rustc-version RELEASE]
 //!                 [--all-features] [--no-default-features] [--offline] [--no-deps | --locked]
 //!                 [--build [-p NAME]... [--workspace] [--exclude NAME]... [--dev-units]
 //!                  [--programs [--bin NAME | --example NAME]]]
 //!
-//! `--cfg-file` is what `rustc --print cfg --target TRIPLE` prints. With `--build`, the graph is
+//! `--cfg-file` is what `rustc --print cfg --target TRIPLE` prints, `--rustc-version` the `release`
+//! `rustc -vV` prints. With `--build`, the graph is
 //! that of `cargo build` with the same flags; with `--programs` too, what it prints is the
 //! programs that build links instead, a JSON list. `--no-deps` is `cargo metadata --no-deps`;
 //! `--locked` never writes the lock file, as the standard library's workspace is read.
@@ -24,6 +26,7 @@ fn main() -> Result<()> {
     let mut manifest_path = None;
     let mut triple = None;
     let mut cfg_file = None;
+    let mut rustc_version = None;
     let mut features = Vec::new();
     let (mut all_features, mut no_default_features, mut offline) = (false, false, false);
     let (mut build, mut workspace, mut dev_units) = (false, false, false);
@@ -37,6 +40,7 @@ fn main() -> Result<()> {
             "--manifest-path" => manifest_path = Some(PathBuf::from(value()?)),
             "--filter-platform" => triple = Some(value()?),
             "--cfg-file" => cfg_file = Some(value()?),
+            "--rustc-version" => rustc_version = Some(value()?),
             "--features" => features.push(value()?),
             "-p" | "--package" => packages.push(value()?),
             "--exclude" => excludes.push(value()?),
@@ -83,6 +87,7 @@ fn main() -> Result<()> {
         platform: triple.as_deref().map(|triple| TargetPlatform { triple, cfg: &cfg }),
         offline,
         store: None,
+        rustc_version: rustc_version.as_deref(),
     };
     if listed {
         let targets =

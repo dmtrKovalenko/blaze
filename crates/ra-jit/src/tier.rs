@@ -429,7 +429,7 @@ impl Watched {
             return None;
         }
         let (heat, total) = self.heat();
-        let share = |count: u64| if total == 0 { 0 } else { count * 1000 / total };
+        let share = |count: u64| (count * 1000).checked_div(total).unwrap_or(0);
         for &(start, count) in &heat {
             if share(count) >= WARM_SHARE {
                 self.ever_hot.insert(start);
@@ -503,7 +503,7 @@ impl Watched {
     /// Writes what the program is told of its tiers.
     fn publish(&self) {
         let (heat, total) = self.heat();
-        let share = |count: u64| if total == 0 { 0 } else { count * 1000 / total };
+        let share = |count: u64| (count * 1000).checked_div(total).unwrap_or(0);
         let (sampler, wall) = self.rounds.iter().fold((0, 0), |(s, w), it| (s + it.3, w + it.4));
         let mut functions: Vec<TierFunction> = heat
             .iter()
@@ -546,7 +546,7 @@ impl Watched {
             at: now_ms(),
             window_ms: WINDOW.as_millis() as u64,
             samples: total,
-            sampler_permille: if wall == 0 { 0 } else { sampler * 1000 / wall },
+            sampler_permille: (sampler * 1000).checked_div(wall).unwrap_or(0),
             functions,
             events: self.events.iter().cloned().collect(),
         };

@@ -21,6 +21,16 @@ pub(crate) fn is_lasting(name: &[u8]) -> bool {
     name.starts_with(hir_ty_codegen::LASTING_STATIC.as_bytes())
 }
 
+/// The name of the base's copy of a static that `name`, of a symbol of a patch, says the patch
+/// left behind ([`hir_ty_codegen::MOVED_STATIC`]), with the `_` of a Mach-O name in front.
+pub(crate) fn left_behind(name: &[u8]) -> Option<Vec<u8>> {
+    let prefix = hir_ty_codegen::MOVED_STATIC.as_bytes();
+    match name.strip_prefix(b"_").and_then(|it| it.strip_prefix(prefix)) {
+        Some(rest) => Some([b"_", rest].concat()),
+        None => name.strip_prefix(prefix).map(<[u8]>::to_vec),
+    }
+}
+
 /// Where a running program has each static that patches defined anew, by its name.
 #[derive(Clone, Default)]
 pub(crate) struct Lasting {

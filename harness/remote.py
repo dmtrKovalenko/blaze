@@ -605,7 +605,7 @@ def stored(top, remote):
     _, counted, _ = c.cache("stats", env=limit)
     whole, _, _ = c.cache("verify")
     check("a pull into a store with a limit fetches what fits and says what does not",
-          out.returncode == 0 and "3 left that do not fit under RA_JIT_CACHE_MAX" in out.stdout and whole
+          out.returncode == 0 and "3 left that do not fit under BLAZE_CACHE_MAX" in out.stdout and whole
           and counted.get("packs") == 3 and counted.get("pack bytes") <= 3 * MIB + 4096
           and packs_fetched(remote) in (3, None), out.stdout.strip()[:90])
 
@@ -1119,9 +1119,13 @@ def poisoned(top, remote, a, crates, target, workspace, address, bucket, expecte
     _, _, records, changed = sent[0]
     b = machine("changed")
     log, _ = b.build(crates, env={"RA_JIT_REMOTE": address})
+    # B's own pack can be one of A's to the byte, name and all: it compiled the same code, and
+    # a pack of one build is the same as another's whenever the values went in in the same
+    # order. What B must not have is a changed pack, under A's name or under its own.
+    kept = b.packs()
     check("code changed under A's name: rejected, B compiles its own and prints the same",
           all("rejected " + name in log for name, *_ in sent) and compiled(log) > 0 and b.run() == expected
-          and not any(fields[0] + ".pack" in b.packs() for fields in listed),
+          and all(kept.values()) and not any(digest(changed) + ".pack" in kept for *_, changed in sent),
           f"{len(sent)} packs, {compiled(log)} compiled")
     for name, data, *_ in sent:
         bucket.put(name, data)

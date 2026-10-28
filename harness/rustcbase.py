@@ -194,6 +194,12 @@ def edit(file, old, new):
     return (file, old, new)
 
 
+# `counted`'s static made twice as large, with another first value.
+GROWN = ("    static CALLS: AtomicU32 = AtomicU32::new(0);\n    CALLS.fetch_add(1, Ordering::Relaxed) + 1\n",
+         "    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(7);\n"
+         "    CALLS.fetch_add(1, Ordering::Relaxed) as u32 + 1\n")
+
+
 # name: (edits, each a list of replacements, with how each is built; seconds to wait once ready; env)
 SCENARIOS = {
     "body": ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 0, {}),
@@ -257,12 +263,18 @@ SCENARIOS = {
                     [edit(D, "    x + 100\n", "    never_called(x) + 100\n")]], ["patch", "patch"], 0, {}),
     "trait-default": ([[edit(M, '"hello {}"', '"hi {}"')]], ["full"], 0, {}),
     "counted-static": ([[edit(M, "AtomicU32::new(0);\n    CALLS", "AtomicU32::new(5);\n    CALLS")]], ["full"], 0, {}),
+    # A static that grows does not fit where the executable has it: it is the patch's own, with
+    # what refers to it (#168), and the patch after has it again.
+    "grown-static": ([[edit(M, *GROWN)], [edit(M, "    x * 3\n", "    x * 4\n")]], ["patch", "patch"], 0, {}),
     "async": ([[edit(M, "    x * 2\n", "    x * 6\n")]], ["full"], 0, {}),
     "rpit": ([[edit(M, '    "shown"\n', '    "shown!"\n')]], ["full"], 0, {}),
     "asset": ([[edit("app/src/asset.txt", "one", "two")]], ["full"], 0, {}),
     "full-then-patch": ([[edit(M, "    x + 1\n}\n\nfn counted", "    x + 2\n}\n\nfn counted")],
                          [edit(M, "    x * 3\n", "    x * 4\n")]], ["full", "patch"], 0, {}),
     "own-base": ([[edit(M, "    x * 3\n", "    x * 4\n")]], ["patch"], 8, {}),
+    "own-base-grown-static": ([[edit(M, *GROWN)], [edit(M, "    x * 3\n", "    x * 4\n")]], ["patch", "patch"], 8, {}),
+    "full-then-grown-static": ([[edit(M, "    x + 1\n}\n\nfn counted", "    x + 2\n}\n\nfn counted")],
+                                [edit(M, *GROWN)]], ["full", "patch"], 0, {}),
     # A patch of rustc's executable when the edit interrupts the daemon's own base, and of that
     # base when it was linking as the edit came: the edit waits for the link, whose executable
     # is then the program. The waits land the edit at points of the base's build.

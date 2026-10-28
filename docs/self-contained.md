@@ -69,11 +69,13 @@ Until K, J and M land, blaze still runs cargo and rustc for the first build and 
 macros. So that installing needs no rustup now, blaze keeps a toolchain of its own, private
 to it, that no project's pin or `PATH` changes:
 
-- **What:** the pinned nightly's `rustc`, `cargo`, `rust-std-<host>` and `rust-src` components, as
+- **What:** the pinned nightly's `rustc`, `cargo`, `rust-std-<host>`, `rust-std-wasm32-wasip1` (the
+  WASI libc a proc macro's module is linked with, `own_macro.rs`) and `rust-src` components, as
   the Rust project publishes them on static.rust-lang.org, unchanged. Not `rustfmt`, `clippy`,
   `rust-docs` or `rust-analyzer`.
-- **Size:** 133.6 MB to download on Linux x86-64, 118.2 MB on Linux AArch64, 97.4 MB on
-  macOS, the same bytes rustup's `minimal` profile and `rust-src` download today.
+- **Size:** 159.4 MB to download on Linux x86-64, 143.8 MB on Linux AArch64, 122.9 MB on
+  macOS, the same bytes rustup's `minimal` profile, `rust-src` and the `wasm32-wasip1` target
+  download today.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-25-<host>/` (`BLAZE_HOME` moves it), laid out as rustup
   lays out a toolchain, with its channel manifest, so that blaze's sysroot rules read it
   unchanged.

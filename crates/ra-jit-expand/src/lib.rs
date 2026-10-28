@@ -261,6 +261,35 @@ fn store() -> Option<&'static Store> {
     Store::global()
 }
 
+/// The first expansion the proc-macro server itself failed, not the macro: what is said of it.
+static SERVER_FAILED: OnceLock<String> = OnceLock::new();
+
+impl Kept {
+    /// Keeps what is said of `expanded` when the server failed it: a server that died or
+    /// answered nothing expands no macro after it, and each call it failed is an error the
+    /// database keeps, so every build of the process fails with it ([`server_failed`]).
+    fn failed(&self, expanded: &Result<tt::TopSubtree, ProcMacroExpansionError>) {
+        if let Err(ProcMacroExpansionError::System(why)) = expanded {
+            let said = format!(
+                "the proc-macro server failed to expand `{}` of {}: {why}; what it did not \
+                 expand is missing from the program, so nothing is built from it",
+                self.name, self.dylib.path
+            );
+            if SERVER_FAILED.set(said).is_ok() {
+                eprintln!("proc macros: {}", SERVER_FAILED.get().map_or("", String::as_str));
+            }
+        }
+    }
+}
+
+/// What is said of the first expansion the proc-macro server failed in this process, when
+/// one did. The macros of that call and of every one after it did not expand, so what is built
+/// from them is not the program: a build fails with this, at the point it is first seen,
+/// rather than with a name the expansion would have defined (no-fallback).
+pub fn server_failed() -> Option<&'static str> {
+    SERVER_FAILED.get().map(String::as_str)
+}
+
 impl ProcMacroExpander for Kept {
     fn expand(
         &self,
@@ -274,7 +303,7 @@ impl ProcMacroExpander for Kept {
         current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         if compare::comparing() {
-            return self.inner.expand(
+            let expanded = self.inner.expand(
                 db,
                 subtree,
                 attrs,
@@ -284,6 +313,8 @@ impl ProcMacroExpander for Kept {
                 mixed_site,
                 current_dir,
             );
+            self.failed(&expanded);
+            return expanded;
         }
         let start = Instant::now();
         let mode = config().mode;
@@ -318,6 +349,7 @@ impl ProcMacroExpander for Kept {
         );
         COUNTS.expanded.add(expand.elapsed());
         COUNTS.kinds[kind_index(self.kind)].add(expand.elapsed());
+        self.failed(&expanded);
         if config().compare {
             compare::again(
                 &self.dylib.path,

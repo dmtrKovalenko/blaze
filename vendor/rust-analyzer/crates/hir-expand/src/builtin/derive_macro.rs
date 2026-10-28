@@ -97,6 +97,7 @@ register_builtin! {
     Reborrow => reborrow_expand,
     CoerceShared => coerce_shared_expand,
     ConstParamTy => const_param_ty_expand,
+    From => from_expand,
 }
 
 pub fn find_builtin_derive(ident: &name::Name) -> Option<BuiltinDeriveExpander> {
@@ -749,6 +750,96 @@ fn const_param_ty_expand(
         false,
         |_| quote! {span =>},
     )
+}
+
+/// `#[derive(From)]` (`derive_from`): `From` of the type of a struct's one field, as rustc's
+/// (`deriving/from.rs`): the impl keeps the struct's generics and bounds, and adds no bound of
+/// its own.
+fn from_expand(
+    db: &dyn SourceDatabase,
+    span: Span,
+    tt: &tt::TopSubtree,
+) -> ExpandResult<tt::TopSubtree> {
+    let empty = || tt::TopSubtree::empty(tt::DelimSpan::from_single(span));
+    let (adt, span_map) = match to_adt_syntax(db, tt, span) {
+        Ok(it) => it,
+        Err(err) => return ExpandResult::new(empty(), err),
+    };
+    let strukt = match &adt {
+        ast::Adt::Struct(it) => it,
+        ast::Adt::Enum(_) => {
+            return ExpandResult::new(
+                empty(),
+                ExpandError::other(span, "`#[derive(From)]` used on an enum"),
+            );
+        }
+        ast::Adt::Union(_) => {
+            return ExpandResult::new(
+                empty(),
+                ExpandError::other(span, "`#[derive(From)]` used on a union"),
+            );
+        }
+    };
+    let field_types: Vec<_> = match strukt.field_list() {
+        Some(FieldList::RecordFieldList(it)) => it.fields().map(|it| it.ty()).collect(),
+        Some(FieldList::TupleFieldList(it)) => it.fields().map(|it| it.ty()).collect(),
+        None => vec![],
+    };
+    let field_ty = match &field_types[..] {
+        [Some(ty)] => syntax_bridge::syntax_node_to_token_tree(
+            ty.syntax(),
+            &span_map,
+            span,
+            DocCommentDesugarMode::ProcMacro,
+        ),
+        [None] => {
+            return ExpandResult::new(empty(), ExpandError::other(span, "missing field type"));
+        }
+        fields => {
+            let count = if fields.is_empty() { "no fields" } else { "multiple fields" };
+            return ExpandResult::new(
+                empty(),
+                ExpandError::other(
+                    span,
+                    format!("`#[derive(From)]` used on a struct with {count}"),
+                ),
+            );
+        }
+    };
+    let info = match parse_adt_from_syntax(&adt, &span_map, span) {
+        Ok(it) => it,
+        Err(err) => return ExpandResult::new(empty(), err),
+    };
+    let krate = dollar_crate(span);
+    let value = || tt::Ident::new("value", span);
+    let body = match &info.shape {
+        AdtShape::Struct(VariantShape::Struct(fields)) => {
+            let (field, value) = (&fields[0], value());
+            quote! {span => Self { #field : #value } }
+        }
+        _ => {
+            let value = value();
+            quote! {span => Self ( #value ) }
+        }
+    };
+    let trait_path = {
+        let field_ty = field_ty.clone();
+        quote! {span => #krate::convert::From<#field_ty> }
+    };
+    ExpandResult::ok(expand_simple_derive_with_parsed(
+        span,
+        info,
+        trait_path,
+        |_| {
+            let value = value();
+            quote! {span =>
+                #[inline]
+                fn from(#value : #field_ty) -> Self { #body }
+            }
+        },
+        false,
+        empty(),
+    ))
 }
 
 fn reborrow_expand(

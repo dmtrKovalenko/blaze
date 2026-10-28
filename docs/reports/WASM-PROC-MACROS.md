@@ -20,10 +20,15 @@ otherwise.
 - ra-jit (`--target wasm32-wasip1 --crate proc_macro --shared`) links the macro crate and
   everything it uses into a WASI reactor that exports `blaze_proc_macro_list` and
   `blaze_proc_macro_expand`. No rustc-built code is in it.
-- The host (`src/lib.rs`, `src/wasi.rs`) compiles the module once per process with
-  Cranelift, when one of its macros first expands: a load reads the list of its macros from
-  the `.macros` file beside it. Its machine code goes in the store under the host's identity
-  (Wasmtime refuses code of another version or configuration). Each expansion gets a fresh
+- The host (`src/lib.rs`, `src/wasi.rs`) compiles the module with Cranelift where blaze builds
+  it (`cargo/compile_time.rs`, `cargo/own_macro.rs`), with no unit waiting: the module carries its list of macros in a custom section
+  (`blaze_proc_macros`), written to the `.macros` file beside it at once, stamped with the
+  module's and its `.made-of`'s length, mtime and inode, so that a load reads no module. The
+  first expansion of its macros waits for the compile. The machine code is kept beside the
+  module (`<module>.<key>.cwasm`, mmapped by `Module::deserialize_file`) and in the store's
+  lasting namespace, under a key of no path or build: the module's sha256, the architecture and
+  Wasmtime's `precompile_compatibility_hash` (its version, target, flags, CPU features and
+  tunables), so it travels to R2 in the sealed packs. Each expansion gets a fresh
   instance (`InstancePre`), so no state carries over between expansions, and memory is capped
   at 4 GiB.
 - WASI is a subset written for this. The package directory is preopened read-only at
@@ -124,8 +129,28 @@ them (4 to 11 s each). Again, every module's build and machine code come from th
 (about 0.35 s and 3 ms each) and most expansions are found, so the corpus builds faster than
 with native macros, whose server and dylibs start each run.
 
+### Since: compiled in the build, kept path-free (lane pmfast)
+
+The table above has the load compiling each module, one after another, and a key of the
+machine code that had the store's build identity in it, which changes with the first toolchain
+name a process sets: the run after a cold `--own-target` build compiled every module again
+(49.9 s). With the changes above, on the same VM, `--own-target`, the corpus, wall seconds,
+medians of alternating runs ([bench/results/2026-10-27-pmfast](../../bench/results/2026-10-27-pmfast/README.md)):
+
+| arm | cold | again | edit | again |
+|---|---|---|---|---|
+| wasm, before | 80.05 | 49.94 | 5.18 | 2.90 |
+| wasm, after | 46.08 | 5.34 | 4.05 | 1.89 |
+| native | 45.17 | 13.38 | 3.99 | 2.02 |
+
+A module's compile costs about 5.5 CPU seconds (0.5 to 0.8 s on 16 cores): the 8 of the corpus
+take the machine's cores from the build's own units for about 2.5 s in all, which is what is
+left of the cold gap. Cranelift's `OptLevel::None` compiles no faster than `Speed` here.
+
 ## What is left
 
+- A cheaper first tier (Winch, or Pulley) for the cold compile, with Cranelift's code kept for
+  later runs, would take most of the compile's CPU off the cold build.
 - A module's own build is kept as a build script's is (`own_script.rs`), keyed by its
   rust-project description, which has the checkout's absolute paths. So another checkout or
   machine builds the module again, and its expansions are found only by the same checkout.

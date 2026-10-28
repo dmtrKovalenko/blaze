@@ -330,6 +330,11 @@ pub(crate) fn file_hash(db: &RootDatabase, file: vfs::FileId, path: &Path) -> Ha
     }
 }
 
+/// `bytes` in lower-case hex, two digits each: how a hash is written in a name or a key.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|it| format!("{it:02x}")).collect()
+}
+
 /// The directory cargo keeps what it fetched in, by a file it fetched: sources of a registry
 /// are in its `registry/src`, those of git in its `git/checkouts`.
 fn cargo_home_of(path: &Path) -> Option<&Path> {

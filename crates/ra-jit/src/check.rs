@@ -5,6 +5,7 @@
 
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -13,6 +14,7 @@ use ide_db::{
     ChangeWithProcMacros, RootDatabase,
     base_db::{SourceDatabase as _, TargetKind},
 };
+use intern::sym;
 use project_model::ProjectWorkspaceKind;
 use rustc_hash::{FxHashMap, FxHashSet};
 use vfs::Vfs;
@@ -40,16 +42,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
         crate::load(&projects, &cargo_config, crate::load_config(), selection, None, None)?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
-    let mut checker = Checker::new(
-        &db,
-        &vfs,
-        &checkouts,
-        &members,
-        &args.selection,
-        read_from,
-        root,
-        lints_capped,
-    );
+    let mut checker = Checker::new(&db, &vfs, &checkouts, &members, read_from, root, lints_capped);
     let served = match crate::socket::Served::bind(&socket) {
         Ok(served) => served,
         Err(crate::socket::NotServed::Taken) => {
@@ -59,7 +52,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
             anyhow::bail!("listening on {}: {error}", socket.display())
         }
     };
-    eprintln!("checking {} files of {} crates", checker.checked.len(), checker.crates);
+    eprintln!("checking {} crates", checker.crates);
     for (stream, _open) in served.incoming() {
         let Ok(request) = crate::socket::read_request(&stream) else {
             continue;
@@ -69,10 +62,7 @@ pub(crate) fn serve(args: Args) -> anyhow::Result<()> {
                 eprintln!("{RELOAD}: {reload}");
                 RELOAD.to_owned()
             }
-            None => match (checker.verdict(&db), request.strip_prefix(LINT)) {
-                (verdict, Some(ask)) if verdict == "ok" => checker.lints(&db, ask),
-                (verdict, _) => verdict,
-            },
+            None => checker.answer(&db, &args, &request),
         };
         let _ = std::io::Write::write_all(&mut &stream, format!("{reply}\n").as_bytes());
         if reply == RELOAD {
@@ -105,20 +95,13 @@ pub(crate) fn once(project: &Path, krate: &str) -> anyhow::Result<Option<crate::
     )?;
     ide_db::base_db::set_process_env(&mut db, crate::process::own());
     let Parts { root, members, lints_capped, .. } = checkouts.parts(&args.project)?;
-    let checker = Checker::new(
-        &db,
-        &vfs,
-        &checkouts,
-        &members,
-        &args.selection,
-        read_from,
-        root,
-        lints_capped,
-    );
-    if let Some(refused) = checker.refused(&db) {
+    let checker = Checker::new(&db, &vfs, &checkouts, &members, read_from, root, lints_capped);
+    // A probe's `rust-project.json` has no cargo targets to pick from: its crates are checked.
+    let scope = checker.scope(None)?;
+    if let Some(refused) = checker.refused(&db, &scope) {
         return Ok(Some(refused));
     }
-    Ok(checker.checked.iter().find_map(|&file| unresolved(&db, file)).map(|path| {
+    Ok(scope.checked.iter().find_map(|&file| unresolved(&db, file)).map(|path| {
         crate::Refused::Error(crate::errors::Said::one(crate::errors::Diagnostic {
             code: Some("E0433".to_owned()),
             message: format!("failed to resolve `{path}`"),
@@ -140,11 +123,93 @@ fn unresolved(db: &RootDatabase, file: vfs::FileId) -> Option<String> {
     })
 }
 
+/// A target of the workspace a check diagnoses: its root file, its kind and, of a library,
+/// whether it is checked as its unit tests, which are a crate of their own.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Picked {
+    root: PathBuf,
+    kind: TargetKind,
+    test: bool,
+}
+
+impl Picked {
+    fn of(root: PathBuf, kind: TargetKind, test: bool) -> Picked {
+        // Every other target is one crate, with `cfg(test)` or not as the load has it.
+        let test = test && kind == TargetKind::Lib { is_proc_macro: false };
+        Picked { root, kind, test }
+    }
+}
+
+/// The line a checker is asked with: the flags of the check that pick targets, then
+/// `request`.
+pub(crate) fn request(targets: &[String], request: &str) -> String {
+    format!("{}\t{request}", serde_json::to_string(targets).unwrap_or_default())
+}
+
+/// The targets of the workspace of `project` that `cargo check` of `selection` with the
+/// target flags `targets` diagnoses: the units of its unit graph, the targets picked and what
+/// of the workspace they depend on, as cargo checks them.
+fn picked(
+    selection: &crate::plan::Selection,
+    targets: &[String],
+    project: &Path,
+) -> anyhow::Result<FxHashSet<Picked>> {
+    let manifest = match project.is_file() {
+        true => project.to_owned(),
+        false => project.join("Cargo.toml"),
+    };
+    let (cwd, manifest) = crate::plan::asked_where(&manifest, selection);
+    let graph = crate::cargo::metadata::checked(selection, targets, cwd, manifest)?;
+    let units = graph.units.iter().filter_map(|unit| {
+        let kind = match unit.target.kind.first()?.as_str() {
+            "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" => {
+                TargetKind::Lib { is_proc_macro: false }
+            }
+            "proc-macro" => TargetKind::Lib { is_proc_macro: true },
+            "bin" => TargetKind::Bin,
+            "example" => TargetKind::Example,
+            "test" => TargetKind::Test,
+            "bench" => TargetKind::Bench,
+            "custom-build" => TargetKind::BuildScript,
+            _ => return None,
+        };
+        Some(Picked::of(unit.target.src_path.clone(), kind, unit.checked_as_test))
+    });
+    Ok(units.collect())
+}
+
+/// A crate of the workspace, as a check picks it or not.
+struct Local {
+    krate: ide_db::base_db::Crate,
+    /// Which target it is, when its root file has a path.
+    target: Option<Picked>,
+    /// Whether it is a build script or a proc macro, which run as they were built.
+    runs: bool,
+    script: bool,
+    /// The files of its modules.
+    files: Vec<vfs::FileId>,
+}
+
+/// What one check diagnoses: the crates of the targets it picks.
+struct Scope {
+    /// Their files.
+    checked: Vec<vfs::FileId>,
+    /// The crates: a file of a library is also one of its unit tests, and a file can be a
+    /// module of a target the check does not pick.
+    within: Arc<FxHashSet<ide_db::base_db::Crate>>,
+    /// The crates `cargo blaze clippy` lints: proc macros included, build scripts not.
+    linted: Vec<ide_db::base_db::Crate>,
+}
+
 struct Checker {
     /// The source files of the workspace as they were last read.
     files: Vec<WatchedFile>,
-    /// The files of the crates checked, which are the workspace's.
-    checked: Vec<vfs::FileId>,
+    /// The crates of the workspace.
+    locals: Vec<Local>,
+    /// The root files of the targets of the workspace's packages.
+    local_roots: FxHashSet<PathBuf>,
+    /// What each set of target flags a check was asked with picks, by the flags.
+    scopes: FxHashMap<String, Scope>,
     crates: usize,
     /// The files of the build scripts and proc macros of the workspace.
     ran: FxHashSet<vfs::FileId>,
@@ -157,21 +222,16 @@ struct Checker {
     sources: Sources,
     root: PathBuf,
     lints_capped: bool,
-    /// The crates `cargo blaze clippy` lints: the workspace's, proc macros included, build
-    /// scripts not.
-    linted: Vec<ide_db::base_db::Crate>,
     /// Where each file loaded is, for naming them in lints.
     located: FxHashMap<vfs::FileId, PathBuf>,
 }
 
 impl Checker {
-    #[expect(clippy::too_many_arguments)]
     fn new(
         db: &RootDatabase,
         vfs: &Vfs,
         checkouts: &crate::Checkouts,
         members: &FxHashSet<ide_db::base_db::Crate>,
-        selection: &crate::plan::Selection,
         read_from: SystemTime,
         root: PathBuf,
         lints_capped: bool,
@@ -186,8 +246,7 @@ impl Checker {
             .collect();
         let mut ran_roots = FxHashSet::default();
         let mut script_roots = FxHashSet::default();
-        // The crates of a package `--exclude` names are not checked.
-        let mut excluded_roots = FxHashSet::default();
+        let mut local_roots = FxHashSet::default();
         let mut manifests = FxHashMap::default();
         for workspace in checkouts.loaded.workspaces() {
             let ProjectWorkspaceKind::Cargo { cargo, .. } = &workspace.kind else { continue };
@@ -197,12 +256,9 @@ impl Checker {
             }
             for package in cargo.packages().filter(|it| cargo[*it].is_local) {
                 manifests.insert(cargo[package].manifest.to_path_buf().into(), None);
-                let excluded = selection.excludes.contains(&cargo[package].name);
                 for &target in &cargo[package].targets {
                     let target = &cargo[target];
-                    if excluded {
-                        excluded_roots.insert(PathBuf::from(target.root.clone()));
-                    }
+                    local_roots.insert(PathBuf::from(target.root.clone()));
                     let runs = matches!(
                         target.kind,
                         TargetKind::BuildScript | TargetKind::Lib { is_proc_macro: true }
@@ -222,34 +278,24 @@ impl Checker {
         let path_of = |file: vfs::FileId| -> Option<PathBuf> {
             Some(vfs.file_path(file).as_path()?.to_path_buf().into())
         };
-        let (mut checked, mut ran, mut dirs, mut crates) =
+        let (mut locals, mut ran, mut dirs, mut crates) =
             (Vec::new(), FxHashSet::default(), Vec::new(), 0);
-        let mut linted = Vec::new();
         hir::attach_db(db, || {
             for &member in members {
                 let krate = hir::Crate::from(member);
                 if !krate.origin(db).is_local() {
                     continue;
                 }
-                // Metadata includes dev targets even when the build loads none of their
-                // dev-dependencies. A plain check leaves them alone, as cargo does. Use
-                // the crate's kind: a test and a binary can share the same root file.
-                if !selection.dev_deps
-                    && matches!(
-                        krate.target_kind(db),
-                        TargetKind::Example | TargetKind::Test | TargetKind::Bench
-                    )
-                {
-                    continue;
-                }
                 let root_file = krate.root_file(db);
-                if path_of(root_file).is_some_and(|it| excluded_roots.contains(&it)) {
-                    continue;
-                }
-                if !path_of(root_file).is_some_and(|it| script_roots.contains(&it)) {
-                    linted.push(member);
-                }
                 let runs = path_of(root_file).is_some_and(|it| ran_roots.contains(&it));
+                let script = path_of(root_file).is_some_and(|it| script_roots.contains(&it));
+                // A test and a binary can share a root file, and a library's unit tests are
+                // a crate of its own: the kind and `cfg(test)` say which target it is.
+                let target = path_of(root_file).map(|root| {
+                    let kind = krate.target_kind(db);
+                    let test = member.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(sym::test));
+                    Picked::of(root, kind, test)
+                });
                 let mut of_it: Vec<vfs::FileId> = krate
                     .modules(db)
                     .into_iter()
@@ -258,19 +304,17 @@ impl Checker {
                 of_it.sort_unstable();
                 of_it.dedup();
                 match runs {
-                    true => ran.extend(of_it),
+                    true => ran.extend(of_it.iter().copied()),
                     false => {
                         crates += 1;
                         if let Some(dir) = path_of(root_file).as_deref().and_then(Path::parent) {
                             dirs.push(dir.to_owned());
                         }
-                        checked.extend(of_it);
                     }
                 }
+                locals.push(Local { krate: member, target, runs, script, files: of_it });
             }
         });
-        checked.sort_unstable();
-        checked.dedup();
         dirs.sort();
         dirs.dedup();
         // A directory below another is walked with it.
@@ -287,7 +331,9 @@ impl Checker {
             .collect();
         Checker {
             files,
-            checked,
+            locals,
+            local_roots,
+            scopes: FxHashMap::default(),
             crates,
             ran,
             dirs: outer,
@@ -296,8 +342,75 @@ impl Checker {
             sources: Sources { paths },
             root,
             lints_capped,
-            linted,
             located,
+        }
+    }
+
+    /// What a check of `targets` diagnoses; of every crate of the workspace for none. A target
+    /// picked that the workspace was not loaded with is an error.
+    fn scope(&self, targets: Option<&FxHashSet<Picked>>) -> anyhow::Result<Scope> {
+        let (mut checked, mut within, mut linted) = (Vec::new(), FxHashSet::default(), Vec::new());
+        let mut found = FxHashSet::default();
+        for local in &self.locals {
+            let picked = match targets {
+                Some(targets) => local.target.as_ref().is_some_and(|it| targets.contains(it)),
+                None => true,
+            };
+            if !picked {
+                continue;
+            }
+            found.extend(local.target.clone());
+            if !local.script {
+                linted.push(local.krate);
+            }
+            if !local.runs {
+                checked.extend(local.files.iter().copied());
+                within.insert(local.krate);
+            }
+        }
+        // A package that is no member has no build script crate.
+        let mut missing = targets
+            .into_iter()
+            .flatten()
+            .filter(|it| it.kind != TargetKind::BuildScript)
+            .filter(|it| self.local_roots.contains(&it.root) && !found.contains(*it));
+        if let Some(missing) = missing.next() {
+            anyhow::bail!(
+                "the check picks the {:?} target of {}{}, which the workspace was not loaded with",
+                missing.kind,
+                missing.root.display(),
+                if missing.test { " as a test" } else { "" },
+            );
+        }
+        checked.sort_unstable();
+        checked.dedup();
+        Ok(Scope { checked, within: Arc::new(within), linted })
+    }
+
+    /// The answer to `request`, of [`request`]'s form, once the source is taken in: `ok`, the
+    /// errors, the lints, or why there is no answer.
+    fn answer(&mut self, db: &RootDatabase, args: &Args, request: &str) -> String {
+        let Some((targets, request)) = request.split_once('\t') else {
+            return format!("a check request names no targets: {request}");
+        };
+        if !self.scopes.contains_key(targets) {
+            let flags: Vec<String> = match serde_json::from_str(targets) {
+                Ok(flags) => flags,
+                Err(error) => {
+                    return format!("the targets of a check request do not read: {error}");
+                }
+            };
+            let scope = picked(&args.selection, &flags, &args.project)
+                .and_then(|picked| self.scope(Some(&picked)));
+            match scope {
+                Ok(scope) => self.scopes.insert(targets.to_owned(), scope),
+                Err(error) => return format!("{error:#}"),
+            };
+        }
+        let scope = &self.scopes[targets];
+        match (self.verdict(db, scope), request.strip_prefix(LINT)) {
+            (verdict, Some(ask)) if verdict == "ok" => self.lints(db, scope, ask),
+            (verdict, _) => verdict,
         }
     }
 
@@ -336,37 +449,38 @@ impl Checker {
         None
     }
 
-    /// `ok`, or the errors in the source as rustc writes them.
-    fn verdict(&self, db: &RootDatabase) -> String {
-        match self.refused(db) {
+    /// `ok`, or the errors in the source of `scope` as rustc writes them.
+    fn verdict(&self, db: &RootDatabase, scope: &Scope) -> String {
+        match self.refused(db, scope) {
             Some(refused) => refused.reply(),
             None => "ok".to_owned(),
         }
     }
 
-    /// The errors in the source, `None` when it compiles.
-    fn refused(&self, db: &RootDatabase) -> Option<crate::Refused> {
+    /// The errors in the source of `scope`, `None` when it compiles.
+    fn refused(&self, db: &RootDatabase, scope: &Scope) -> Option<crate::Refused> {
         let broken = crate::broken_in(
             db,
-            &self.checked,
+            &scope.checked,
             &self.sources,
             &self.root,
-            None,
+            Some(scope.within.clone()),
             !self.lints_capped,
         );
         hir::attach_db(db, || {
-            crate::refusal(db, &self.checked, &self.sources, &self.root, broken, None)
+            crate::refusal(db, &scope.checked, &self.sources, &self.root, broken, None)
         })
     }
 
-    /// The answer to the lint request `ask`: what blaze's clippy finds in the crates.
-    fn lints(&self, db: &RootDatabase, ask: &str) -> String {
+    /// The answer to the lint request `ask`: what blaze's clippy finds in the crates of
+    /// `scope`.
+    fn lints(&self, db: &RootDatabase, scope: &Scope, ask: &str) -> String {
         let ask: blaze_lints::serve::Ask = match serde_json::from_str(ask) {
             Ok(ask) => ask,
             Err(error) => return format!("the lint request does not read: {error}"),
         };
         let path_of = |file: vfs::FileId| self.located.get(&file).cloned();
-        let answer = blaze_lints::serve::answer(db, &self.linted, &self.root, &path_of, &ask);
+        let answer = blaze_lints::serve::answer(db, &scope.linted, &self.root, &path_of, &ask);
         format!("{LINT}{}", serde_json::to_string(&answer).unwrap_or_default())
     }
 }

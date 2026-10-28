@@ -432,6 +432,9 @@ impl<'a> Patch<'a> {
             let section = symbol.section_index().context("a symbol in no section")?;
             let jump_from = match image.symbols.get(name) {
                 None => None,
+                // One that says what a patch left behind is of that patch, which the executable
+                // was linked with, and says nothing of this one's.
+                Some(_) if super::lasting::left_behind(name).is_some() => None,
                 Some(Named::One(Defined { address, kind: Kind::Code(len) }))
                     if code.contains(&section) =>
                 {

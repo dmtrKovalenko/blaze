@@ -49,19 +49,23 @@ agents/rules.ts --write` for AGENTS.md).
    Why: "You should use your own nightly that you control since you are trying to replace rustc"
    (Andrew, 2026-10-26). "blaze should be the latest-nightly equivalent" (Andrew, 2026-10-27, #404).
    We are moving off rustc entirely ("no rustc", Andrew).
-6. **sandbox-everything**: Every test, build script and proc macro runs in a sandbox, by default, on
-   every platform. `cargo ra-jit test` runs each test executable in one sandbox (Linux namespaces
-   and seccomp, macOS Seatbelt and the interposer) under `all` and `affected` alike; every build
-   script, cargo's runs and the daemon's, runs in the same one through `cargo/script_sandbox.rs`
-   (writing only its `OUT_DIR`), and every proc-macro server is started in it (`macro_sandbox.rs`).
-   Where none can be made it stops, rather than run outside. The only ways out are a package's
-   `[package.metadata.blaze.sandbox]` (`tests = false`, `unsandboxed-tests`, `build-script =
-   false`), the root manifest's `[workspace.metadata.blaze.sandbox]` (`unsandboxed-build-scripts`,
-   `unsandboxed-proc-macros`) and `RA_JIT_SANDBOX=off`, never a silent fallback. Nothing new that
-   runs user code runs outside it by default. See
+6. **sandbox-everything**: Every build script and proc macro runs in a sandbox, by default, on every
+   platform: every build script, cargo's runs and the daemon's, runs in one through
+   `cargo/script_sandbox.rs` (writing only its `OUT_DIR`), and every proc-macro server is started in
+   it (`macro_sandbox.rs`). Sandboxed tests are an experiment a workspace opts into (`experimental =
+   ["sandboxed-tests"]` under the root manifest's `[workspace.metadata.blaze]`, or a package's
+   `tests = true` under `[package.metadata.blaze.sandbox]`): there `cargo ra-jit test` runs each
+   test executable in one sandbox (Linux namespaces and seccomp, macOS Seatbelt and the interposer)
+   under `all` and `affected` alike, and elsewhere tests run as cargo runs them, every time, never
+   kept as passed. Where a sandbox is due and none can be made it stops, rather than run outside.
+   The only ways out are a package's `[package.metadata.blaze.sandbox]` (`tests = false`,
+   `unsandboxed-tests`, `build-script = false`), the root manifest's
+   `[workspace.metadata.blaze.sandbox]` (`unsandboxed-build-scripts`, `unsandboxed-proc-macros`) and
+   `RA_JIT_SANDBOX=off`, never a silent fallback. Nothing new that runs user code runs outside it by
+   default; tests do until the experiment ends. See
    [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
    Why: "Everything should by default be in sandbox and yea it should have sandbox support macos"
-   (Andrew, 2026-10-26).
+   (Andrew, 2026-10-26). Sandboxed tests became an opt-in experiment on 2026-10-27 (Andrew).
 7. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer,
    rewrite it or port rustc's rule properly, rather than do the least work or what a small team
    could maintain. Spend the effort on proving it right (differential tests against rustc, fuzzing,

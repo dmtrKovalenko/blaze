@@ -179,7 +179,9 @@ fn text(mem: &[u8], ptr: i32, len: i32) -> Result<String, i32> {
 fn iovecs(mem: &[u8], iovs: i32, count: i32) -> Result<Vec<(i32, i32)>, i32> {
     let all = bytes(mem, iovs, count.checked_mul(8).ok_or(EINVAL)?)?;
     Ok(all
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|it| {
             let ptr = i32::from_le_bytes(it[..4].try_into().unwrap());
             let len = i32::from_le_bytes(it[4..].try_into().unwrap());

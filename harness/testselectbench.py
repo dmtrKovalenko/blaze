@@ -8,7 +8,7 @@ usage: testselectbench.py [--json FILE] [--keep DIR] [--args ARG,ARG...] [projec
        nushell by default, at their pinned revisions and on harness/toolchain, tested with
        bench.py's `test` arguments)
 
-Each project is copied to a scratch directory and tested with `cargo ra-jit test` until the
+Each project is copied to a scratch directory, opted into sandboxed tests, and tested with `cargo ra-jit test` until the
 daemon serves the build. Then, each a row: every test (`RA_JIT_TESTS=all`); the affected
 ones twice, the first recording what passed; the affected ones after bench.py's `leaf` edit
 (the first build after it may be cargo's), after a second edit of the same function, and every
@@ -116,6 +116,9 @@ def project(name, args):
     home = tempfile.mkdtemp(prefix="rj-tsb-", dir="/tmp")
     ws = os.path.join(root, name)
     shutil.copytree(source, ws, symlinks=True, ignore=shutil.ignore_patterns("target"))
+    # A pass is kept only for a sandboxed test, an experiment the workspace opts into.
+    with open(os.path.join(ws, "Cargo.toml"), "a") as manifest:
+        manifest.write('\n[workspace.metadata.blaze]\nexperimental = ["sandboxed-tests"]\n')
     bin_dir = os.path.dirname(os.path.abspath(RA_JIT))
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RA_JIT_HOME=home,
                RUST_BACKTRACE="0", RUSTUP_TOOLCHAIN=TOOLCHAIN, **spec.get("env", {}))

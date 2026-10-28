@@ -42,6 +42,11 @@ pub(crate) fn ours_says() -> &'static str {
     own::rustc_version()
 }
 
+/// That rustc's release, as `rustc -vV` says it: `1.101.0-nightly`.
+pub(crate) fn ours_release() -> &'static str {
+    ours_says().split_once(' ').map_or(ours_says(), |(release, _)| release)
+}
+
 /// The commit that toolchain was built from.
 pub(crate) fn ours_commit() -> &'static str {
     own::commit()
@@ -86,9 +91,11 @@ impl std::fmt::Display for Chosen {
 /// release is used as it is; rustup's copy is named in `RUSTUP_TOOLCHAIN`, which rustup's
 /// proxies take over a toolchain file or an override, with its cargo in `CARGO`; blaze's own
 /// is named in `CARGO`, `RUSTC` and `RUSTDOC` and is first on `PATH`, for the processes this one
-/// starts and not the user's shell. `Err` is why the command can't be built, said for the user
-/// to act on. Before any thread starts: it sets the environment.
-pub(crate) fn settle() -> Result<Chosen, String> {
+/// starts and not the user's shell. A `build` in a project whose toolchain is another says so,
+/// once in that project; `blaze toolchain` and blaze's own answers say nothing of a project.
+/// `Err` is why the command can't be built, said for the user to act on. Before any thread
+/// starts: it sets the environment.
+pub(crate) fn settle(build: bool) -> Result<Chosen, String> {
     let ours = OURS.trim();
     let other = super::state::other_toolchain_allowed();
     let rustc = super::state::rustc_path();
@@ -120,7 +127,9 @@ pub(crate) fn settle() -> Result<Chosen, String> {
         ));
     }
     if let Some(version) = version.filter(|it| it != ours_says()) {
-        note_once(&version, named_by());
+        if build {
+            note_once(&version, named_by());
+        }
         let _ = IN_PLACE_OF.set((version, named_by()));
     }
     let rustup = rustup_home().and_then(|home| installed(&home, ours));
@@ -147,7 +156,7 @@ pub(crate) fn settle() -> Result<Chosen, String> {
              there is no home directory: `BLAZE_HOME` names where to keep it"
         ));
     };
-    if !own::complete(&dir) {
+    if !own::complete(&release, &dir) {
         own::fetch(&release, &dir)?;
     }
     use_own(&dir);
@@ -200,7 +209,7 @@ fn note_once(version: &str, named: &str) {
     hash.update(version);
     hash.update([0]);
     hash.update(name());
-    let key: String = hash.finalize().iter().take(12).map(|it| format!("{it:02x}")).collect();
+    let key = crate::content::hex(&hash.finalize()[..12]);
     let marker = own::home().map(|home| home.join("noted").join(key));
     if marker.as_ref().is_some_and(|it| it.exists()) {
         return;

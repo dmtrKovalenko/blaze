@@ -163,22 +163,24 @@ impl Backend {
             Ok("1") => Passes::Less,
             Ok("2") | Err(_) => Passes::Default,
             Ok("3") => Passes::Aggressive,
-            Ok(other) => return Err(format!("{OPTIMIZATION}={other}: expected 0, 1, 2 or 3")),
+            Ok(other) => return Err(format!("BLAZE_OPT={other}: expected 0, 1, 2 or 3")),
         };
         let selection = match std::env::var(SELECTION).as_deref() {
             Ok("fast") => Selection::Fast,
             Ok("optimized") | Err(_) if passes != Passes::None => Selection::Optimized,
             Ok("optimized") | Err(_) => Selection::Fast,
             Ok(other) => {
-                return Err(format!("{SELECTION}={other}: expected `fast` or `optimized`"));
+                return Err(format!("BLAZE_EMIT={other}: expected `fast` or `optimized`"));
             }
         };
         let optimization = Optimization { passes, selection };
         match std::env::var(BACKEND).as_deref() {
             Ok("cranelift") | Err(_) => Ok(Backend::Cranelift),
             Ok("llvm") if cfg!(feature = "llvm") => Ok(Backend::Llvm(optimization)),
-            Ok("llvm") => Err(format!("{BACKEND}=llvm: blaze was built without `--features llvm`")),
-            Ok(other) => Err(format!("{BACKEND}={other}: expected `cranelift` or `llvm`")),
+            Ok("llvm") => {
+                Err(format!("BLAZE_BACKEND=llvm: blaze was built without `--features llvm`"))
+            }
+            Ok(other) => Err(format!("BLAZE_BACKEND={other}: expected `cranelift` or `llvm`")),
         }
     }
 

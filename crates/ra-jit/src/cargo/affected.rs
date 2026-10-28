@@ -51,7 +51,7 @@ pub(crate) fn ask(state: &State) {
         match on {
             true if wanted.is_file() => {}
             // A fresh target has no directory for the program until it is built.
-            true => _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&wanted, "")),
+            true => _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&wanted, "")),
             false => {
                 _ = std::fs::remove_file(&wanted);
                 _ = std::fs::remove_file(dir.join(plan::REACH));
@@ -281,8 +281,7 @@ pub(crate) fn run_identity(asked: &Invocation) -> String {
     let hash = sha2::Digest::finalize(<sha2::Sha256 as sha2::Digest>::new_with_prefix(
         fields.join("\n").as_bytes(),
     ));
-    let hex: String = hash.iter().take(16).map(|it| format!("{it:02x}")).collect();
-    format!("+{hex}")
+    format!("+{}", crate::content::hex(&hash[..16]))
 }
 
 /// Whether what follows `--` leaves the tests to the program to pick and says nothing of how

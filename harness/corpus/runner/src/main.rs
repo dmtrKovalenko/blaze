@@ -659,6 +659,8 @@ fn main() {
     println!("sve {}", cases::sve::run());
     #[cfg(all(feature = "nightly", target_arch = "aarch64"))]
     println!("sve_ops {}", cases::sve_ops::run());
+    #[cfg(all(feature = "nightly", target_arch = "aarch64"))]
+    println!("neon_ops {}", cases::neon_ops::run());
     println!("wide_bits {:x?}", cases::wide_bits::run(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210, u128::MAX - 5));
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     println!("simd_wasm {:x?}", cases::simd_wasm::run());

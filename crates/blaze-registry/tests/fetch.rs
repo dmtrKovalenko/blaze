@@ -8,11 +8,12 @@ use std::{
 };
 
 use blaze_registry::{
-    Blobs, Context, Locked, Package, Registry, SourceConfig, SourceDef, SourceId, Sources,
+    Blobs, Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
     download::{From, checksum, crate_url},
     http::{Http, Response},
     index::Status,
 };
+use blaze_source::SourceId;
 use rustc_hash::FxHashMap as HashMap;
 use semver::{Version, VersionReq};
 
@@ -116,7 +117,7 @@ impl Fixture {
             br#"{"dl":"https://dl.example.com/{crate}/{version}/{lowerprefix}/{sha256-checksum}"}"#,
             "c1",
         );
-        let source = SourceId::for_registry(&format!("sparse+{BASE}")).unwrap();
+        let source = blaze_registry::registry_source(&format!("sparse+{BASE}")).unwrap();
         Fixture { server, store: Arc::default(), home: temporary(name), source }
     }
 
@@ -125,7 +126,7 @@ impl Fixture {
         context.store = Some(self.store.clone());
         context.net.offline = offline;
         context.net.retry.quiet = true;
-        Registry::remote(self.source.clone(), Arc::new(context)).unwrap()
+        Registry::remote(self.source, Arc::new(context)).unwrap()
     }
 
     fn publish(&self, name: &str, files: &[(&str, &[u8], u32)]) -> Package {
@@ -362,8 +363,7 @@ fn vendor(dir: &Path, name: &str, version: &str, package: Option<&str>, files: &
 
 fn locked(name: &str, version: &str, checksum: &str) -> Locked {
     Locked {
-        source: SourceId::crates_io_git(),
-        precise: None,
+        source: SourceId::crates_io(),
         package: Package {
             name: name.to_owned(),
             version: Version::parse(version).unwrap(),
@@ -395,7 +395,7 @@ fn reads_vendored_directories_as_cargo() {
     };
     let context = Arc::new(Context::new(fixture.home.clone(), fixture.server.clone()));
     let sources = Sources::new(&config, context).unwrap();
-    let directory = sources.directory(&SourceId::for_directory(&dir).unwrap()).unwrap();
+    let directory = sources.directory(SourceId::for_directory(&dir).unwrap()).unwrap();
     let mut names: Vec<_> =
         directory.packages().unwrap().iter().map(|it| it.name.clone()).collect();
     names.sort();
@@ -457,11 +457,7 @@ fn replaced_registries_unpack_under_the_replacement() {
     let context = Arc::new(Context::new(fixture.home.clone(), fixture.server.clone()));
     let sources = Sources::new(&config, context).unwrap();
     let roots = sources
-        .fetch(&[Locked {
-            source: SourceId::crates_io_git(),
-            precise: None,
-            package: package.clone(),
-        }])
+        .fetch(&[Locked { source: SourceId::crates_io(), package: package.clone() }])
         .unwrap();
     let dir = fixture.source.registry_dir_name();
     assert!(dir.starts_with("index.example.com-"), "{dir}");

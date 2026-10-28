@@ -54,10 +54,12 @@ The installer downloads the build for your machine from the
 published with it, puts `blaze`, `cargo-blaze` and the programs they run in `~/.cargo/bin`, and
 has blaze download its Rust. It asks nothing. On Linux the build has `blaze-proc-macro-srv` too,
 blaze's own proc-macro server, which a build from crates.io (below) does not have. Run it again
-to upgrade. To install a given release, end the line with `| sh -s -- --version 0.2.0`;
+to upgrade. Releases are dated, `0.YYYYMMDD.N`, and the release train publishes one when main is
+green and has changed since the last. To install a given release, end the line with
+`| sh -s -- --version 0.YYYYMMDD.N`;
 `--no-toolchain` leaves the download to the first build, and `--help` says what else it takes.
-`cargo blaze <command>` is the same as `blaze <command>`. Until the first release under the name
-blaze, it installs the newest nightly build.
+`cargo blaze <command>` is the same as `blaze <command>`. Until the first dated release, it
+installs the `nightly` prerelease, a build of 2026-10-20 that nothing updates any more.
 
 ## From crates.io
 

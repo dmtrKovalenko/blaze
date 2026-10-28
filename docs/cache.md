@@ -80,11 +80,11 @@ rust-analyzer anything while it ran (a span's text, file or line), or when its o
 span anchored where no span of its input is.
 
 A macro that reads a file or an environment variable by itself is pure to the key and is
-not: name it in `RA_JIT_PROC_MACRO_CACHE_SKIP` (a comma-separated list of macro names) to
-expand it every time. `RA_JIT_PROC_MACRO_CACHE=all` keeps function-like macros too, which
+not: name it in `BLAZE_PROC_MACRO_CACHE_SKIP` (a comma-separated list of macro names) to
+expand it every time. `BLAZE_PROC_MACRO_CACHE=all` keeps function-like macros too, which
 are off by default because they are the ones that read outside their input (`sqlx::query!`,
-`include_dir!`). `RA_JIT_PROC_MACRO_CACHE=check` expands every call anyway and says which
-macro expanded otherwise than it was kept. `RA_JIT_PROC_MACRO_CACHE=off` keeps nothing. The
+`include_dir!`). `BLAZE_PROC_MACRO_CACHE=check` expands every call anyway and says which
+macro expanded otherwise than it was kept. `BLAZE_PROC_MACRO_CACHE=off` keeps nothing. The
 daemon's log has a line per load: how many expansions ran and in how long, how many came
 from the store, and why the rest were not kept. rustc's own cache, `-Zcache-proc-macros`,
 keeps derives only ([research/proc-macro-cache.md](research/proc-macro-cache.md)).
@@ -94,17 +94,18 @@ keeps derives only ([research/proc-macro-cache.md](research/proc-macro-cache.md)
 
 The store is `ra-jit/store` in the user's cache directory (`$XDG_CACHE_HOME`, else
 `~/.cache`), whatever the checkout: two checkouts, or two projects with dependencies in
-common, keep a function once. `RA_JIT_CACHE` names another directory, or `off` for none.
-The daemon reads the variable when it starts, so under `cargo ra-jit` it has to be set in
-the environment of the command that starts the daemon; run `cargo ra-jit stop` first if
-one is running. `cargo ra-jit status` says how much the store holds, the most it may hold,
-and where it is.
+common, keep a function once. `BLAZE_CACHE` names another directory, or `off` for none.
+The daemon reads the variable when it starts, so under `cargo blaze` it has to be set in
+the environment of the command that starts the daemon; run `cargo blaze stop` first if
+one is running. `cargo blaze status` says how much the store holds, the most it may hold,
+and where it is. Each setting is read by its old name too, `RA_JIT_` for `BLAZE_`; when
+both are set, the `BLAZE_` one wins.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `RA_JIT_CACHE` | the store's directory, or `off` | `ra-jit/store` in the user's cache directory |
-| `RA_JIT_CACHE_MAX` | the most the sealed packs may take: bytes, or a number with `K`, `M` or `G`, or `off` | a tenth of the disk the store is on that is free or the store's, at least 256M and at most 32G |
-| `RA_JIT_CACHE_SEAL_AT` | size at which an open pack is sealed at the end of a build; exists for the harnesses | 4M |
+| `BLAZE_CACHE` | the store's directory, or `off` | `ra-jit/store` in the user's cache directory |
+| `BLAZE_CACHE_MAX` | the most the sealed packs may take: bytes, or a number with `K`, `M` or `G`, or `off` | a tenth of the disk the store is on that is free or the store's, at least 256M and at most 32G |
+| `BLAZE_CACHE_SEAL_AT` | size at which an open pack is sealed at the end of a build; exists for the harnesses | 4M |
 
 The default limit is worked out again at each collection, so a disk that fills up with
 other things takes room back from the store.
@@ -131,8 +132,13 @@ starts over. One that finds a newer format leaves it alone and runs without a st
 
 ### Integrity and crashes
 
-A pack's hash is checked the first time a process reads it, and each value carries a
-checksum that is checked every time it is read. A pack that fails either check, or has a
+Opening the store reads the index at the start of each pack and none of the values, and a
+process keeps 16 bytes of each key in memory (the first 8 bytes of the key, the pack and
+the entry), reading the rest of the entry from the pack when it looks the key up. A daemon
+checks the hash of every pack once it starts, beside loading the workspace; any other
+process, such as the wrapper cargo starts for each build script, checks a pack's hash the
+first time it finds a key in it. Each value carries a checksum that is checked every time
+it is read. A pack that fails either check, or has a
 block that does not unpack, is removed and what was in it is compiled again. A sealed pack
 appears by a rename after it is written and synced, and the open pack it was sealed from is
 removed after that. An open pack left by a daemon that died is sealed up to its last whole
@@ -150,7 +156,7 @@ at all it prints `store: not used: ...` and runs without a store.
 A collection runs when a daemon opens the store, after it seals a pack, and on
 `ra-jit cache gc`. It seals open packs left behind, removes old temporaries, merges sealed
 packs smaller than 4M into one when there are more than 16 of them, and then removes the
-least recently used packs until the rest fit under `RA_JIT_CACHE_MAX`. A pack counts as used
+least recently used packs until the rest fit under `BLAZE_CACHE_MAX`. A pack counts as used
 when a daemon read a value from it during a build.
 
 Eviction is by pack, not by record. One recently used record keeps its whole pack, which
@@ -162,11 +168,11 @@ the least recently used; `ra-jit cache gc --max 0` empties the store at once.
 
 ### Commands
 
-These act on the store `cargo ra-jit status` names.
+These act on the store `cargo blaze status` names.
 
     ra-jit cache stats                 format, packs, bytes, limit, oldest and newest use
     ra-jit cache verify                read everything; exit 1 if a pack is not what was written
-    ra-jit cache gc [--max SIZE]       collect now, to RA_JIT_CACHE_MAX or to SIZE
+    ra-jit cache gc [--max SIZE]       collect now, to BLAZE_CACHE_MAX or to SIZE
 
 ### Limits
 
@@ -183,10 +189,10 @@ A remote is a directory, `s3://bucket/prefix`, an `https://` address it is only 
 whose files are named by their paths with `.` for `/` (a GitHub release's assets: see "The
 standard library" below), or a tenant of blaze's cache gateway,
 `blaze+https://<gateway>/t/<tenant>/v3` ([remote-cache.md](remote-cache.md), the API in
-`worker/remote-cache/API-v0.md`). The gateway's token is read from `RA_JIT_REMOTE_TOKEN`, or
+`worker/remote-cache/API-v0.md`). The gateway's token is read from `BLAZE_REMOTE_TOKEN`, or
 from the variable `?token=env:NAME` names; without one the tenant is read anonymously, which a
 public tenant allows, and nothing is sent. Packs of 16 MB and more are fetched from it in ranges
-of 8 MB, `RA_JIT_REMOTE_JOBS` at a time, and objects over 90 MB go up in parts. A gateway is not
+of 8 MB, `BLAZE_REMOTE_JOBS` at a time, and objects over 90 MB go up in parts. A gateway is not
 listed, so `ra-jit cache gc --remote` does not apply to it. It holds sealed packs under the hash of
 their bytes, a list of the keys in each pack, and one manifest per project that lists the
 packs that project's builds were served from.
@@ -209,7 +215,7 @@ virtual-hosted addressing, IAM errors and role credentials are untested.
     ra-jit cache pull REMOTE [PROJECT]
 
 `push` sends the packs the manifest lacks and adds them to it. `pull` fetches the packs the
-manifest lists that are not in the local store, as many as fit under `RA_JIT_CACHE_MAX`.
+manifest lists that are not in the local store, as many as fit under `BLAZE_CACHE_MAX`.
 `PROJECT` picks the manifest and defaults to `default`. Each prints one line of what it moved,
 whether it went through or not, for a CI job's summary:
 
@@ -217,32 +223,32 @@ whether it went through or not, for a CI job's summary:
 
 ### From the daemon
 
-With `RA_JIT_REMOTE` set, the daemon pulls before its first build, pulls again when a build
+With `BLAZE_REMOTE` set, the daemon pulls before its first build, pulls again when a build
 misses a key and the manifest has changed, and pushes what it compiled after the first
 build, then every five minutes, and once more when it is told to stop. No build waits for a
 push. A daemon killed with SIGKILL pushes nothing on its way out; the next push sends it.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `RA_JIT_REMOTE` | the remote the daemon keeps its store in step with | not set |
-| `RA_JIT_PROJECT` | which manifest | `default` |
-| `RA_JIT_REMOTE_READONLY` | never write to the remote | off |
-| `RA_JIT_REMOTE_LAZY` | fetch only the key lists, and a pack when a build first asks for a key in it | off |
-| `RA_JIT_REMOTE_PUSH_EVERY` | how often a running daemon pushes (`90s`, `5m`, `1h`), or `off` | `5m` |
-| `RA_JIT_REMOTE_JOBS` | requests in flight at once | 8 |
-| `RA_JIT_REMOTE_TIMEOUT` | seconds a request may go without an answer | 30 |
-| `RA_JIT_REMOTE_SIGN` | file holding the key this machine signs manifests with | not set |
-| `RA_JIT_REMOTE_TRUST` | public keys this machine accepts manifests from, comma separated | not set |
-| `RA_JIT_REMOTE_TOKEN` | the bearer token of a `blaze+` gateway remote | not set |
-| `RA_JIT_REMOTE_REQUIRED` | a remote that fails fails the command (see below) | off |
+| `BLAZE_REMOTE` | the remote the daemon keeps its store in step with | not set |
+| `BLAZE_PROJECT` | which manifest | `default` |
+| `BLAZE_REMOTE_READONLY` | never write to the remote | off |
+| `BLAZE_REMOTE_LAZY` | fetch only the key lists, and a pack when a build first asks for a key in it | off |
+| `BLAZE_REMOTE_PUSH_EVERY` | how often a running daemon pushes (`90s`, `5m`, `1h`), or `off` | `5m` |
+| `BLAZE_REMOTE_JOBS` | requests in flight at once | 8 |
+| `BLAZE_REMOTE_TIMEOUT` | seconds a request may go without an answer | 30 |
+| `BLAZE_REMOTE_SIGN` | file holding the key this machine signs manifests with | not set |
+| `BLAZE_REMOTE_TRUST` | public keys this machine accepts manifests from, comma separated | not set |
+| `BLAZE_REMOTE_TOKEN` | the bearer token of a `blaze+` gateway remote | not set |
+| `BLAZE_REMOTE_REQUIRED` | a remote that fails fails the command (see below) | off |
 
-`RA_JIT_REMOTE` needs the local store (`RA_JIT_CACHE` not `off`): the remote fills and
-reads it. `RA_JIT_REMOTE=off` turns it off for one command.
+`BLAZE_REMOTE` needs the local store (`BLAZE_CACHE` not `off`): the remote fills and
+reads it. `BLAZE_REMOTE=off` turns it off for one command.
 
 A remote that cannot be reached, answers 5xx after its retries, refuses the token (401, 403),
 or sends bytes that do not hash to their name does not stop a build: what it would have
 served is compiled, and every build's `Finished` line says so until an exchange with it
-succeeds again, as in `[ra-jit, remote down: <remote>: <why>]`. With `RA_JIT_REMOTE_REQUIRED=1`,
+succeeds again, as in `[blaze, remote down: <remote>: <why>]`. With `BLAZE_REMOTE_REQUIRED=1`,
 which CI sets, each of those is an error that fails the command (`cache push`, `cache pull`,
 or the build), so a cache that stopped working is not a slowdown nobody sees.
 
@@ -256,7 +262,7 @@ build first reads the store it fetches the project once per store, from:
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `RA_JIT_STD_FROM` | the remote to fetch the standard library from, or `off` | the binary's own release, when it is one; otherwise none |
+| `BLAZE_STD_FROM` | the remote to fetch the standard library from, or `off` | the binary's own release, when it is one; otherwise none |
 
 A build of another binary (crates.io, nix, your own) finds nothing for its `<build>` and
 compiles the library itself, once per store.
@@ -291,12 +297,12 @@ Signing does. Make a key and note the public half it prints:
 
     ra-jit cache keygen ~/.config/ra-jit/sign.key
 
-A machine with `RA_JIT_REMOTE_SIGN` naming that file signs each manifest it writes
-(Ed25519, over the manifest's name and body). A machine with `RA_JIT_REMOTE_TRUST` listing
+A machine with `BLAZE_REMOTE_SIGN` naming that file signs each manifest it writes
+(Ed25519, over the manifest's name and body). A machine with `BLAZE_REMOTE_TRUST` listing
 public keys refuses any manifest not signed by one of them. A machine that trusts keys but
 has none to sign with refuses to push.
 
-So: with `RA_JIT_REMOTE_TRUST` set, nobody without a trusted signing key can make ra-jit emit
+So: with `BLAZE_REMOTE_TRUST` set, nobody without a trusted signing key can make ra-jit emit
 code other than what a local build gives, whatever they do to the bucket. Without it,
 whoever can write to the bucket is trusted, as with sccache or a registry mirror. A trusted
 signer is trusted completely; ra-jit does not compile again to check them. Under all of it

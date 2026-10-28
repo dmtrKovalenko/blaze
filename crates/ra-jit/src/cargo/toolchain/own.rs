@@ -178,7 +178,7 @@ pub(crate) fn home() -> Option<PathBuf> {
 
 /// Whether `dir` has a whole toolchain: what is moved into place is whole, so this tells one
 /// from a directory someone else left there.
-pub(crate) fn complete(dir: &Path) -> bool {
+fn whole(dir: &Path) -> bool {
     let exe = std::env::consts::EXE_SUFFIX;
     let needed = [
         format!("bin/cargo{exe}"),
@@ -187,6 +187,17 @@ pub(crate) fn complete(dir: &Path) -> bool {
         "lib/rustlib/src/rust/library".to_owned(),
     ];
     needed.iter().all(|it| dir.join(it).exists())
+}
+
+/// Whether `dir` is a whole toolchain with every component `release` pins: one downloaded
+/// before a component was pinned (the standard library of `wasm32-wasip1`, which proc macros
+/// are built for) is downloaded again.
+pub(crate) fn complete(release: &Release, dir: &Path) -> bool {
+    let Ok(has) = std::fs::read_to_string(dir.join("lib/rustlib/components")) else {
+        return false;
+    };
+    let has: Vec<&str> = has.lines().collect();
+    whole(dir) && release.components.iter().all(|it| has.contains(&it.name().as_str()))
 }
 
 /// Downloads `release` into `dir` unless it is there. Processes that ask at once download it
@@ -216,7 +227,7 @@ fn fetch_from(
     std::fs::create_dir_all(parent).map_err(|e| failed(&e))?;
     let lock = File::create(parent.join(format!(".{name}.lock"))).map_err(|e| failed(&e))?;
     lock.lock().map_err(|e| failed(&e))?;
-    if complete(dir) {
+    if complete(release, dir) {
         return Ok(());
     }
     eprintln!(
@@ -279,7 +290,7 @@ fn superseded(release: &Release, parent: &Path) -> Vec<(PathBuf, String)> {
                 .bytes()
                 .enumerate()
                 .all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
-        if dated && date < release.date && complete(&entry.path()) {
+        if dated && date < release.date && whole(&entry.path()) {
             old.push((entry.path(), name));
         }
     }
@@ -501,7 +512,7 @@ async fn download(
         }
         tokio::time::sleep(Duration::from_secs(tries.into())).await;
     }
-    let got: String = hasher.finalize().iter().map(|it| format!("{it:02x}")).collect();
+    let got = crate::content::hex(&hasher.finalize());
     if got != pin.sha256 {
         drop(written);
         _ = std::fs::remove_file(part);
@@ -667,8 +678,7 @@ mod tests {
     }
 
     fn sha256(bytes: &[u8]) -> &'static str {
-        let hex: String = Sha256::digest(bytes).iter().map(|it| format!("{it:02x}")).collect();
-        hex.leak()
+        crate::content::hex(&Sha256::digest(bytes)).leak()
     }
 
     /// A release of two packages, written as the Rust project's site has them into `dist`,
@@ -729,13 +739,23 @@ mod tests {
         assert_eq!(ours.version, super::super::OURS.trim(), "harness/toolchain_pins.py --write");
         assert_eq!(ours.channel, "nightly");
         assert!(ours.rustc.contains("-nightly ("), "{}", ours.rustc);
-        let packages: Vec<_> = ours.components.iter().map(|it| it.package).collect();
-        assert_eq!(packages, ["rustc", "cargo", "rust-std", "rust-src"]);
-        assert_eq!(ours.components[3].file(ours.channel), "rust-src-nightly.tar.xz");
+        let names: Vec<_> = ours.components.iter().map(Component::name).collect();
+        assert_eq!(
+            names,
+            [
+                "rustc-x86_64-unknown-linux-gnu",
+                "cargo-x86_64-unknown-linux-gnu",
+                "rust-std-x86_64-unknown-linux-gnu",
+                "rust-std-wasm32-wasip1",
+                "rust-src"
+            ],
+            "proc macros are built for wasm32-wasip1 (own_macro.rs), so its library is pinned"
+        );
+        assert_eq!(ours.components[4].file(ours.channel), "rust-src-nightly.tar.xz");
         assert!(Release::read(PINS, "riscv64gc-unknown-linux-gnu").is_none());
         for host in ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
         {
-            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 4, "{host}");
+            assert_eq!(Release::read(PINS, host).unwrap().components.len(), 5, "{host}");
         }
     }
 
@@ -746,7 +766,7 @@ mod tests {
         let release = release(&dist, &rustc());
         let dir = work.path().join("toolchains/9.9.9-test-host");
         fetched(&dist, &release, &dir).unwrap();
-        assert!(complete(&dir));
+        assert!(complete(&release, &dir));
         let read = |path: &str| std::fs::read_to_string(dir.join(path)).unwrap();
         assert_eq!(read("lib/rustlib/components"), "rustc-test-host\nrust-src\n");
         assert_eq!(
@@ -785,6 +805,9 @@ mod tests {
         // Whole, it is not downloaded again: the files it came from can be gone.
         std::fs::remove_dir_all(&dist).unwrap();
         fetched(&dist, &release, &dir).unwrap();
+        // One laid out before a component was pinned is not whole.
+        std::fs::write(dir.join("lib/rustlib/components"), "rustc-test-host\n").unwrap();
+        assert!(!complete(&release, &dir));
     }
 
     #[test]
@@ -868,7 +891,7 @@ mod tests {
         std::fs::write(dist.join("rustc-9.9.9-test-host.tar.xz"), &rest).unwrap();
         let dir = work.path().join("toolchains/9.9.9-test-host");
         fetched(&dist, &release, &dir).unwrap();
-        assert!(complete(&dir));
+        assert!(complete(&release, &dir));
     }
 
     #[test]

@@ -251,6 +251,12 @@ pub const CARGO_HOME: &str = "/cargo";
 /// it (`docs/live.md#types`).
 pub const LASTING_STATIC: &str = "ra_jit::static::lasting::";
 
+/// What the name of a data object of a patch starts with that says the patch left the base's
+/// copy of a static behind, the rest of the name being that copy's: the patch has one of its
+/// own, and everything that refers to it (`patch::Base::moved`), so nothing that runs refers to
+/// the base's.
+pub const MOVED_STATIC: &str = "ra_jit::static::moved::";
+
 /// `path` with the directory `to` in place of the directory `from` it is under.
 pub fn moved(path: &str, from: &str, to: &str) -> Option<String> {
     let rest = path.strip_prefix(from)?;
@@ -7012,7 +7018,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return Ok(data);
         }
         let node = patch::Node::Static(id);
-        let known = self.base.and_then(|base| base.statics.get(&id));
+        let mut known = self.base.and_then(|base| base.statics.get(&id));
+        // One whose value no longer fits where the base has it is a static of the patch's own,
+        // named as one new since the base is.
+        if let Some(moved) = known.filter(|_| self.replaced.moved.contains(&id)) {
+            self.leave_behind(&moved.symbol)?;
+            known = None;
+        }
         // One with another value keeps its name, and what refers to it by that gets the new.
         let again = known.filter(|_| self.replaced.changed.contains(&node));
         if let Some(known) = known.filter(|_| again.is_none()) {
@@ -7762,12 +7774,26 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         Ok(data)
     }
 
-    /// Defines `id` as `blob`, in a section of its own named `section` when there is one.
+    /// Says that the patch leaves the base's copy of a static, `symbol`, behind ([`MOVED_STATIC`]).
+    fn leave_behind(&mut self, symbol: &str) -> Result<()> {
+        if symbol.is_empty() {
+            return Ok(());
+        }
+        let name = format!("{MOVED_STATIC}{symbol}");
+        let data = self.declare_named_data(&name, Linkage::Hidden, false, false, true)?;
+        let mut description = DataDescription::new();
+        description.define_zeroinit(1);
+        self.module
+            .define_data(data, &description)
+            .map_err(|e| CodegenError::Backend(e.to_string()))
+    }
+
     /// Writes rustc's hash of each type in `blob.type_ids` at its place in the bytes.
     fn hash_type_ids(&self, blob: &mut ConstBlob) -> Result<()> {
         hash_type_ids(self.db, self.symbols, &self.own_statics.crates, blob)
     }
 
+    /// Defines `id` as `blob`, in the section named `section` when there is one.
     fn fill_data(&mut self, id: DataId, mut blob: ConstBlob, section: Option<&str>) -> Result<()> {
         self.hash_type_ids(&mut blob)?;
         let mut data = DataDescription::new();
@@ -9608,7 +9634,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if align > 16 {
             return self.stack_slot(layout);
         }
-        let align_shift = align.trailing_zeros() as u8;
+        let align_shift = self.slot_align_shift(layout);
         let free = self.free_argument_slots.iter().position(|it| it.1 == (size, align_shift));
         let slot = match free {
             Some(free) => self.free_argument_slots.swap_remove(free).0,
@@ -9639,13 +9665,24 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         addr
     }
 
+    /// The alignment of a slot of `layout` of at most 16, as a shift: the layout's, or 16 on
+    /// AArch64 for a value `copy_value` copies in vectors, whose vectors are then at offsets
+    /// of the frame a load or store of 16 bytes reaches (see `reaches_vector`).
+    fn slot_align_shift(&self, layout: &Layout) -> u8 {
+        let shift = layout.align.abi.bytes().trailing_zeros() as u8;
+        if self.cg.target.arch == Arch::Aarch64 && self.copies_in_vectors(layout) {
+            return shift.max(4);
+        }
+        shift
+    }
+
     fn stack_slot(&mut self, layout: &Layout) -> Value {
         let (size, align) = (layout.size.bytes() as u32, layout.align.abi.bytes());
         if align <= 16 {
             let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                 StackSlotKind::ExplicitSlot,
                 size,
-                align.trailing_zeros() as u8,
+                self.slot_align_shift(layout),
             ));
             return self.builder.ins().stack_addr(ptr(), slot, 0);
         }
@@ -11703,15 +11740,73 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// reach the cache (sha2's SHA-NI rounds ran at a ninth of rustc's unoptimized build's
     /// speed). Anything else goes in words, as its fields are written.
     fn copy_value(&mut self, dst: Value, src: Value, layout: &Layout) {
-        let vector = matches!(
-            (&layout.backend_repr, &layout.fields),
-            (BackendRepr::SimdVector { .. }, _) | (_, rustc_abi::FieldsShape::Array { .. })
-        ) && layout.size.bytes() % 16 == 0
-            && self.makes_vectors();
-        if !vector || dst == src || layout.size.bytes() > 128 {
+        if !self.copies_in_vectors(layout)
+            || dst == src
+            || !self.reaches_vector(dst)
+            || !self.reaches_vector(src)
+        {
             return self.copy(dst, src, layout.size);
         }
         self.copy_in(dst, src, layout.size, &[types::I8X16]);
+    }
+
+    /// Whether `copy_value` copies a value of `layout` in vectors of 16 bytes.
+    fn copies_in_vectors(&self, layout: &Layout) -> bool {
+        matches!(
+            (&layout.backend_repr, &layout.fields),
+            (BackendRepr::SimdVector { .. }, _) | (_, rustc_abi::FieldsShape::Array { .. })
+        ) && layout.size.bytes() % 16 == 0
+            && layout.size.bytes() <= 128
+            && self.makes_vectors()
+    }
+
+    /// Whether loads and stores of 16 bytes at `addr` and the 16-byte steps after it are
+    /// reached by an immediate offset. AArch64 reaches a slot of the frame from `sp`, and
+    /// Cranelift reaches an offset a 16-byte access can't encode (one past -256..256 that is
+    /// not a multiple of 16) by a register extended by `sxtx`, which valgrind can't decode
+    /// (it stops the program with SIGILL). A slot at an offset that is a multiple of 16 is
+    /// reached by a scaled immediate.
+    fn reaches_vector(&self, addr: Value) -> bool {
+        if self.cg.target.arch != Arch::Aarch64 {
+            return true;
+        }
+        let func = &self.builder.func;
+        let constant = |value: Value| match func.dfg.value_def(func.dfg.resolve_aliases(value)) {
+            ir::ValueDef::Result(inst, _) => match func.dfg.insts[inst] {
+                ir::InstructionData::UnaryImm { opcode: ir::Opcode::Iconst, imm } => {
+                    Some(imm.bits())
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let (mut addr, mut offset) = (addr, 0i64);
+        loop {
+            let ir::ValueDef::Result(inst, _) = func.dfg.value_def(func.dfg.resolve_aliases(addr))
+            else {
+                return true;
+            };
+            match func.dfg.insts[inst] {
+                ir::InstructionData::StackAddr {
+                    opcode: ir::Opcode::StackAddr,
+                    stack_slot,
+                    offset: at,
+                } => {
+                    let aligned = func.sized_stack_slots[stack_slot].align_shift >= 4;
+                    return aligned && (offset + i64::from(at)) % 16 == 0;
+                }
+                ir::InstructionData::Binary { opcode: ir::Opcode::Iadd, args: [a, b] } => {
+                    let (base, by) = match (constant(a), constant(b)) {
+                        (_, Some(by)) => (a, by),
+                        (Some(by), _) => (b, by),
+                        _ => return true,
+                    };
+                    offset = offset.wrapping_add(by);
+                    addr = base;
+                }
+                _ => return true,
+            }
+        }
     }
 
     /// Stores `lanes` of `lane` to `dst` as one vector of 16 bytes, when they are 16 bytes and
@@ -11720,6 +11815,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn store_whole(&mut self, lanes: &[Value], lane: Type, dst: Value) -> bool {
         let bits = lane.bits() as usize;
         if lanes.len() * bits != 128 || bits > 64 || !self.makes_vectors() {
+            return false;
+        }
+        if !self.reaches_vector(dst) {
             return false;
         }
         let int = Type::int(bits as u16).expect("a lane of 8 to 64 bits");
@@ -19229,5 +19327,151 @@ mod tests {
         let afresh = places(false);
         assert_eq!(afresh.slots.len(), 1);
         assert_eq!(places(true), afresh);
+    }
+
+    /// An object with `count` statics of a `u32` in `section` and as many pointers to a
+    /// function in `pointers`, as `#[link_section]` and `inventory::submit!` give.
+    fn object_of_statics(
+        triple: target_lexicon::Triple,
+        data_sections: bool,
+        used: bool,
+        (section, pointers): (&str, &str),
+        count: u32,
+    ) -> Vec<u8> {
+        use cranelift_codegen::settings::{self, Configurable};
+        use cranelift_module::{DataDescription, Linkage, Module, default_libcall_names};
+        use cranelift_object::{ObjectBuilder, ObjectModule};
+
+        let mut flags = settings::builder();
+        flags.set("is_pic", "true").unwrap();
+        let isa = cranelift_codegen::isa::lookup(triple)
+            .unwrap()
+            .finish(settings::Flags::new(flags))
+            .unwrap();
+        let mut builder = ObjectBuilder::new(isa, "statics", default_libcall_names()).unwrap();
+        builder.per_data_object_section(data_sections);
+        let mut module = ObjectModule::new(builder);
+        let sig = module.make_signature();
+        let init = module.declare_function("init", Linkage::Local, &sig).unwrap();
+        // `ret` on aarch64.
+        module.define_function_bytes(init, 4, &[0xc0, 0x03, 0x5f, 0xd6], &[]).unwrap();
+        for i in 0..count {
+            let entry =
+                module.declare_data(&format!("ENTRY_{i}"), Linkage::Local, false, false).unwrap();
+            let mut data = DataDescription::new();
+            match i {
+                0 => data.define_zeroinit(4),
+                _ => data.define(Box::new(i.to_le_bytes())),
+            }
+            data.set_align(4);
+            data.set_custom_section(section);
+            data.set_used(used);
+            module.define_data(entry, &data).unwrap();
+
+            let ctor =
+                module.declare_data(&format!("CTOR_{i}"), Linkage::Local, false, false).unwrap();
+            let mut data = DataDescription::new();
+            data.define(Box::new([0; 8]));
+            data.set_align(8);
+            data.set_custom_section(pointers);
+            data.set_used(used);
+            let func = module.declare_func_in_data(init, &mut data);
+            data.write_function_addr(0, func);
+            module.define_data(ctor, &data).unwrap();
+        }
+        module.finish().emit().unwrap()
+    }
+
+    /// Statics that name one section share it, as in LLVM's objects: a Mach-O object has room
+    /// for 255 sections, and blaze writes a program as one (#724).
+    #[test]
+    fn statics_of_one_section_share_it_in_a_mach_o_object() {
+        use object::macho;
+        use object::read::macho::{MachOFile64, Nlist, Section as _};
+        use object::{Endianness, Object, ObjectSection, ObjectSymbol};
+
+        let count = 300;
+        let names = ("__DATA,__blaze_many", "__DATA,__mod_init_func,mod_init_funcs");
+        let triple = target_lexicon::triple!("aarch64-apple-darwin");
+        let bytes = object_of_statics(triple, false, true, names, count);
+        let file = MachOFile64::<Endianness>::parse(&*bytes).unwrap();
+        assert!(file.sections().count() < 255);
+        let named = |name: &str| {
+            let mut found = file.sections().filter(|it| it.name() == Ok(name));
+            let section = found.next().unwrap();
+            assert!(found.next().is_none(), "two sections named `{name}`");
+            section
+        };
+
+        let many = named("__blaze_many");
+        assert_eq!(many.segment_name(), Ok(Some("__DATA")));
+        assert_eq!(many.align(), 4);
+        let values: Vec<u32> = many
+            .data()
+            .unwrap()
+            .chunks(4)
+            .map(|it| u32::from_le_bytes(it.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, (0..count).collect::<Vec<_>>());
+        let ctors = named("__mod_init_func");
+        assert_eq!(ctors.size(), 8 * u64::from(count));
+        assert_eq!(
+            ctors.macho_section().flags(Endianness::Little),
+            macho::S_MOD_INIT_FUNC_POINTERS
+        );
+        let mut at: Vec<u64> = ctors.relocations().map(|(offset, _)| offset).collect();
+        at.sort_unstable();
+        assert_eq!(at, (0..u64::from(count)).map(|i| 8 * i).collect::<Vec<_>>());
+
+        // Each keeps its own symbol, which Apple's linker keeps or strips on its own.
+        for (prefix, section, size) in [("_ENTRY_", &many, 4), ("_CTOR_", &ctors, 8)] {
+            let mut offsets: Vec<u64> = file
+                .symbols()
+                .filter(|it| it.name().is_ok_and(|name| name.starts_with(prefix)))
+                .map(|it| {
+                    assert_eq!(it.section_index(), Some(section.index()));
+                    let n_desc = it.macho_symbol().n_desc(Endianness::Little);
+                    assert_ne!(n_desc & macho::N_NO_DEAD_STRIP, 0);
+                    it.address() - section.address()
+                })
+                .collect();
+            offsets.sort_unstable();
+            assert_eq!(offsets, (0..u64::from(count)).map(|i| size * i).collect::<Vec<_>>());
+        }
+    }
+
+    /// In an ELF object the section is what the linker keeps or drops: one asked for each piece
+    /// of data, or one `#[used]` keeps (`SHF_GNU_RETAIN`), stays one per static, which the
+    /// linker merges by name; otherwise the statics of a section share it.
+    #[test]
+    fn statics_of_one_section_in_an_elf_object_share_it_unless_each_is_kept_alone() {
+        use object::{Object, ObjectSection, SectionFlags, elf};
+
+        let count = 300;
+        let names = ("blaze_many", ".init_array");
+        let sections = |data_sections: bool, used: bool| {
+            let triple = target_lexicon::triple!("aarch64-unknown-linux-gnu");
+            let bytes = object_of_statics(triple, data_sections, used, names, count);
+            let file = object::File::parse(&*bytes).unwrap();
+            let of = |name: &str| {
+                let found: Vec<_> = file
+                    .sections()
+                    .filter(|it| it.name() == Ok(name))
+                    .map(|it| it.flags())
+                    .collect();
+                let retained = found.iter().filter(|flags| match flags {
+                    SectionFlags::Elf { sh_flags } => {
+                        sh_flags & u64::from(elf::SHF_GNU_RETAIN) != 0
+                    }
+                    _ => unreachable!(),
+                });
+                (found.len(), retained.count())
+            };
+            (of(names.0), of(names.1))
+        };
+        let count = count as usize;
+        assert_eq!(sections(false, false), ((1, 0), (1, 0)));
+        assert_eq!(sections(true, false), ((count, 0), (count, 0)));
+        assert_eq!(sections(false, true), ((count, count), (count, count)));
     }
 }

@@ -210,75 +210,79 @@ pub fn print_tree(
         })
     };
     let printed = blaze_metadata::resolved(&asked, Some(&pick), |resolved| {
-        let Resolved {
-            resolve, members, member_ids, specs, cli_features, behavior, packages, ..
-        } = resolved;
+        let Resolved { resolve, members, member_ids, cli_features, behavior, packages, .. } =
+            resolved;
         let requested_kinds = kinds.requested();
-        let member_features = members_with_features(&members, specs, cli_features)?;
-        let feature_opts = FeatureOpts::new(behavior, has_dev, force_all);
-        let targets = Targets { packages, kinds };
-        let features = FeatureResolver::resolve(
-            &targets,
-            resolve,
-            &member_features,
-            &requested_kinds,
-            feature_opts,
-        )?;
-        let mut graph = graph::build(
-            resolve,
-            &features,
-            member_features,
-            kinds,
-            &requested_kinds,
-            packages,
-            opts,
-        );
-
-        let root_specs = match opts.invert.is_empty() {
-            true => specs.to_vec(),
-            false => opts.invert.iter().map(|p| PackageIdSpec::parse(p)).collect::<Result<_>>()?,
-        };
-        let root_ids = graph::specs_to_ids(resolve, &root_specs)?;
-        let mut root_indexes = graph.indexes_from_ids(&root_ids);
-        if opts.duplicates {
-            // `-d -p foo` only shows duplicates within foo's subtree.
-            graph = graph.from_reachable(&root_indexes);
-            root_indexes = graph.find_duplicates();
-        }
-        if !opts.invert.is_empty() || opts.duplicates {
-            graph.invert();
-        }
-
-        let all_ids: Vec<PackageId> = resolve.iter().collect();
-        let pkgs_to_prune = opts
-            .pkgs_to_prune
-            .iter()
-            .map(|p| {
-                // Said if the spec is not of the resolved graph.
-                let spec = PackageIdSpec::parse(p)?;
-                spec.query(&all_ids)?;
-                Ok(spec)
-            })
-            .collect::<Result<Vec<PackageIdSpec>>>()?;
-
-        if root_indexes.is_empty() {
-            warn(
-                "nothing to print.\n\n\
-                 To find dependencies that require specific target platforms, \
-                 try to use option `--target all` first, and then narrow your search scope accordingly.",
+        // One tree per feature resolve: per package under `resolver.feature-unification =
+        // "package"`.
+        for roots in resolved.feature_resolves()? {
+            let feature_opts = FeatureOpts::new(behavior, has_dev, force_all);
+            let targets = Targets { packages, kinds };
+            let features = FeatureResolver::resolve(
+                &targets,
+                resolve,
+                &roots.members,
+                &requested_kinds,
+                feature_opts,
+            )?;
+            let mut graph = graph::build(
+                resolve,
+                &features,
+                members_with_features(&members, &roots.specs, cli_features)?,
+                kinds,
+                &requested_kinds,
+                packages,
+                opts,
             );
-            return Ok(());
+
+            let root_specs = match opts.invert.is_empty() {
+                true => roots.specs,
+                false => {
+                    opts.invert.iter().map(|p| PackageIdSpec::parse(p)).collect::<Result<_>>()?
+                }
+            };
+            let root_ids = graph::specs_to_ids(resolve, &root_specs)?;
+            let mut root_indexes = graph.indexes_from_ids(&root_ids);
+            if opts.duplicates {
+                // `-d -p foo` only shows duplicates within foo's subtree.
+                graph = graph.from_reachable(&root_indexes);
+                root_indexes = graph.find_duplicates();
+            }
+            if !opts.invert.is_empty() || opts.duplicates {
+                graph.invert();
+            }
+
+            let all_ids: Vec<PackageId> = resolve.iter().collect();
+            let pkgs_to_prune = opts
+                .pkgs_to_prune
+                .iter()
+                .map(|p| {
+                    // Said if the spec is not of the resolved graph.
+                    let spec = PackageIdSpec::parse(p)?;
+                    spec.query(&all_ids)?;
+                    Ok(spec)
+                })
+                .collect::<Result<Vec<PackageIdSpec>>>()?;
+
+            if root_indexes.is_empty() {
+                warn(
+                    "nothing to print.\n\n\
+                     To find dependencies that require specific target platforms, \
+                     try to use option `--target all` first, and then narrow your search scope accordingly.",
+                );
+                continue;
+            }
+            let printer = Printer {
+                graph: &graph,
+                format: format::Pattern::new(&opts.format)
+                    .with_context(|| format!("tree format `{}` not valid", opts.format))?,
+                symbols: if opts.unicode { &UTF8_SYMBOLS } else { &ASCII_SYMBOLS },
+                pkgs_to_prune: &pkgs_to_prune,
+                member_ids,
+                opts,
+            };
+            printer.print(root_indexes, out);
         }
-        let printer = Printer {
-            graph: &graph,
-            format: format::Pattern::new(&opts.format)
-                .with_context(|| format!("tree format `{}` not valid", opts.format))?,
-            symbols: if opts.unicode { &UTF8_SYMBOLS } else { &ASCII_SYMBOLS },
-            pkgs_to_prune: &pkgs_to_prune,
-            member_ids,
-            opts,
-        };
-        printer.print(root_indexes, out);
         Ok(())
     });
     for it in warned.into_inner() {

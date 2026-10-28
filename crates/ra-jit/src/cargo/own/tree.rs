@@ -96,6 +96,7 @@ pub(super) fn command(args: Args<'_>) -> anyhow::Result<i32> {
             platform: None,
             offline: read.has("--offline") || read.has("--frozen"),
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let mut out = String::new();
         blaze_tree::print_tree(&asked, &opts, &kinds, &mut out, &mut |it| say::warning(it))?;

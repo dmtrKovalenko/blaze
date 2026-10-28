@@ -134,7 +134,7 @@ def run_mir_case(name, case, workspace, json_path):
     run = subprocess.run([RA_JIT, "mir", workspace, "--crate", case["crate"]], capture_output=True, text=True)
     if run.returncode != 0:
         raise SystemExit(f"{name}: ra-jit mir failed:\n{run.stderr[-2000:]}")
-    reasons = re.findall(r"^// ra-jit: no MIR: (.*)$", run.stdout, re.M)
+    reasons = re.findall(r"^// blaze: no MIR: (.*)$", run.stdout, re.M)
     lowered = len(re.findall(r"^fn ", run.stdout, re.M))
     print(f"{name}: {lowered} lowered, {len(reasons)} refused")
     for reason in sorted(set(reasons)):

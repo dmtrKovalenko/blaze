@@ -7,7 +7,8 @@
 //! code over the entry of each function the patch replaces. Whatever referred to the old
 //! function, a call, a vtable or a function pointer, still arrives there and goes on to the
 //! new one. Data has no entry to jump from, so a static with another value is written where
-//! the old one is, when it is no larger.
+//! the old one is. The patch names one that no longer fits there as a static new since the
+//! base, and holds everything that refers to it.
 //!
 //! What is appended, in four segments of its own:
 //!
@@ -54,7 +55,7 @@ use object::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(crate) use self::lasting::Lasting;
-use self::lasting::{Own, is_lasting};
+use self::lasting::{Own, is_lasting, left_behind};
 
 mod debug;
 mod lasting;
@@ -324,7 +325,10 @@ impl Baseline {
     /// A Mach-O splice stops when `give_up` is set, with [`GaveUp`], and leaves the executable
     /// and what is known of it as they were.
     pub(crate) fn splice(&mut self, patch: &[u8], give_up: &AtomicBool) -> anyhow::Result<Spliced> {
-        self.splice_as(patch, give_up, false).map(|(spliced, _)| spliced)
+        let before = file_key(&self.path);
+        let spliced = self.splice_as(patch, give_up, false)?.0;
+        names_spliced(&self.path, before);
+        Ok(spliced)
     }
 
     /// Splices `object`, all of a program the daemon built, into the executable rustc linked,
@@ -531,12 +535,7 @@ impl Baseline {
                 ensure!(image.machine == Machine::X86_64, "live edits support Linux x86-64 only");
                 let uuid = image.id.context("the executable has no GNU build ID")?;
                 let mut patch = Patch::read(patch, image, false)?;
-                ensure!(
-                    self.baked
-                        .iter()
-                        .all(|it| patch.replaced.iter().any(|replaced| replaced.name == &**it)),
-                    "a function the executable was linked with a patch of is as it first was"
-                );
+                self.has_baked(patch.replaced.iter().map(|it| it.name))?;
                 lasting.place(&patch.lasting_own()?)?;
                 patch.keep_lasting(|name| lasting.address(name))?;
                 let (code, moved) =
@@ -608,11 +607,7 @@ impl Baseline {
 
     /// The splice of a wasm module, which is written anew from the linker's each time.
     fn rewrite(&self, module: &wasm::Module, patch: &[u8]) -> anyhow::Result<(Vec<u8>, Spliced)> {
-        let defined: FxHashSet<Box<[u8]>> = wasm::defined(patch)?.into_iter().collect();
-        ensure!(
-            self.baked.iter().all(|it| defined.contains(it)),
-            "a function the executable was linked with a patch of is as it first was"
-        );
+        self.has_baked(wasm::defined(patch)?.iter().map(|it| &**it))?;
         ensure!(
             Stamp::of(&File::open(&self.path)?)? == self.stamp,
             "the executable was written by someone else"
@@ -622,16 +617,102 @@ impl Baseline {
 }
 
 impl Baseline {
-    /// Whether a patch that defines `defined` has every function of the patch the
-    /// executable was linked with.
-    fn has_baked<'a>(&self, defined: impl Iterator<Item = &'a [u8]>) -> anyhow::Result<()> {
-        let defined: FxHashSet<&[u8]> = defined.collect();
-        ensure!(
-            self.baked.iter().all(|it| defined.contains(&**it)),
-            "a function the executable was linked with a patch of is as it first was"
-        );
-        Ok(())
+    /// [`has_baked`] of the patch the executable was linked with.
+    fn has_baked<'a>(&self, defined: impl IntoIterator<Item = &'a [u8]>) -> anyhow::Result<()> {
+        has_baked(&self.baked, defined)
     }
+}
+
+/// What [`kept_names`] read, by executable: of the file it was read from (device and inode),
+/// and the names.
+#[cfg(unix)]
+type KeptNames = FxHashMap<PathBuf, ((u64, u64), Arc<FxHashSet<String>>)>;
+
+#[cfg(unix)]
+static KEPT_NAMES: std::sync::LazyLock<std::sync::Mutex<KeptNames>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The file at `path`, by its device and inode: a link writes a new one.
+#[cfg(unix)]
+fn file_key(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let file = std::fs::metadata(path).ok()?;
+    Some((file.dev(), file.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_key(_: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// The names the executable at `path` defines, read once for each file a link writes. A splice
+/// moves what some of them are at and adds none, so what was read of the file it started from
+/// is true of the one it leaves, which on macOS is a new file ([`names_spliced`]): read again
+/// there, a 34 MB program's took 97 ms of each edit (#453).
+pub(crate) fn kept_names(path: &Path) -> Option<Arc<FxHashSet<String>>> {
+    #[cfg(unix)]
+    {
+        let key = file_key(path)?;
+        let mut kept = crate::lock(&KEPT_NAMES);
+        if let Some((at, names)) = kept.get(path)
+            && *at == key
+        {
+            return Some(names.clone());
+        }
+        let bytes = std::fs::read(path).ok()?;
+        let file = object::File::parse(&*bytes).ok()?;
+        let macho = file.format() == object::BinaryFormat::MachO;
+        let names = file.symbols().filter(|it| it.is_definition()).filter_map(|it| {
+            let name = it.name().ok()?;
+            Some(if macho { name.strip_prefix('_').unwrap_or(name) } else { name }.to_owned())
+        });
+        let names = Arc::new(names.collect::<FxHashSet<_>>());
+        kept.insert(path.to_owned(), (key, names.clone()));
+        Some(names)
+    }
+    #[cfg(not(unix))]
+    {
+        _ = path;
+        None
+    }
+}
+
+/// Has what [`kept_names`] read of the file `before` at `path` be of the file a splice left
+/// there: the same names. What was read of another file, as of a link before, stays of that.
+fn names_spliced(path: &Path, before: Option<(u64, u64)>) {
+    #[cfg(unix)]
+    if let (Some(before), Some(after)) = (before, file_key(path))
+        && let Some((at, _)) = crate::lock(&KEPT_NAMES).get_mut(path)
+        && *at == before
+    {
+        *at = after;
+    }
+    #[cfg(not(unix))]
+    {
+        _ = (path, before);
+    }
+}
+
+/// Whether a patch that defines `defined` has each of `baked`, what the patch the executable
+/// was linked with defined: one it lacks would be as it first was, which the executable no
+/// longer has. A static the patch left behind ([`lasting::left_behind`]) is not one: nothing
+/// refers to the executable's copy any more.
+pub(super) fn has_baked<'a>(
+    baked: &[Box<[u8]>],
+    defined: impl IntoIterator<Item = &'a [u8]>,
+) -> anyhow::Result<()> {
+    let defined: FxHashSet<&[u8]> = defined.into_iter().collect();
+    let left: FxHashSet<Vec<u8>> = defined.iter().filter_map(|it| left_behind(it)).collect();
+    let lacked = baked.iter().find(|it| {
+        !defined.contains(&***it) && !left.contains(&***it) && left_behind(it).is_none()
+    });
+    if let Some(lacked) = lacked {
+        bail!(
+            "{}, of the patch the executable was linked with, is as it first was",
+            String::from_utf8_lossy(lacked)
+        );
+    }
+    Ok(())
 }
 
 /// The `-headerpad` to link the executable at `path` with again for an edit to be spliced into
@@ -656,6 +737,45 @@ pub(crate) fn headerpad_wanted(path: &Path) -> anyhow::Result<Option<(u64, bool)
     commands.resize(HEADER + len, 0);
     file.read_exact(&mut commands[HEADER..])?;
     macho::headerpad_wanted(&commands)
+}
+
+/// The `-headerpad` an Apple executable linked of the objects and archives at `paths` wants for
+/// splices, at most, from their unwind information alone: what its first link is told, which
+/// has no executable of before to go by. `None` when none of them has an AArch64 Mach-O object
+/// with unwind information.
+pub(crate) fn headerpad_of_objects(paths: &[&Path]) -> anyhow::Result<Option<u64>> {
+    let mut unwinding = macho::Unwinding::default();
+    for path in paths {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: the daemon wrote the objects and the archives are the prebuilt standard
+        // library's: nothing writes one while the link that reads it is under way.
+        let bytes = unsafe { memmap2::Mmap::map(&file)? };
+        let read = |unwinding: &mut macho::Unwinding, object: &[u8]| -> anyhow::Result<()> {
+            if object.get(..4) != Some(&object::macho::MH_MAGIC_64.to_le_bytes()) {
+                return Ok(());
+            }
+            let Some([frames, compact]) = macho::unwind_sections(object)? else { return Ok(()) };
+            if let Some((offset, size)) = frames {
+                let at = usize::try_from(offset)?;
+                let section = object
+                    .get(at..at + usize::try_from(size)?)
+                    .context("`__eh_frame` past the end of the object")?;
+                unwinding.add_frames(section)?;
+            }
+            if let Some((_, size)) = compact {
+                unwinding.add_compact(size);
+            }
+            Ok(())
+        };
+        let added = match object::read::archive::ArchiveFile::parse(&*bytes) {
+            Ok(archive) => archive
+                .members()
+                .try_for_each(|member| read(&mut unwinding, member?.data(&*bytes)?)),
+            Err(_) => read(&mut unwinding, &bytes),
+        };
+        added.with_context(|| format!("reading the unwind information of {}", path.display()))?;
+    }
+    Ok(unwinding.headerpad())
 }
 
 /// Why a splice stopped half way: a newer edit wants the executable.
@@ -2065,6 +2185,9 @@ impl<'a> Patch<'a> {
                 None => None,
                 // The executable's is the same static with the same value: it is kept.
                 Some(_) if is_lasting(name) => None,
+                // One that says what a patch left behind is of that patch, which the executable
+                // was linked with, and says nothing of this one's.
+                Some(_) if left_behind(name).is_some() => None,
                 Some(Named::One(old))
                     if whole
                         && old.kind == SymbolKind::Text
@@ -2840,7 +2963,56 @@ fn binary_id(build_id: &[u8]) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
-    use super::{Field, Machine, Writing};
+    use super::{Field, Machine, Writing, has_baked};
+
+    /// A patch has to define all the executable was linked with a patch of, but for a static
+    /// it left behind, under ELF's names and Mach-O's; what said so before is not looked for.
+    #[test]
+    fn a_static_left_behind_is_not_as_it_first_was() {
+        let names = |all: &[&str]| -> Vec<Box<[u8]>> {
+            all.iter().map(|it| it.as_bytes().into()).collect()
+        };
+        let moved = format!("{}ra_jit::static::7", hir_ty_codegen::MOVED_STATIC);
+        let baked = names(&["f", "ra_jit::static::7"]);
+        assert!(has_baked(&baked, [&b"f"[..], moved.as_bytes()]).is_ok());
+        assert!(has_baked(&baked, [&b"f"[..]]).is_err());
+        assert!(has_baked(&baked, [&b"ra_jit::static::7"[..]]).is_err());
+        let baked = names(&["_f", "_ra_jit::static::7"]);
+        assert!(has_baked(&baked, [&b"_f"[..], format!("_{moved}").as_bytes()]).is_ok());
+        assert!(has_baked(&baked, [&b"_f"[..], moved.as_bytes()]).is_err());
+        assert!(has_baked(&names(&["f", &moved]), [&b"f"[..]]).is_ok());
+    }
+
+    /// What was read of the names stays across a splice that writes a new file, as on macOS,
+    /// and not across a link: the splice after a link starts from the file the link wrote.
+    #[cfg(unix)]
+    #[test]
+    fn the_names_read_stay_across_a_splice_and_not_a_link() {
+        use super::{KEPT_NAMES, file_key, kept_names, names_spliced};
+        let dir = std::env::temp_dir().join(format!("ra-jit-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("program");
+        // Each file is kept under another name, so that no inode is used again.
+        let write = |nth: usize| {
+            let new = dir.join(format!("program.{nth}"));
+            std::fs::write(&new, format!("file {nth}")).unwrap();
+            std::fs::hard_link(&new, dir.join(format!("kept.{nth}"))).unwrap();
+            std::fs::rename(&new, &path).unwrap();
+            file_key(&path).unwrap()
+        };
+        let linked = write(0);
+        let names = std::sync::Arc::new(["f".to_owned()].into_iter().collect());
+        crate::lock(&KEPT_NAMES).insert(path.clone(), (linked, std::sync::Arc::clone(&names)));
+        write(1);
+        names_spliced(&path, Some(linked));
+        assert!(std::sync::Arc::ptr_eq(&kept_names(&path).unwrap(), &names));
+        // Linked again, and spliced: read again, and this file is no executable.
+        let linked = write(2);
+        write(3);
+        names_spliced(&path, Some(linked));
+        assert!(kept_names(&path).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// A client starts the program the daemon writes in place once the daemon is through,
     /// not while the file is open for writing, which on Linux is "text file busy".

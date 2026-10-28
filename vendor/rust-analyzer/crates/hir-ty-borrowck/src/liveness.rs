@@ -331,7 +331,7 @@ pub(super) fn region_liveness<'db>(
             next += 1;
         }
     }
-    dropped.sort_by_key(|&local| {
+    dropped.sort_by_cached_key(|&local| {
         (drop_live[local].iter().map(|point| rank[point]).min().unwrap_or(usize::MAX), local)
     });
     let mut components = DropComponents::new(ctx, regions);

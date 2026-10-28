@@ -124,7 +124,7 @@ impl Remote {
             || std::env::var_os("RA_JIT_REMOTE_READONLY").is_some_and(|it| it != "0");
         let object_max = match std::env::var("RA_JIT_REMOTE_MAX") {
             Ok(text) => parse_size(&text)
-                .with_context(|| format!("RA_JIT_REMOTE_MAX=`{text}` is not a size"))?,
+                .with_context(|| format!("BLAZE_REMOTE_MAX=`{text}` is not a size"))?,
             Err(_) => OBJECT_MAX,
         };
         let turns = Turns::of(kept_in, &place.name());
@@ -155,7 +155,7 @@ impl Remote {
     /// An error when this machine is not to write to the remote, saying why.
     pub(crate) fn may_write(&self) -> anyhow::Result<()> {
         if self.read_only {
-            bail!("RA_JIT_REMOTE_READONLY is set: nothing is sent");
+            bail!("BLAZE_REMOTE_READONLY is set: nothing is sent");
         }
         if let Place::Gateway(gateway) = &self.place
             && let Some(why) = gateway.cannot_write()
@@ -914,10 +914,7 @@ async fn lacking(
             eprintln!("remote: the keys of {pack}.pack are not known, so it is fetched: {e:#}");
         }
         let all_here = keys.is_ok_and(|keys| {
-            !keys.is_empty()
-                && keys
-                    .chunks_exact(32)
-                    .all(|key| <&[u8; 32]>::try_from(key).is_ok_and(|key| here.contains(key)))
+            !keys.is_empty() && keys.as_chunks::<32>().0.iter().all(|key| here.contains(key))
         });
         ((pack, listed), all_here)
     }));
@@ -970,7 +967,7 @@ pub(crate) async fn pull(store: &Path, remote: &Remote, project: &str) -> anyhow
         said += &format!(", {here_already} that are in other packs of the store passed over");
     }
     if over != 0 {
-        said += &format!(", {over} left that do not fit under RA_JIT_CACHE_MAX");
+        said += &format!(", {over} left that do not fit under BLAZE_CACHE_MAX");
     }
     if tally.done != 0 {
         said += &keep_under(dir, limit).await?;
@@ -997,7 +994,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
     if verb == "gc" && args.next_if(|it| it == "--remote").is_some() {
         return collect_remote(args);
     }
-    let store = crate::cargo::daemon::store().context("RA_JIT_CACHE says there is no store")?;
+    let store = crate::cargo::daemon::store().context("BLAZE_CACHE says there is no store")?;
     match verb.as_str() {
         "stats" => stats(&store),
         "gc" => collect(&store, args),
@@ -1255,7 +1252,7 @@ impl Shared {
                 eprintln!("remote: {e:#}");
                 note_down(&store, &remote, Some(&e));
                 match required() {
-                    true => Err(e.context("RA_JIT_REMOTE_REQUIRED is set")),
+                    true => Err(e.context("BLAZE_REMOTE_REQUIRED is set")),
                     false => Ok(None),
                 }
             }
@@ -1348,7 +1345,7 @@ impl Shared {
         eprintln!("remote: {e:#}");
         note_down(&self.store, &self.remote.place.name(), Some(&e));
         match required() {
-            true => Err(e.context("RA_JIT_REMOTE_REQUIRED is set")),
+            true => Err(e.context("BLAZE_REMOTE_REQUIRED is set")),
             false => Ok(()),
         }
     }
@@ -1378,7 +1375,7 @@ impl Lazy {
         let held = &Room::of(Some(remote.object_max));
         let fetched = stream::iter(missing.into_iter().map(|(pack, listed)| async move {
             if listed.size > limit {
-                bail!("{pack}.pack is listed as {} bytes, over RA_JIT_CACHE_MAX", listed.size);
+                bail!("{pack}.pack is listed as {} bytes, over BLAZE_CACHE_MAX", listed.size);
             }
             let most = listed.keys_max(remote);
             let keys =
@@ -1409,8 +1406,8 @@ impl Lazy {
     fn add(&mut self, pack: Digest, listed: Listed, keys: &[u8]) {
         let at = self.packs.len() as u32;
         self.packs.push((pack, listed, OnceLock::new()));
-        for key in keys.chunks_exact(32) {
-            self.holder.entry(key.try_into().expect("32 bytes")).or_insert(at);
+        for key in keys.as_chunks::<32>().0 {
+            self.holder.entry(*key).or_insert(at);
         }
     }
 

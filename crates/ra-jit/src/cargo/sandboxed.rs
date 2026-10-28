@@ -1,19 +1,23 @@
-//! Every test executable `cargo ra-jit test` runs, runs in a sandbox ([`crate::sandbox`]), one
-//! sandbox for the whole executable with libtest's threads inside it: the machine's files
-//! read-only, the workspace and the target directory as they are but its writes kept to
-//! itself, empty temporary directories, and no network but its own loopback. The test
-//! harness ra-jit writes marks each test's thread ([`crate::sandbox::MARK`]), so that what
-//! the sandbox records is each test's.
+//! Sandboxed tests are an experiment a workspace opts into: `experimental =
+//! ["sandboxed-tests"]` in its root manifest ([`super::experimental`]), or `tests = true` in
+//! [`TABLE`] of a package's. A test of neither runs outside, as cargo runs it, every time and
+//! never kept in the store ([`super::results`]), for nothing records what it read.
+//!
+//! A test executable that is opted in runs in a sandbox ([`crate::sandbox`]), one sandbox for
+//! the whole executable with libtest's threads inside it: the machine's files read-only, the
+//! workspace and the target directory as they are but its writes kept to itself, empty
+//! temporary directories, and no network but its own loopback. The test harness ra-jit writes
+//! marks each test's thread ([`crate::sandbox::MARK`]), so that what the sandbox records is
+//! each test's.
 //!
 //! Tests are hermetic: a test the sandbox denied something (a write outside its own
 //! directories, an address but loopback) fails, whatever it ended with, and the command says
 //! what was denied and how to take the test out: `[package.metadata.blaze.sandbox]` in its
 //! package's manifest, with `tests = false` for every test of the package or
 //! `unsandboxed-tests` for some, or `RA_JIT_SANDBOX=off` for every test of the command. A
-//! test taken out runs every time and is never kept in the store ([`super::results`]). Where
-//! no sandbox can be made the command stops before any test runs, and says why: a run that
-//! went on outside would break, unseen, the promise that a test can't change the machine or
-//! reach the network.
+//! test taken out runs every time and is never kept. Where no sandbox can be made the command
+//! stops before any test runs, and says why: a run that went on outside would break, unseen,
+//! the promise that a test can't change the machine or reach the network.
 //!
 //! Under `RA_JIT_TESTS=affected` the sandbox also records what each test that reaches the
 //! world outside its code read, which is part of the key its pass is kept under. What a thread
@@ -30,10 +34,14 @@ use anyhow::Context as _;
 use sha2::{Digest as _, Sha256};
 
 use super::{
+    experimental::{self, Experiments},
     say,
     state::{Program, State},
 };
-use crate::sandbox::{self, Line, Reached, Spec};
+use crate::{
+    content::hex,
+    sandbox::{self, Line, Reached, Spec},
+};
 
 pub(crate) const VAR: &str = sandbox::VAR;
 
@@ -64,11 +72,12 @@ pub(crate) const KEPT: &[&str] = &[
     "RUST_MIN_STACK",
 ];
 
-/// The table of a package's manifest that takes its tests out of the sandbox.
+/// The table of a package's manifest that takes its tests into the sandbox or out of it.
 pub(crate) const TABLE: &str = "[package.metadata.blaze.sandbox]";
 
-/// Whether this command runs its tests sandboxed: unless `RA_JIT_SANDBOX` (or `BLAZE_SANDBOX`)
-/// is `off`, as [`sandbox::on`] decides for build scripts and proc macros too.
+/// Whether this command may run tests sandboxed, those that are opted in: unless
+/// `RA_JIT_SANDBOX` (or `BLAZE_SANDBOX`) is `off`, as [`sandbox::on`] decides for build
+/// scripts and proc macros too.
 pub(crate) fn on() -> bool {
     sandbox::on()
 }
@@ -79,11 +88,33 @@ pub(crate) struct OptOut {
     pub(crate) manifest: PathBuf,
     /// `tests = false`: every test of the package runs outside.
     pub(crate) all: bool,
+    /// `tests = true`: every test of the package runs sandboxed, but those `unsandboxed-tests`
+    /// names, whether or not its workspace opts in.
+    pub(crate) opted_in: bool,
     /// `unsandboxed-tests`: the tests, by libtest's names, that run outside.
     pub(crate) tests: BTreeSet<String>,
     /// `build-script = false`: its build script runs outside, when the package is a member of
     /// the workspace being built (a dependency can't take itself out).
     pub(crate) build_script_outside: bool,
+    /// What the root manifest of the package's workspace opts into; nothing in what
+    /// [`opt_out`] reads.
+    pub(crate) experiments: Experiments,
+}
+
+impl OptOut {
+    /// Whether the package's tests run sandboxed, when the command runs any so ([`on`]).
+    pub(crate) fn sandboxed(&self) -> bool {
+        !self.all && (self.opted_in || self.experiments.has(experimental::SANDBOXED_TESTS))
+    }
+}
+
+/// What the manifest of the package in `package_dir` and the root manifest of its workspace
+/// say of its tests and the sandbox.
+pub(crate) fn of_tests(package_dir: &Path) -> anyhow::Result<OptOut> {
+    let mut out = opt_out(package_dir)?;
+    let root = workspace_root(package_dir)?.unwrap_or_else(|| package_dir.to_owned());
+    out.experiments = experimental::of(&root)?;
+    Ok(out)
 }
 
 /// What the manifest of the package in `package_dir` says of its tests and the sandbox. A
@@ -103,7 +134,8 @@ pub(crate) fn opt_out(package_dir: &Path) -> anyhow::Result<OptOut> {
     for (key, value) in table {
         match key.as_str() {
             "tests" => {
-                out.all = !value.as_bool().ok_or_else(|| wrong("`tests` is true or false"))?
+                let tests = value.as_bool().ok_or_else(|| wrong("`tests` is true or false"))?;
+                (out.all, out.opted_in) = (!tests, tests);
             }
             "unsandboxed-tests" => {
                 let names =
@@ -266,8 +298,7 @@ pub(crate) fn identity_of(env: &[(String, String)]) -> String {
         hash.update(value.as_bytes());
         hash.update([0]);
     }
-    let hex: String = hash.finalize().iter().take(8).map(|it| format!("{it:02x}")).collect();
-    format!("~{hex}")
+    format!("~{}", hex(&hash.finalize()[..8]))
 }
 
 /// The target directory `executable` is in: the nearest directory above it that cargo marked
@@ -356,7 +387,7 @@ pub(crate) struct Sandbox {
 impl Sandbox {
     /// The command that runs `program` in it.
     pub(crate) fn command(&self, program: &Path) -> anyhow::Result<Command> {
-        let mut command = Command::new(std::env::current_exe().context("finding ra-jit itself")?);
+        let mut command = Command::new(std::env::current_exe().context("finding blaze itself")?);
         command.arg(sandbox::COMMAND).arg(&self.spec_file).arg("--").arg(program);
         Ok(command)
     }
@@ -389,7 +420,7 @@ pub(crate) fn denied(lines: &[Line], shown: &str, opt_out: &OptOut) -> Denied {
     let ways = |names: &str| {
         format!(
             "`unsandboxed-tests = [{names}]` under `{TABLE}` in {manifest} (`tests = false` for \
-             every test of the package), or `{VAR}=off` for every test of the command"
+             every test of the package), or `BLAZE_SANDBOX=off` for every test of the command"
         )
     };
     let mut denied = Denied { tests: BTreeSet::new(), unknown: false };
@@ -483,7 +514,7 @@ pub(crate) fn digest(path: &Path) -> String {
     } else {
         hash.update(b"o");
     }
-    hash.finalize().iter().take(16).map(|it| format!("{it:02x}")).collect()
+    hex(&hash.finalize()[..16])
 }
 
 #[cfg(test)]
@@ -528,6 +559,39 @@ mod tests {
         assert!(opt_out(&dir).is_err());
         write("[package]\nname = \"a\"\n[package.metadata.blaze.sandbox]\nbuild-script = false\n");
         assert!(opt_out(&dir).unwrap().build_script_outside);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_package_or_its_workspace_opts_its_tests_into_the_sandbox() {
+        let dir = std::env::temp_dir().join(format!("ra-jit-opt-in-{}", std::process::id()));
+        let member = dir.join("member");
+        std::fs::create_dir_all(&member).unwrap();
+        let root = |text: &str| std::fs::write(dir.join("Cargo.toml"), text).unwrap();
+        let package = |text: &str| {
+            std::fs::write(member.join("Cargo.toml"), format!("[package]\nname = \"m\"\n{text}"))
+                .unwrap()
+        };
+        root("[workspace]\nmembers = [\"member\"]\n");
+        package("");
+        let out = of_tests(&member).unwrap();
+        assert!(!out.sandboxed() && out.experiments.manifest == dir.join("Cargo.toml"));
+        package("[package.metadata.blaze.sandbox]\ntests = true\n");
+        assert!(of_tests(&member).unwrap().sandboxed());
+        package("[package.metadata.blaze.sandbox]\nunsandboxed-tests = [\"tests::x\"]\n");
+        assert!(!of_tests(&member).unwrap().sandboxed());
+        root(
+            "[workspace]\nmembers = [\"member\"]\n\
+             [workspace.metadata.blaze]\nexperimental = [\"sandboxed-tests\"]\n",
+        );
+        let out = of_tests(&member).unwrap();
+        assert!(out.sandboxed() && out.tests.contains("tests::x"));
+        package("[package.metadata.blaze.sandbox]\ntests = false\n");
+        assert!(!of_tests(&member).unwrap().sandboxed());
+        root(
+            "[workspace]\nmembers = [\"member\"]\n[workspace.metadata.blaze]\nexperimental = [\"x\"]\n",
+        );
+        assert!(of_tests(&member).is_err());
         _ = std::fs::remove_dir_all(&dir);
     }
 

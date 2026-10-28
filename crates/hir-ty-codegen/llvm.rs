@@ -827,7 +827,7 @@ const INLINE_THRESHOLD: u32 = 500;
 /// key has it, as code inlined at another threshold is other code.
 pub(super) fn inline_threshold() -> u32 {
     std::env::var("RA_JIT_LLVM_INLINE_THRESHOLD").map_or(INLINE_THRESHOLD, |it| {
-        it.parse().unwrap_or_else(|_| panic!("RA_JIT_LLVM_INLINE_THRESHOLD={it} is not a number"))
+        it.parse().unwrap_or_else(|_| panic!("BLAZE_LLVM_INLINE_THRESHOLD={it} is not a number"))
     })
 }
 

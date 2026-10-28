@@ -332,7 +332,7 @@ impl Asked {
         add(&[u8::from(links)]);
         add(source.as_bytes());
         let digest = hasher.finalize();
-        digest[..16].iter().map(|it| format!("{it:02x}")).collect()
+        crate::content::hex(&digest[..16])
     }
 
     /// The path of `file` as rustdoc shows it: from the directory it runs in.
@@ -453,7 +453,7 @@ impl Replay {
         let Some(first) = Recorded::all_in(&self.dir)?.into_iter().next() else {
             return Ok(None);
         };
-        let ra_jit = std::env::current_exe().context("finding ra-jit itself")?;
+        let ra_jit = std::env::current_exe().context("finding blaze itself")?;
         let mut ra_jit = in_place(as_asked(ra_jit), &first.cwd, &first.env);
         ra_jit.arg(REPLAY).arg(serde_json::to_string(self)?);
         Ok(Some(ra_jit))
@@ -1138,7 +1138,7 @@ fn built_from(db: &RootDatabase, library: ide_db::base_db::Crate) -> String {
                     hasher.update(hash);
                 }
             }
-            hasher.finalize().iter().map(|it| format!("{it:02x}")).collect()
+            crate::content::hex(&hasher.finalize())
         })
         .collect();
     crates.sort_unstable();

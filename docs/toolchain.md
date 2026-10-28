@@ -25,7 +25,8 @@ the standard library is part of a compiler.
 - **Name:** `blaze-<date>` (`blaze-2026-10-27`), after the date of the Rust nightly it is built
   from (`harness/toolchain`, `nightly-2026-10-27`). `blaze toolchain` prints it and where it
   is; `blaze toolchain --path` prints the directory alone.
-- **Bytes:** the upstream nightly's `rustc`, `cargo`, `rust-std` and `rust-src`, unchanged, from
+- **Bytes:** the upstream nightly's `rustc`, `cargo`, `rust-std` (the host's, and `wasm32-wasip1`'s,
+  which proc macros are built for) and `rust-src`, unchanged, from
   static.rust-lang.org, each checked against the sha256 compiled into blaze
   (`crates/ra-jit/src/cargo/toolchain/pins.txt`, `harness/toolchain_pins.py`). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.

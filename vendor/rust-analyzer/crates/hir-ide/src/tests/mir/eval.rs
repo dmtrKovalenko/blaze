@@ -1115,6 +1115,40 @@ fn main<'a, T: Foo + Bar + Baz>(
 }
 
 #[test]
+fn derive_from() {
+    // Nightly's `#[derive(From)]` (#600): `From` of the one field's type, for a tuple struct, a
+    // struct with a named field, and a generic one.
+    check_pass(
+        r#"
+//- minicore: derive_from, from, sized
+use core::from::From;
+
+#[derive(From)]
+struct Meters(u32);
+
+#[derive(From)]
+struct Named { inner: i64 }
+
+#[derive(From)]
+struct Pair<T>((T, T));
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+fn main() {
+    let meters: Meters = 5u32.into();
+    let named = Named::from(-7);
+    let pair: Pair<u8> = (1, 2).into();
+    if meters.0 != 5 || named.inner != -7 || (pair.0).0 != 1 || (pair.0).1 != 2 {
+        should_not_reach();
+    }
+}
+"#,
+    );
+}
+
+#[test]
 fn statement_macro_in_the_parentheses_of_another() {
     // rustc parses `twice!(n += 1;)` with no `;` after it as an expression, so the outer
     // call's expansion, two calls with nothing between, does not parse (#154).

@@ -198,6 +198,7 @@ fn sync(
             platform: None,
             offline: read.has("--offline") || read.has("--frozen"),
             store: None,
+            rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let packages =
             blaze_metadata::vendored(&asked, read.has("--respect-source-config"), locked)

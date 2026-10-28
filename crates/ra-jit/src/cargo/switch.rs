@@ -91,7 +91,7 @@ pub(crate) fn enable() -> anyhow::Result<i32> {
     let wrapper = wrapper_path()?;
     anyhow::ensure!(
         wrapper.exists(),
-        "{} is not installed next to ra-jit; plain cargo is not changed",
+        "{} is not installed next to blaze; plain cargo is not changed",
         wrapper.display()
     );
     let home = cargo_home().context("no CARGO_HOME or HOME")?;

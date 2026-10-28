@@ -180,6 +180,31 @@ fn main() {
 }
 
 #[test]
+fn method_call_on_rpit_of_recursive_call() {
+    check_types(
+        r#"
+//- minicore: iterator, result
+struct Once(u32);
+impl Iterator for Once {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> { loop {} }
+}
+
+fn doubled(depth: u32) -> Result<impl Iterator<Item = u32>, ()> {
+    match doubled(depth - 1) {
+        Ok(mut values) => {
+            let first = values.next();
+              //^^^^^ Option<u32>
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(Once(depth * 2))
+}
+"#,
+    );
+}
+
+#[test]
 fn regression_21455() {
     check_infer(
         r#"

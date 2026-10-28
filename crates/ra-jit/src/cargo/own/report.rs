@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal as _, Write as _};
-use std::path::PathBuf;
 
 use anyhow::Context as _;
 use blaze_manifest::metadata::root_manifest;
@@ -140,7 +139,7 @@ fn future_incompatibilities(read: &Read) -> anyhow::Result<i32> {
     let ctx = Context::new(config("report", read)?);
     let root = root_manifest(None, &ctx)?;
     let ws = Workspace::new(&root, &ctx)?;
-    let path = PathBuf::from(ws.build_dir()).join(FILE);
+    let path = ws.build_dir().join(FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

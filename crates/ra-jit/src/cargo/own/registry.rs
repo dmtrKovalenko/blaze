@@ -1,17 +1,17 @@
 //! `cargo search`, `owner`, `yank`, `login` and `logout`: a registry's web API asked with
-//! blaze-registry's client, and its token kept as cargo's `cargo:token` provider keeps it, as
-//! cargo 1.99.0's `commands/{search,owner,yank,login,logout}.rs`, `ops/registry` and
-//! `util/auth` do. A credential provider other than `cargo:token` is refused: blaze runs none.
+//! blaze-registry's client, with the token its credential providers give
+//! (`blaze_registry::auth`), as cargo 1.99.0's `commands/{search,owner,yank,login,logout}.rs`
+//! and `ops/registry` do.
 
-use std::fmt;
 use std::io::IsTerminal as _;
+use std::sync::Arc;
 
 use anyhow::{Context as _, anyhow, bail};
-use blaze_manifest::config::{OptValue, PathAndArgs, Value};
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::{Config, Context, Workspace};
-use blaze_registry::SourceId;
-use blaze_registry::api::{Api, check_token};
+use blaze_registry::api::Api;
+use blaze_registry::auth::{Auth, AuthorizationError, Named, Operation, Shell};
+use blaze_resolve::{CRATES_IO_REGISTRY, SourceId};
 
 use super::super::say;
 use super::args::{Args, Read, switch, valued};
@@ -283,24 +283,19 @@ struct Target {
 }
 
 impl Target {
-    /// cargo's `display_registry_name`.
-    fn shown(&self) -> String {
-        match &self.name {
-            Some(name) => name.clone(),
-            None => self.original.url().to_string(),
-        }
+    fn named(&self) -> Named<'_> {
+        Named { source: &self.original, name: self.name.as_deref() }
     }
 
-    /// cargo's `SourceId` as it says it: "registry `<name>`".
     fn described(&self) -> String {
-        format!("registry `{}`", self.shown())
+        self.named().described()
     }
 
     /// cargo's `display_index`.
     fn index(&self) -> String {
         match self.original.is_crates_io() {
             true => "crates.io index".to_owned(),
-            false => format!("`{}` index", self.shown()),
+            false => format!("`{}` index", self.named().shown()),
         }
     }
 }
@@ -308,23 +303,20 @@ impl Target {
 /// cargo's `get_source_id`: the registry named, with only crates.io's own replacement (its
 /// sparse index); with none named, a `[source]` replacing crates.io is an error.
 fn target(ctx: &Context, asked: Option<&RegistryOrIndex>) -> anyhow::Result<Target> {
-    let crates_io =
-        || (SourceId::crates_io_git(), Some(blaze_registry::CRATES_IO_REGISTRY.to_owned()));
+    let crates_io = || (SourceId::crates_io(), Some(CRATES_IO_REGISTRY.to_owned()));
     let (original, name) = match asked {
         None => crates_io(),
-        Some(RegistryOrIndex::Index(url)) => (SourceId::for_registry(url)?, None),
-        Some(RegistryOrIndex::Registry(name)) if name == blaze_registry::CRATES_IO_REGISTRY => {
-            crates_io()
-        }
+        Some(RegistryOrIndex::Index(url)) => (blaze_registry::registry_source(url)?, None),
+        Some(RegistryOrIndex::Registry(name)) if name == CRATES_IO_REGISTRY => crates_io(),
         Some(RegistryOrIndex::Registry(name)) => {
             let index = ctx.config.registry_index(name)?;
-            (SourceId::for_registry(index.as_str())?, Some(name.clone()))
+            (SourceId::for_alt_registry(&index, name)?, Some(name.clone()))
         }
     };
     let builtin =
-        blaze_metadata::registry_sources(ctx, false)?.map().replacement(&original, false)?;
+        blaze_metadata::registry_sources(ctx, false, None)?.map().replacement(original)?;
     let replaced =
-        blaze_metadata::registry_sources(ctx, true)?.map().replacement(&original, false)?;
+        blaze_metadata::registry_sources(ctx, true, None)?.map().replacement(original)?;
     if asked.is_none() && replaced != builtin {
         let shown = match replaced_by(&ctx.config)? {
             Some((name, true)) => bail!(
@@ -343,7 +335,7 @@ fn target(ctx: &Context, asked: Option<&RegistryOrIndex>) -> anyhow::Result<Targ
 /// The last name of crates.io's chain of `replace-with`, and whether it is a `[registries]`
 /// name rather than a `[source]` one: cargo names a replacement by it.
 fn replaced_by(config: &Config) -> anyhow::Result<Option<(String, bool)>> {
-    let mut name = blaze_registry::CRATES_IO_REGISTRY.to_owned();
+    let mut name = CRATES_IO_REGISTRY.to_owned();
     let mut last = None;
     while let Some(with) = config.get_string(&format!("source.{name}.replace-with"))? {
         name = with.val;
@@ -352,45 +344,18 @@ fn replaced_by(config: &Config) -> anyhow::Result<Option<(String, bool)>> {
             is_source |= config.get_string(&format!("source.{name}.{key}"))?.is_some();
         }
         last = Some((name.clone(), !is_source));
-        if !is_source
-            || last.as_ref().is_some_and(|(it, _)| it == blaze_registry::CRATES_IO_REGISTRY)
-        {
+        if !is_source || last.as_ref().is_some_and(|(it, _)| it == CRATES_IO_REGISTRY) {
             break;
         }
     }
     Ok(last)
 }
 
-/// The `[registries.<name>]` whose index is `id`'s.
-fn registry_named(config: &Config, id: &SourceId) -> anyhow::Result<Option<String>> {
-    #[derive(serde::Deserialize)]
-    struct Index {
-        index: Option<String>,
-    }
-    let registries = config
-        .get::<Option<std::collections::BTreeMap<String, Index>>>("registries")
-        .ok()
-        .flatten();
-    Ok(registries.into_iter().flatten().find_map(|(name, it)| {
-        let it = SourceId::for_registry(it.index.as_deref()?).ok()?;
-        (it.canonical_url() == id.canonical_url()).then_some(name)
-    }))
-}
-
-/// What a command does with the registry, for the token it needs.
-#[derive(Clone, Copy, PartialEq)]
-enum Operation {
-    /// A search: a token only when the registry wants one for everything.
-    Read,
-    /// Owners, yanks: a token always.
-    Write,
-}
-
-/// The run's flags every command reads.
+/// The run's flags every command reads, and its credentials.
 struct Run {
     ctx: Context,
+    auth: Arc<Auth>,
     quiet: bool,
-    verbose: bool,
 }
 
 impl Run {
@@ -411,6 +376,34 @@ impl Run {
     }
 }
 
+/// What the credential providers say, through cargo's shell.
+struct Said {
+    quiet: bool,
+    verbose: bool,
+}
+
+impl Shell for Said {
+    fn warn(&self, text: &str) {
+        if !self.quiet {
+            say::warning(text);
+        }
+    }
+
+    fn note(&self, text: &str) {
+        if !self.quiet {
+            say::shell_note(text);
+        }
+    }
+
+    fn status(&self, word: &str, text: &str) {
+        say::status(self.quiet, word, text);
+    }
+
+    fn verbose(&self) -> bool {
+        self.verbose
+    }
+}
+
 /// cargo's `ops::registry::registry`: the registry's `config.json` (asked again when
 /// `force_update`), its API, and the token `operation` needs.
 fn registry(
@@ -419,14 +412,17 @@ fn registry(
     from_command_line: Option<&str>,
     asked: Option<&RegistryOrIndex>,
     force_update: bool,
-    operation: Option<Operation>,
+    operation: Option<Operation<'_>>,
 ) -> anyhow::Result<Api> {
     let is_index = matches!(asked, Some(RegistryOrIndex::Index(_)));
     if is_index && operation.is_some() && from_command_line.is_none() {
         bail!("command-line argument --index requires --token to be specified");
     }
-    let sources = blaze_metadata::registry_sources(&run.ctx, false)?;
-    let registry = sources.registry(&target.replacement)?;
+    if let Some(token) = from_command_line {
+        run.auth.keep_command_line_token(&target.original, token);
+    }
+    let sources = blaze_metadata::registry_sources(&run.ctx, false, Some(run.auth.clone()))?;
+    let registry = sources.registry(target.replacement)?;
     if force_update {
         registry.invalidate();
     }
@@ -441,261 +437,14 @@ fn registry(
         bail!("{} does not support API commands", target.described());
     };
     let token = match operation.is_some() || config.auth_required {
-        true => Some(token(run, target, from_command_line)?),
+        true => {
+            let operation = operation.unwrap_or(Operation::Read);
+            Some(run.auth.token(target.named(), None, operation, &[], false)?)
+        }
         false => None,
     };
     let http = blaze_registry::http::HyperHttp::shared()?;
     Ok(Api::new(api, token, http, config.auth_required))
-}
-
-/// A registry's credentials as `[registry]` (crates.io) or `[registries.<name>]` has them,
-/// with `credentials.toml` and the variables over the files.
-struct Credentials {
-    token: OptValue<String>,
-    provider: Option<PathAndArgs>,
-}
-
-/// cargo's `registry_credential_config_raw`: the table of the registry's name, the name
-/// found by its index URL among `CARGO_REGISTRIES_<NAME>_INDEX` and then `[registries]`.
-fn credentials(run: &Run, target: &Target) -> anyhow::Result<Option<Credentials>> {
-    let config = &run.ctx.config;
-    config.load_credentials()?;
-    for warning in config.take_warnings() {
-        run.warn(&warning);
-    }
-    if !target.original.is_remote_registry() {
-        bail!(
-            "{} does not support API commands.\nCheck for a source-replacement in .cargo/config.",
-            target.described()
-        );
-    }
-    let table = if target.original.is_crates_io() {
-        config.check_registry_index_not_set()?;
-        "registry".to_owned()
-    } else {
-        let index = target.original.canonical_url();
-        let mut names: Vec<String> = config
-            .env_vars()
-            .filter_map(|(k, v)| {
-                Some((k.strip_prefix("CARGO_REGISTRIES_")?.strip_suffix("_INDEX")?, v))
-            })
-            .filter(|(_, v)| SourceId::for_registry(v).is_ok_and(|it| it.canonical_url() == index))
-            .map(|(k, _)| k.to_lowercase())
-            .collect();
-        if names.is_empty() {
-            names.extend(registry_named(config, &target.original)?);
-        }
-        names.sort();
-        let name = match names.len() {
-            0 => return Ok(None),
-            1 => names.pop().expect("one"),
-            _ => bail!(
-                "multiple registries are configured with the same index url '{}': {}",
-                target.original.url(),
-                names.join(", ")
-            ),
-        };
-        if Some(&name) != target.name.as_ref() {
-            run.note(&format!(
-                "name of alternative registry `{}` set to `{name}`",
-                target.original.url()
-            ));
-        }
-        format!("registries.{name}")
-    };
-    let token = config.get::<OptValue<String>>(&format!("{table}.token"))?;
-    let provider = config.get::<Option<PathAndArgs>>(&format!("{table}.credential-provider"))?;
-    Ok(Some(Credentials { token, provider }))
-}
-
-const TOKEN: &str = "cargo:token";
-
-/// cargo's `credential_provider`: the providers to ask in turn, each a program and its
-/// arguments, with cargo's warnings of a token that none of them reads.
-fn providers(
-    run: &Run,
-    target: &Target,
-    found: Option<&Credentials>,
-    warn: bool,
-) -> anyhow::Result<Vec<Vec<String>>> {
-    let config = &run.ctx.config;
-    let resolve = |it: PathAndArgs| -> anyhow::Result<Vec<String>> {
-        let name = it.path.raw_value().to_owned();
-        if it.args.is_empty()
-            && let Some(alias) =
-                config.get::<Option<PathAndArgs>>(&format!("credential-alias.{name}"))?
-            && !BUILT_IN.contains(&name.as_str())
-        {
-            let program = alias.path.resolve_program(config.cwd()).display().to_string();
-            return Ok(std::iter::once(program).chain(alias.args).collect());
-        }
-        let program = it.path.resolve_program(config.cwd()).display().to_string();
-        Ok(std::iter::once(program).chain(it.args).collect())
-    };
-    let global =
-        config.get::<Option<Vec<Value<String>>>>("registry.global-credential-providers")?;
-    let providers: Vec<Vec<String>> = match global.filter(|it| !it.is_empty()) {
-        Some(list) => list
-            .iter()
-            .rev()
-            .map(|it| resolve(PathAndArgs::from_whitespace_separated_string(it)))
-            .collect::<anyhow::Result<_>>()?,
-        None => vec![vec![TOKEN.to_owned()]],
-    };
-    let Some(found) = found else { return Ok(providers) };
-    if let Some(provider) = &found.provider {
-        let provider = resolve(provider.clone())?;
-        if let Some(token) = &found.token
-            && provider[0] != TOKEN
-            && warn
-        {
-            run.warn(&format!(
-                "{} has a token configured in {} that will be ignored because this registry is \
-                 configured to use credential-provider `{}`",
-                target.described(),
-                token.definition,
-                provider[0]
-            ));
-        }
-        return Ok(vec![provider]);
-    }
-    if let Some(token) = &found.token
-        && !providers.iter().any(|it| it[0] == TOKEN)
-        && warn
-    {
-        run.warn(&format!(
-            "{} has a token configured in {} that will be ignored because the `cargo:token` \
-             credential provider is not listed in `registry.global-credential-providers`",
-            target.described(),
-            token.definition
-        ));
-    }
-    Ok(providers)
-}
-
-/// cargo's built-in providers, which an alias cannot shadow.
-const BUILT_IN: &[&str] = &[
-    "cargo:token",
-    "cargo:paseto",
-    "cargo:token-from-stdout",
-    "cargo:wincred",
-    "cargo:macos-keychain",
-    "cargo:libsecret",
-];
-
-/// What the providers are asked, as cargo's `Action`.
-enum Action<'a> {
-    Get,
-    Login { token: Option<String>, login_url: Option<&'a str> },
-    Logout,
-}
-
-impl fmt::Display for Action<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Action::Get => "get",
-            Action::Login { .. } => "login",
-            Action::Logout => "logout",
-        })
-    }
-}
-
-/// What a provider answered.
-enum Answer {
-    /// It has no token: none to give, or none to remove.
-    NotFound,
-    Token(String),
-    Done,
-}
-
-/// cargo's `credential_action` with `cargo:token` the only provider blaze runs.
-fn credential_action(run: &Run, target: &Target, action: Action<'_>) -> anyhow::Result<Answer> {
-    let found = credentials(run, target)?;
-    let providers = providers(run, target, found.as_ref(), true)?;
-    let mut not_found = false;
-    for provider in providers {
-        if run.verbose {
-            run.status(
-                "Credential",
-                &format!("{} {action} {}", provider.join(" "), target.shown()),
-            );
-        }
-        if provider[0] != TOKEN {
-            bail!(
-                "credential provider `{}` is not one blaze runs: blaze keeps tokens only as \
-                 `cargo:token` does, in its configuration and `credentials.toml`",
-                provider.join(" ")
-            );
-        }
-        let previous = found.as_ref().and_then(|it| it.token.as_ref()).map(|it| it.val.clone());
-        let done = cargo_token(run, target, &action, previous).with_context(|| {
-            format!("credential provider `{}` failed action `{action}`", provider.join(" "))
-        })?;
-        match done {
-            Answer::NotFound => not_found = true,
-            answer => return Ok(answer),
-        }
-    }
-    match not_found {
-        true => Ok(Answer::NotFound),
-        false => bail!("no credential providers could handle the request"),
-    }
-}
-
-/// cargo's `TokenCredential`.
-fn cargo_token(
-    run: &Run,
-    target: &Target,
-    action: &Action<'_>,
-    previous: Option<String>,
-) -> anyhow::Result<Answer> {
-    let alternative = (!target.original.is_crates_io()).then(|| target.name.as_deref()).flatten();
-    let name = target.shown();
-    match action {
-        Action::Get => Ok(previous.map_or(Answer::NotFound, Answer::Token)),
-        Action::Login { token, login_url } => {
-            let token = match token {
-                Some(token) => token.clone(),
-                None => {
-                    match (login_url, &target.name) {
-                        (Some(url), _) => eprintln!("please paste the token found on {url} below"),
-                        (None, Some(name)) => eprintln!("please paste the token for {name} below"),
-                        (None, None) => {
-                            eprintln!("please paste the token for {} below", target.original.url())
-                        }
-                    }
-                    read_line()?
-                }
-            };
-            let token = token.replace("cargo login", "").trim().to_owned();
-            check_token(&token)?;
-            if !target.original.is_crates_io() && alternative.is_none() {
-                bail!("can't save credentials for anonymous registry");
-            }
-            run.ctx.config.save_credentials(Some(&token), alternative)?;
-            run.status("Login", &format!("token for `{name}` saved"));
-            Ok(Answer::Done)
-        }
-        Action::Logout => {
-            if previous.is_none() {
-                return Ok(Answer::NotFound);
-            }
-            run.ctx.config.save_credentials(None, alternative)?;
-            run.status(
-                "Logout",
-                &format!("token for `{name}` has been removed from local storage"),
-            );
-            let location = match target.original.is_crates_io() {
-                true => "<https://crates.io/me>".to_owned(),
-                false => format!("the `{name}` website"),
-            };
-            eprintln!(
-                "note: This does not revoke the token on the registry server.\n    If you need to \
-                 revoke the token, visit {location} and follow the instructions there."
-            );
-            Ok(Answer::Done)
-        }
-    }
 }
 
 fn read_line() -> anyhow::Result<String> {
@@ -704,86 +453,12 @@ fn read_line() -> anyhow::Result<String> {
     Ok(line.trim().to_owned())
 }
 
-/// cargo's `auth_token`: the token given on the command line, else the providers'.
-fn token(run: &Run, target: &Target, from_command_line: Option<&str>) -> anyhow::Result<String> {
-    if let Some(token) = from_command_line {
-        return Ok(token.to_owned());
-    }
-    match credential_action(run, target, Action::Get)? {
-        Answer::Token(token) => Ok(token),
-        _ => Err(AuthorizationError::new(run, target)?.into()),
-    }
-}
-
-/// A registry that wants a token there is none of, as cargo says it.
-#[derive(Debug)]
-struct AuthorizationError {
-    crates_io: bool,
-    /// `--registry`'s name: none for `--index`.
-    name: Option<String>,
-    url: String,
-    default_registry: bool,
-    /// Whether `cargo:token` is among the providers, so that `cargo login` would help.
-    cargo_token: bool,
-}
-
-impl AuthorizationError {
-    fn new(run: &Run, target: &Target) -> anyhow::Result<AuthorizationError> {
-        let found = credentials(run, target)?;
-        let providers = providers(run, target, found.as_ref(), false)?;
-        Ok(AuthorizationError {
-            crates_io: target.original.is_crates_io(),
-            name: target.name.clone(),
-            url: target.original.url().to_string(),
-            default_registry: run.ctx.config.default_registry()?.is_some(),
-            cargo_token: providers.iter().any(|it| it[0] == TOKEN),
-        })
-    }
-}
-
-impl std::error::Error for AuthorizationError {}
-
-impl fmt::Display for AuthorizationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.crates_io {
-            let args = if self.default_registry { " --registry crates-io" } else { "" };
-            write!(f, "no token found, please run `cargo login{args}`")?;
-            if self.cargo_token {
-                write!(f, "\nor use environment variable CARGO_REGISTRY_TOKEN")?;
-            }
-            Ok(())
-        } else if let Some(name) = &self.name {
-            write!(f, "no token found for `{name}`")?;
-            match self.cargo_token {
-                true => write!(
-                    f,
-                    ", please run `cargo login --registry {name}`\nor use environment variable {}",
-                    blaze_manifest::config::env_key(&format!("registries.{name}.token"))
-                ),
-                false => {
-                    write!(f, "\nYou may need to log in using this registry's credential provider")
-                }
-            }
-        } else {
-            write!(
-                f,
-                "no token found for `{url}`\nconsider setting up an alternate registry in Cargo's \
-                 configuration\nas described by \
-                 https://doc.rust-lang.org/cargo/reference/registries.html\n\n[registries]\n\
-                 my-registry = {{ index = \"{url}\" }}\n",
-                url = self.url
-            )
-        }
-    }
-}
-
 /// The run of one command, its `--config`s merged.
 fn start(name: &str, read: &Read) -> anyhow::Result<Run> {
-    Ok(Run {
-        ctx: Context::new(config(name, read)?),
-        quiet: read.has("--quiet"),
-        verbose: read.has("--verbose"),
-    })
+    let ctx = Context::new(config(name, read)?);
+    let (quiet, verbose) = (read.has("--quiet"), read.has("--verbose"));
+    let auth = Arc::new(Auth::new(ctx.config.reload()?, Box::new(Said { quiet, verbose })));
+    Ok(Run { ctx, auth, quiet })
 }
 
 fn ended(done: anyhow::Result<()>) -> anyhow::Result<i32> {
@@ -866,7 +541,7 @@ fn searched(
     } else if total > limit && limit >= 100 {
         let extra = match target.original.is_crates_io() {
             true => {
-                let url = url::Url::parse_with_params("https://crates.io/search", &[("q", query)])?;
+                let url = url::Url::parse_with_params("https://crates.io/search", [("q", query)])?;
                 format!(" (go to {url} to see more)")
             }
             false => String::new(),
@@ -940,7 +615,7 @@ pub(super) fn owner(typed: &[String]) -> anyhow::Result<i32> {
             token.as_deref(),
             asked.as_ref(),
             true,
-            Some(Operation::Write),
+            Some(Operation::Owners { name: &name }),
         )?;
         let host = api.host().to_owned();
         let to_add = read.values("--add");
@@ -1005,14 +680,11 @@ pub(super) fn yank(typed: &[String]) -> anyhow::Result<i32> {
         };
         let target = target(&run.ctx, asked.as_ref())?;
         let token = read.value("--token");
-        let api = registry(
-            &run,
-            &target,
-            token.as_deref(),
-            asked.as_ref(),
-            true,
-            Some(Operation::Write),
-        )?;
+        let operation = match read.has("--undo") {
+            true => Operation::Unyank { name: &name, vers: &version },
+            false => Operation::Yank { name: &name, vers: &version },
+        };
+        let api = registry(&run, &target, token.as_deref(), asked.as_ref(), true, Some(operation))?;
         let spec = format!("{name}@{version}");
         if read.has("--undo") {
             run.status("Unyank", &spec);
@@ -1064,7 +736,7 @@ fn resolve_crate(
 /// one word given).
 pub(super) fn login(typed: &[String]) -> anyhow::Result<i32> {
     let flags = [valued(&["--registry"])];
-    let (before, _provider_args) = match typed.iter().position(|it| it == "--") {
+    let (before, provider_args) = match typed.iter().position(|it| it == "--") {
         Some(at) => (&typed[..at], &typed[at + 1..]),
         None => (typed, &typed[typed.len()..]),
     };
@@ -1094,8 +766,10 @@ pub(super) fn login(typed: &[String]) -> anyhow::Result<i32> {
             None,
         ) {
             Ok(api) => Some(format!("{}/me", api.host())),
-            Err(err) if err.is::<AuthorizationError>() => None,
-            Err(err) => return Err(err),
+            Err(err) => match err.downcast::<AuthorizationError>() {
+                Ok(err) => err.login_url,
+                Err(err) => return Err(err),
+            },
         };
         let token = from_command_line.or_else(|| {
             if std::io::stdin().is_terminal() {
@@ -1103,9 +777,8 @@ pub(super) fn login(typed: &[String]) -> anyhow::Result<i32> {
             }
             read_line().ok().filter(|it| !it.is_empty())
         });
-        let action = Action::Login { token, login_url: login_url.as_deref() };
-        credential_action(&run, &target, action)?;
-        Ok(())
+        let args: Vec<&str> = provider_args.iter().map(String::as_str).collect();
+        run.auth.login(target.named(), token.as_deref(), login_url.as_deref(), &args)
     })())
 }
 
@@ -1123,10 +796,7 @@ pub(super) fn logout(typed: &[String]) -> anyhow::Result<i32> {
     ended((|| {
         let asked = registry_or_index(&read, &run.ctx.config)?;
         let target = target(&run.ctx, asked.as_ref())?;
-        if let Answer::NotFound = credential_action(&run, &target, Action::Logout)? {
-            run.status("Logout", &format!("not currently logged in to `{}`", target.shown()));
-        }
-        Ok(())
+        run.auth.logout(target.named())
     })())
 }
 

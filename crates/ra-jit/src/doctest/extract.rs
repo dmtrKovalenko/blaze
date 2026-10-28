@@ -372,7 +372,7 @@ fn use_name(tree: &syntax::ast::UseTree) -> Option<String> {
         return None;
     }
     if let Some(rename) = tree.rename() {
-        return Some(rename.name().map_or("_".to_owned(), |it| it.text().to_string()));
+        return Some(rename.name().map_or("_".to_owned(), |it| it.text().to_owned()));
     }
     tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string())
 }

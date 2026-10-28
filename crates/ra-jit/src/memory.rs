@@ -244,7 +244,7 @@ mod tests {
             ("user.slice/memory.max", "8589934592\n"),
             ("user.slice/run.scope/memory.max", "2147483648\n"),
         ]);
-        assert_eq!(allowed_by("0::/user.slice/run.scope\n", &unit), Some(2 << 30));
+        assert_eq!(allowed_by("0::/user.slice/run.scope\n", unit), Some(2 << 30));
         let above = files(&[("a/memory.max", "1073741824\n"), ("a/b/memory.max", "max\n")]);
         assert_eq!(allowed_by("0::/a/b\n", above), Some(1 << 30));
         let container = files(&[("memory.max", "4294967296\n")]);

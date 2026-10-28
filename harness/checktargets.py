@@ -66,8 +66,36 @@ def main():
         for flags in ([], ["-p", "app"], ["-p", "app", "--lib"], ["-p", "app", "--bins"]):
             compare(at, home, f"unselected dev targets {flags}", flags, 0)
         compare(at, home, "selected dev targets have real errors", ["--all-targets"], 101)
-        for path in ("tests/broken.rs", "examples/broken.rs", "benches/broken.rs"):
+        # Each flag picks its own targets of the dev ones (#632): `--tests` checks no example
+        # or bench, `--test NAME` the one test.
+        for flags, status in ((["--tests"], 101), (["--examples"], 101), (["--benches"], 101),
+                              (["--test", "helper"], 0), (["--example", "broken"], 101),
+                              (["--bench", "broken"], 101), (["--lib", "--bins"], 0)):
+            compare(at, home, f"picked dev targets {flags}", ["-p", "app", *flags], status)
+        os.unlink(os.path.join(at, "app", "tests/broken.rs"))
+        compare(at, home, "an unpicked example and bench", ["-p", "app", "--tests"], 0)
+        for path in ("examples/broken.rs", "benches/broken.rs"):
             os.unlink(os.path.join(at, "app", path))
+        # An example may use a dev-dependency; `--tests` does not check it.
+        write(at, "app/examples/uses_helper.rs", "fn main() { let _ = helper::Grid { value: 1 }; }\n")
+        for flags in (["--tests"], ["--examples"], ["--all-targets"]):
+            compare(at, home, f"example with a dev-dependency {flags}", ["-p", "app", *flags], 0)
+        # What is under `cfg(test)` in the library is its unit tests', which `--lib` does not check.
+        lib = "pub fn value() -> u32 { 7 }\n"
+        write(at, "app/src/lib.rs", lib + "#[cfg(test)] mod tests { fn broken() { let _ = helper::value(); let _ = missing; } }\n")
+        for flags, status in ((["--lib"], 0), (["--tests"], 101), (["--test", "helper"], 0)):
+            compare(at, home, f"unit tests with an error {flags}", ["-p", "app", *flags], status)
+        write(at, "app/src/lib.rs", lib)
+        # A member that is only depended on is checked as its library, not as its unit tests
+        # or its tests, whose dev-dependencies the build does not resolve.
+        helper = "pub struct Grid { pub value: u32 }\npub fn value() -> u32 { 7 }\n"
+        write(at, "helper/src/lib.rs", helper + "#[cfg(test)] mod tests { fn broken() { let _ = missing; } }\n")
+        write(at, "helper/tests/broken.rs", "fn main() { let _ = missing; }\n")
+        for flags, status in ((["-p", "app", "--tests"], 0), (["-p", "app", "--all-targets"], 0),
+                              (["--workspace", "--tests"], 101)):
+            compare(at, home, f"a member depended on {flags}", flags, status)
+        write(at, "helper/src/lib.rs", helper)
+        os.unlink(os.path.join(at, "helper/tests/broken.rs"))
         # A dev target may share a root file with a normal one: filtering by path alone
         # would also hide the binary's real error below.
         write(at, "app/Cargo.toml", PACKAGE + '[dev-dependencies]\nhelper.workspace = true\n'

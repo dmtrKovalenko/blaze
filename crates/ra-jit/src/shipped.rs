@@ -120,7 +120,7 @@ fn program_unit(sysroot: &Path, dir: &Path, store: &Path, profile: &str) -> anyh
     ra_jit.env("PATH", path).env("RA_JIT_CACHE", store).env("RA_JIT_STD_FROM", "off");
     ra_jit.env_remove("RUSTUP_TOOLCHAIN").env_remove("CARGO_TARGET_DIR");
     ra_jit.current_dir(dir).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
-    let built = ra_jit.output().context("running ra-jit")?;
+    let built = ra_jit.output().context("running blaze")?;
     let said = String::from_utf8_lossy(&built.stderr).into_owned();
     std::fs::write(dir.join(format!("ra-jit-{profile}.log")), &said)?;
     if !built.status.success() {

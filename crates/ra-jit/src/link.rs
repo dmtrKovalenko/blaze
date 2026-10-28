@@ -96,7 +96,7 @@ pub(crate) fn command(
     if line.apple {
         // Last, as on rustc's line: the room the splice wants, which a link made short of it
         // tells the file, and the link again reads. It is no less than the flags ask for.
-        let asked = user.iter().filter_map(|it| crate::cargo::plan::headerpad_in(it)).last();
+        let asked = user.iter().filter_map(|it| crate::cargo::plan::headerpad_in(it)).next_back();
         args.push(crate::cargo::plan::headerpad_read(exe, asked)?);
     }
     shlex::try_join(args.iter().map(String::as_str)).context("a link argument has a NUL in it")

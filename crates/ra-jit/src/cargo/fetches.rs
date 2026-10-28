@@ -619,12 +619,12 @@ fn key(sha256: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|it| format!("{it:02x}")).collect()
+    crate::content::hex(&Sha256::digest(bytes))
 }
 
 fn open_store(store: Option<&Path>) -> anyhow::Result<ra_jit_store::Store> {
     let dir =
-        store.context("blaze keeps downloads in its store, which `RA_JIT_CACHE=off` turns off")?;
+        store.context("blaze keeps downloads in its store, which `BLAZE_CACHE=off` turns off")?;
     ra_jit_store::Store::open_by_content(dir)
         .with_context(|| format!("opening blaze's store in {}", dir.display()))
 }
@@ -933,6 +933,7 @@ fn resolve(
         platform: Some(blaze_metadata::TargetPlatform { triple: target, cfg: &cfg }),
         offline: false,
         store: None,
+        rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let json = blaze_metadata::metadata(&asked)?;
     let metadata: cargo_metadata::Metadata = serde_json::from_str(&json)?;

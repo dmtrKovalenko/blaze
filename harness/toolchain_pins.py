@@ -24,8 +24,11 @@ DIST = "https://static.rust-lang.org/dist"
 # The hosts blaze has a build for, and Windows for `cargo install`.
 HOSTS = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
          "x86_64-pc-windows-msvc"]
-# rustup's `minimal` profile without rust-docs, and the standard library's source.
-COMPONENTS = ["rustc", "cargo", "rust-std", "rust-src"]
+# rustup's `minimal` profile without rust-docs, the standard library of wasm32-wasip1, which
+# proc macros are built for (crates/ra-jit/src/cargo/own_macro.rs), and the standard library's
+# source. `None` is the host.
+COMPONENTS = [("rustc", None), ("cargo", None), ("rust-std", None), ("rust-std", "wasm32-wasip1"),
+              ("rust-src", "*")]
 
 
 def get(url):
@@ -62,8 +65,8 @@ def pins():
         f"manifest {digest} {len(manifest)}",
     ]
     for host in HOSTS:
-        for package in COMPONENTS:
-            target = "*" if package == "rust-src" else host
+        for package, target in COMPONENTS:
+            target = target or host
             built = channel["pkg"][package]["target"][target]
             if not built.get("available"):
                 sys.exit(f"{package} is not built for {target} in Rust {RELEASE}")

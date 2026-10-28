@@ -36,7 +36,12 @@
         stdarch_arm_barrier,
         stdarch_arm_hints,
         stdarch_aarch64_rand,
-        stdarch_neon_f16
+        stdarch_neon_f16,
+        stdarch_neon_sm4,
+        stdarch_neon_feat_lut,
+        stdarch_neon_feat_lrcpc3,
+        stdarch_aarch64_feature_detection,
+        aarch64_unstable_target_feature
     )
 )]
 
@@ -7138,6 +7143,11 @@ pub mod sve {
 /// generated (`sve_ops.rs`).
 #[cfg(all(feature = "nightly", target_arch = "aarch64"))]
 pub mod sve_ops;
+
+/// Each function of `core::arch`'s NEON with a const parameter, at each end of its range,
+/// generated (`neon_ops.rs`, by `harness/neon_ops.py`).
+#[cfg(all(feature = "nightly", target_arch = "aarch64"))]
+pub mod neon_ops;
 
 /// rust-analyzer's `ExprCollector::new(db: &dyn SourceDatabase, module: ModuleId, ..) ->
 /// ExprCollector<'_>`: lifetime elision counts the lifetimes the parameters' types write or

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sandboxbench.py: what the sandbox every test runs in costs, on Linux and macOS.
+"""sandboxbench.py: what the sandbox a test runs in costs, on Linux and macOS.
 
 usage: sandboxbench.py [--cpus 0-15] [--rounds 5] [--runs 600] [--tests 600] [--io 50]
        (RA_JIT_BIN names the ra-jit built; cargo-ra-jit is found next to it)
@@ -10,8 +10,8 @@ lowest and highest of the rounds:
 - a program that does nothing, run `--runs` times one after another and 16 at a time, bare
   and in `ra-jit sandbox` (with no record, which installs no seccomp filter, and with a
   record of what it wrote and reached);
-- a generated library with `--tests` unit tests, `--io` of which read a file of the package
-  and write one in the package and one in `std::env::temp_dir()`, under `cargo ra-jit test`
+- a generated library, opted into sandboxed tests, with `--tests` unit tests, `--io` of which
+  read a file of the package and write one in the package and one in `std::env::temp_dir()`, under `cargo ra-jit test`
   once the daemon serves its build: with `RA_JIT_SANDBOX=off`, in the sandbox under
   `RA_JIT_TESTS=all`, under `affected` with what passed forgotten before each run (so every
   test runs and records what it reads), and as one process per test (`--exact name`, 16 at a
@@ -88,7 +88,8 @@ def library(root, tests, io):
     os.makedirs(os.path.join(root, "src"))
     os.makedirs(os.path.join(root, "data"))
     open(os.path.join(root, "Cargo.toml"), "w").write(
-        '[package]\nname = "sbxbench"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n')
+        '[package]\nname = "sbxbench"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n\n'
+        '[workspace.metadata.blaze]\nexperimental = ["sandboxed-tests"]\n')
     open(os.path.join(root, "data", "in.txt"), "w").write("the input\n" * 64)
     lines = ["pub fn mix(x: u64) -> u64 { x.wrapping_mul(0x9e3779b97f4a7c15).rotate_left(17) ^ x }", "",
              "#[cfg(test)]", "mod tests {", "    use super::*;"]

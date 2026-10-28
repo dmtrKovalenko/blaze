@@ -20,12 +20,17 @@
 //! The daemon also tiers the program up while it runs: when it asks, a thread of this crate
 //! samples where the program's threads are, and the daemon compiles the functions they are
 //! found in again with LLVM and sends them as patches like any other. [`tiers`] says what it
-//! did, for the program to show. `RA_JIT_TIER=off` in the program's environment turns the
-//! sampling off.
+//! did, for the program to show. `BLAZE_TIER=off` (or its old name `RA_JIT_TIER=off`) in the
+//! program's environment turns the sampling off.
 //!
 //! macOS on AArch64, and Linux and Windows on x86-64; elsewhere [`Live::start`] says so.
 
 use std::{fmt, path::PathBuf, sync::OnceLock, time::Duration};
+
+/// The setting `BLAZE_<name>`, else its old name `RA_JIT_<name>`, as blaze itself reads them.
+fn setting(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(format!("BLAZE_{name}")).or_else(|| std::env::var_os(format!("RA_JIT_{name}")))
+}
 
 pub mod format;
 

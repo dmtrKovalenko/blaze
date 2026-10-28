@@ -125,7 +125,7 @@ would have:
 ### LLVM's inliner
 
 LLVM's own inliner runs at threshold 500 (`llvm::INLINE_THRESHOLD`), over the 225 of `-O2` and
-250 of `-O3`; `RA_JIT_LLVM_INLINE_THRESHOLD=N` sets another, and the store keeps code of each
+250 of `-O3`; `BLAZE_LLVM_INLINE_THRESHOLD=N` sets another, and the store keeps code of each
 threshold apart. Measured on LLVM 23 with the runtime set of docs/benchmarks.md (dev-aws-5,
 x86-64, 16 cores, 5 rounds, each build with a cold store of its own; ratio to rustc's release
 build, lower is faster):
@@ -133,7 +133,7 @@ build, lower is faster):
 | Build | Geomean | words | ripgrep | tokei | Code, bat | Code, ripgrep | Compile, all 8 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | blaze's building in, LLVM's default | 1.091 | 1.22 | 1.14 | 1.28 | 9.06 MB | 12.79 MB | 129.0 s |
-| nothing built in by blaze (`RA_JIT_BUILT_IN=0`) | 1.092 | 1.22 | 1.14 | 1.31 | 9.06 MB | 12.79 MB | 129.7 s |
+| nothing built in by blaze (`BLAZE_BUILT_IN=0`) | 1.092 | 1.22 | 1.14 | 1.31 | 9.06 MB | 12.79 MB | 129.7 s |
 | threshold 225 | 1.100 | 1.24 | 1.15 | 1.37 | 8.96 MB | 12.78 MB | 129.2 s |
 | **threshold 500** | **1.080** | 1.16 | 1.11 | 1.26 | 9.55 MB | 13.03 MB | 128.6 s |
 | threshold 1000 | 1.079 | 1.13 | 1.10 | 1.18 | 10.29 MB | 13.32 MB | 130.7 s |
@@ -222,10 +222,10 @@ runs, and a new daemon starts every function at level 1.
 
 ## Turning it off
 
-`RA_JIT_TIER=off` in the daemon's environment starts none of it: no program is asked to
+`BLAZE_TIER=off` in the daemon's environment starts none of it: no program is asked to
 sample, no function leaves level 1, and the worker says `tier: off` in its log.
-`RA_JIT_TIER=off` in a program's own environment keeps it from sampling.
-`RA_JIT_TIER=2` stops at level 2, which then counts nothing. `RA_JIT_DUMP_TIER=1` has the
+`BLAZE_TIER=off` in a program's own environment keeps it from sampling.
+`BLAZE_TIER=2` stops at level 2, which then counts nothing. `BLAZE_DUMP_TIER=1` has the
 worker print the IR of each tiered function and why a body was not built in.
 
 ## Measured
@@ -241,8 +241,8 @@ work was run the same way.
 
 | Build | Generations per second | vs release | vs the checked build | Before this round |
 |---|---|---|---|---|
-| level 1, Cranelift (`RA_JIT_TIER=off`) | 18, 18 | 3% | 3% | 3% |
-| level 2, LLVM -O3 (`RA_JIT_TIER=2`) | 581, 568 | 86%, 86% | 94%, 93% | 69%, 73% |
+| level 1, Cranelift (`BLAZE_TIER=off`) | 18, 18 | 3% | 3% | 3% |
+| level 2, LLVM -O3 (`BLAZE_TIER=2`) | 581, 568 | 86%, 86% | 94%, 93% | 69%, 73% |
 | level 3, LLVM -O3 + PGO (default) | 595, 576 | 88%, 88% | 96%, 94% | 71%, 74% |
 | rustc `-O3` with `overflow-checks` and `debug-assertions`, the semantics of the dev profile | 619, 612 | 91%, 93% | 100% | 93%, 91% |
 | rustc release (`cargo build --release`) | 679, 657 | 100% | | 100% |
@@ -325,4 +325,4 @@ change.
 
 `harness/tiers.py` (macOS on AArch64; it says so and exits 0 elsewhere): promotion to levels
 2 and 3 with output identical to cargo's, an edit of a tiered function that demotes it and
-is applied at once, and `RA_JIT_TIER=off` changing nothing.
+is applied at once, and `BLAZE_TIER=off` changing nothing.

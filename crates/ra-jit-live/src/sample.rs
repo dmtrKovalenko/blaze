@@ -108,9 +108,9 @@ impl Code {
     }
 }
 
-/// Starts the thread that samples when the daemon asks, unless `RA_JIT_TIER=off`.
+/// Starts the thread that samples when the daemon asks, unless `BLAZE_TIER=off`.
 pub(crate) fn start(dir: PathBuf, code: Code) {
-    if std::env::var_os("RA_JIT_TIER").is_some_and(|it| it == "off") {
+    if crate::setting("TIER").is_some_and(|it| it == "off") {
         return;
     }
     std::thread::Builder::new()

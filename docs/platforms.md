@@ -67,7 +67,7 @@ system.
 
 The platform the work was done on, and the only one where everything has been run: the
 whole gate, `debuginfo.py`, `buildmodel.py`, `storefull.py`, `remote.py` against MinIO, the
-fuzzer, rustc's own test suites, the crate sweep and `cargo ra-jit`. The gate was rerun for
+fuzzer, rustc's own test suites, the crate sweep and `cargo blaze`. The gate was rerun for
 these documents at f191c6e42a under both backends; see [results.md](results.md).
 
 Objects are ELF. A full link runs rustc's link line with ra-jit's object first and
@@ -95,7 +95,7 @@ AArch64 can also be a cross target from Linux x86-64, with the programs run unde
 `qemu-aarch64`. The counts are the same as native except `debuginfo.py`, which does not
 pass under qemu because the harness runs gdb and backtraces without the emulator.
 
-The fuzzer has not been run on AArch64, and nobody has recorded running `cargo ra-jit`
+The fuzzer has not been run on AArch64, and nobody has recorded running `cargo blaze`
 there.
 
 ## Windows x86-64 (MSVC)
@@ -160,11 +160,16 @@ What is specific to the port:
   program's. When the patch's frames are larger than the program's unwind table, both tables
   move into that room, the program's frames where the table has them and the patch's behind;
   only a patch whose frames don't fit there either is linked in full. The room for two more load commands and the table comes from `-Wl,-headerpad`,
-  which `cargo ra-jit` gives the link in a file of its own beside the executable
+  which `cargo blaze` gives the link in a file of its own beside the executable
   (`bin.headerpad`), last on the line: 1 MiB, or what the line asks for. The table grows
-  with the program (3 MB for a GUI app of 570 crates), so after each full link the daemon
-  reads the header, and when the room is short it writes what the table needs and a quarter
-  more into that file and links once again; the links after start from it. A link line
+  with the program (3 MB for a GUI app of 570 crates). Before a link the daemon makes the
+  room in that file what the executable there wants, and at least what the unwind
+  information of the objects it links will take: their `__eh_frame` and a table entry for
+  each frame and each `__compact_unwind` entry, counted from the objects and the prebuilt
+  standard library, so a first link has the room too (#173: bun's base was linked twice,
+  260 s each). After each full link it reads the header, and when the room is still short
+  it writes what the table needs and a quarter more into that file and links once again; the
+  links after start from it. A link line
   given to the daemon by hand keeps the headerpad it has, and without enough the splice
   declines. The file does not grow from splice to splice.
 - The splice reads and writes the loader's fixups as dyld info, the tables rustc's default
@@ -176,7 +181,7 @@ What is specific to the port:
   arguments always go on the stack.
 
 Not there: debug info is not checked on macOS (the harness reads DWARF out of ELF).
-`cargo ra-jit` and plain cargo after `ra-jit enable` serve dev and test builds;
+`cargo blaze` and plain cargo after `ra-jit enable` serve dev and test builds;
 `harness/cargo_ra_jit.py --small` (ripgrep, fd, hyperfine) passes under both backends, and
 the larger projects of that harness have not been run ([cargo.md](cargo.md#macos-arm64)).
 `buildmodel.py`,
@@ -196,7 +201,7 @@ integers, the wasm C ABI (vectors as `v128`, an aggregate of one scalar as that 
 C-variadic calls and definitions through a buffer), `#[link_section]` statics as custom
 sections and a `target_features` section, as LLVM writes them. In the harnesses `rust-lld`
 links these objects ahead of rustc's rlibs. With nothing of rustc's (the whole build of
-[no-rustc.md](no-rustc.md), `RA_JIT_STD_FROM=off`), ra-jit compiles the target's standard
+[no-rustc.md](no-rustc.md), `BLAZE_STD_FROM=off`), ra-jit compiles the target's standard
 library as a unit of its own and links with `rust-lld -flavor wasm` (`link.rs`), with the
 toolchain's wasi-libc for `wasm32-wasip1`. A `#![no_std]` program's unit is `core`,
 `compiler_builtins` and what it names with `extern crate`, as rustc puts them in, so a

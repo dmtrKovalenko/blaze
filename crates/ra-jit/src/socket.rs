@@ -136,7 +136,7 @@ fn too_long(path: &Path, error: io::Error) -> io::Error {
     }
     let length = path.as_os_str().len();
     let said = format!(
-        "{error}: {} is {length} bytes; RA_JIT_HOME can name a shorter directory",
+        "{error}: {} is {length} bytes; BLAZE_HOME can name a shorter directory",
         path.display()
     );
     io::Error::new(error.kind(), said)

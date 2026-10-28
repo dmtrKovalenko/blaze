@@ -35,10 +35,12 @@ use crate::{
     },
     next_solver::{
         Binder, Canonical, ClauseKind, DbInterner, FnSig, GenericArg, GenericArgs, Goal, ParamEnv,
-        PolyTraitRef, Predicate, Region, SimplifiedType, TraitRef, Ty, TyKind, Unnormalized,
+        PolyTraitRef, PredefinedOpaques, Predicate, Region, SimplifiedType, TraitRef, Ty, TyKind,
+        Unnormalized,
         infer::{
             BoundRegionConversionTime, InferCtxt, InferOk,
             canonical::{QueryResponse, canonicalizer::OriginalQueryValues},
+            opaque_types::OpaqueHiddenType,
             select::{ImplSource, Selection, SelectionResult},
             traits::{Obligation, ObligationCause, PredicateObligation},
         },
@@ -308,7 +310,16 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         choice: Choice,
     ) -> Choice::FinalChoice {
         let mut orig_values = OriginalQueryValues::default();
-        let query_input = self.infcx.canonicalize_query(self_ty, &mut orig_values);
+        let predefined_opaques_in_body = PredefinedOpaques::new_from_slice(
+            &self
+                .infcx
+                .clone_opaque_types()
+                .into_iter()
+                .map(|(key, hidden_ty)| (key, hidden_ty.ty))
+                .collect::<Vec<_>>(),
+        );
+        let query_input =
+            self.infcx.canonicalize_query((self_ty, predefined_opaques_in_body), &mut orig_values);
         let steps = match mode {
             Mode::MethodCall => self.method_autoderef_steps(&query_input),
             Mode::Path => self.infcx.probe(|_| {
@@ -318,7 +329,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                 // special handling for this "trivial case" is a good idea.
 
                 let infcx = self.infcx;
-                let (self_ty, var_values) =
+                let ((self_ty, _), var_values) =
                     infcx.instantiate_canonical(self.call_span, &query_input);
                 debug!(?self_ty, ?query_input, "probe_op: Mode::Path");
                 let prev_opaque_entries =
@@ -406,17 +417,23 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
 
     fn method_autoderef_steps(
         &self,
-        self_ty: &Canonical<'db, Ty<'db>>,
+        goal: &Canonical<'db, (Ty<'db>, PredefinedOpaques<'db>)>,
     ) -> MethodAutoderefStepsResult<'db> {
         self.infcx.probe(|_| {
-            debug!("method_autoderef_steps({:?})", self_ty);
+            debug!("method_autoderef_steps({:?})", goal);
 
             // We accept not-yet-defined opaque types in the autoderef
             // chain to support recursive calls. We do error if the final
             // infer var is not an opaque.
             let infcx = self.infcx;
-            let (self_ty, inference_vars) =
-                infcx.instantiate_canonical(self.receiver_span, self_ty);
+            let ((self_ty, predefined_opaques_in_body), inference_vars) =
+                infcx.instantiate_canonical(self.receiver_span, goal);
+            // Instantiating the goal gave `self_ty` fresh inference variables: point the
+            // opaques at them too, or `self_ty_is_opaque` never sees a hidden type. The
+            // probe undoes this.
+            for (key, hidden_ty) in predefined_opaques_in_body.iter() {
+                infcx.register_hidden_type_in_storage(key, OpaqueHiddenType { ty: hidden_ty });
+            }
             let prev_opaque_entries = infcx.inner.borrow_mut().opaque_types().num_entries();
 
             let self_ty_is_opaque = |ty: Ty<'_>| {

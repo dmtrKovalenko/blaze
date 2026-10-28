@@ -114,27 +114,30 @@ The attribute takes plain `name: Type` parameters; not `self` (take `this: &Self
 ## Where results are kept
 
 In memory, up to 256 MiB for the run. On disk under `target/ra-jit/fn-cache` of the target
-directory the program was built in, or `RA_JIT_FN_CACHE_DIR`, up to 512 MiB
-(`RA_JIT_FN_CACHE_SIZE`), the entries used least recently going first. Each entry is written to
+directory the program was built in, or `BLAZE_FN_CACHE_DIR`, up to 512 MiB
+(`BLAZE_FN_CACHE_SIZE`), the entries used least recently going first. Each entry is written to
 a file of its own and renamed into place, so a run that stops partway leaves a whole entry or
 none, and each holds its key, so a damaged one is never taken for another.
 
+The program reads each setting by its old name too, `RA_JIT_` for `BLAZE_`; when both are set,
+the `BLAZE_` one wins.
+
 | Variable | |
 |---|---|
-| `RA_JIT_FN_CACHE=off` | caches nothing |
-| `RA_JIT_FN_CACHE=memory` | keeps results for the run alone |
-| `RA_JIT_FN_CACHE_DIR` | where results are kept on disk |
-| `RA_JIT_FN_CACHE_SIZE` | how much, `512M` by default |
-| `RA_JIT_FN_CACHE_LOG=1` | says for each call whether the result was found or computed |
-| `RA_JIT_FN_CACHE_TRACE=1`, set for the daemon | prints each function the code hash goes through |
+| `BLAZE_FN_CACHE=off` | caches nothing |
+| `BLAZE_FN_CACHE=memory` | keeps results for the run alone |
+| `BLAZE_FN_CACHE_DIR` | where results are kept on disk |
+| `BLAZE_FN_CACHE_SIZE` | how much, `512M` by default |
+| `BLAZE_FN_CACHE_LOG=1` | says for each call whether the result was found or computed |
+| `BLAZE_FN_CACHE_TRACE=1`, set for the daemon | prints each function the code hash goes through |
 
 A function's results on disk are kept for the code it has and the two codes before it: the
 first call of a run with code the function did not have drops what any older code computed,
 at once rather than when the size is reached.
 
-`cargo ra-jit cache` lists what each function holds, for its code and for the older ones;
-`cargo ra-jit cache clear --stale` forgets all but what each function's code computed, and
-`cargo ra-jit cache clear` everything.
+`cargo blaze cache` lists what each function holds, for its code and for the older ones;
+`cargo blaze cache clear --stale` forgets all but what each function's code computed, and
+`cargo blaze cache clear` everything.
 
 ## Live edits
 

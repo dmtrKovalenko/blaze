@@ -315,9 +315,15 @@ pub(crate) fn toolchain_rustc_of(program: &OsStr) -> Option<PathBuf> {
     toolchain_rustc(program, &|name| std::env::var_os(name))
 }
 
-/// The executable of the toolchain that `program` runs. rustup's proxy runs the toolchain
-/// rustup set for the process it started, and is not known without that.
-fn toolchain_rustc(program: &OsStr, var: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+/// The executable of the toolchain that `program` runs. A toolchain's rustc is in the `bin` of
+/// its sysroot, beside `lib/rustlib`; any other is a proxy, which runs the toolchain rustup set
+/// for the process it started and is not known without that. A proxy is rustup's own binary
+/// under another name, or a script that starts it: Homebrew's rustup installs `rustc` as a
+/// script beside no toolchain, which was taken for one with no standard library.
+pub(crate) fn toolchain_rustc(
+    program: &OsStr,
+    var: &dyn Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
     let found = if Path::new(program).components().count() > 1 {
         PathBuf::from(program)
     } else {
@@ -326,8 +332,7 @@ fn toolchain_rustc(program: &OsStr, var: &dyn Fn(&str) -> Option<OsString>) -> O
         std::env::split_paths(&paths).map(|dir| dir.join(&name)).find(|it| it.is_file())?
     };
     let real = std::fs::canonicalize(found).ok()?;
-    let proxy = real.file_stem().and_then(OsStr::to_str).is_some_and(|it| it.starts_with("rustup"));
-    if !proxy {
+    if in_sysroot(&real) {
         return Some(real);
     }
     let toolchain = PathBuf::from(var("RUSTUP_TOOLCHAIN")?);
@@ -338,6 +343,11 @@ fn toolchain_rustc(program: &OsStr, var: &dyn Fn(&str) -> Option<OsString>) -> O
     };
     let rustc = dir.join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
     std::fs::canonicalize(rustc).ok()
+}
+
+/// Whether `rustc` is a toolchain's own: in the `bin` of a sysroot that has `lib/rustlib`.
+fn in_sysroot(rustc: &Path) -> bool {
+    rustc.parent().and_then(Path::parent).is_some_and(|root| root.join("lib/rustlib").is_dir())
 }
 
 fn kept(file: &Path) -> Option<Vec<u8>> {
@@ -389,6 +399,31 @@ mod tests {
             "--crate-name p --edition=2024 src/lib.rs --crate-type lib --emit=dep-info,metadata,link \
              -C metadata=d4ed28d9543870f2 --out-dir target/debug/deps --print cfg"
         ));
+    }
+
+    /// Homebrew's rustup installs `rustc` as a script that starts rustup, in a directory
+    /// beside no toolchain: it is a proxy, and the toolchain is the one rustup names.
+    #[test]
+    fn a_rustc_outside_a_toolchain_is_a_proxy_whatever_its_name() {
+        let root = std::env::temp_dir().join(format!("ra-jit-proxy-{}", std::process::id()));
+        let script = root.join("homebrew/bin/rustc");
+        let toolchain = root.join("rustup/toolchains/nightly");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        std::fs::create_dir_all(toolchain.join("lib/rustlib")).unwrap();
+        std::fs::write(&script, "#!/bin/sh\nexec rustup-init \"$@\"\n").unwrap();
+        let rustc = toolchain.join("bin/rustc");
+        std::fs::write(&rustc, "").unwrap();
+        let var = |name: &str| match name {
+            "RUSTUP_TOOLCHAIN" => Some(OsString::from("nightly")),
+            "RUSTUP_HOME" => Some(root.join("rustup").into_os_string()),
+            _ => None,
+        };
+        let found = toolchain_rustc(script.as_os_str(), &var);
+        assert_eq!(found, Some(std::fs::canonicalize(&rustc).unwrap()));
+        // the toolchain's own rustc is itself
+        assert_eq!(toolchain_rustc(rustc.as_os_str(), &var), found);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

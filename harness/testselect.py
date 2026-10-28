@@ -18,11 +18,15 @@ names: those whose code or what it calls changed, those added or given other att
 one that reads a file every time, the one that failed until it passes (and not the others that
 ran and passed beside it; once fixed back to code that passed, it is not run again), one added
 to a program with an `ignore` with a list, one added to a library with a bench (in a package of
-its own, built with RUSTC_BOOTSTRAP=1), and with `RA_JIT_TESTS=all` every test. A test that ran has to end as its source says. With `-v` the
+its own, built with RUSTC_BOOTSTRAP=1), and with `RA_JIT_TESTS=all` every test. A test that ran has to end as its source says.
+A package's unit and integration tests find its program from their own path, as fd's do: they are
+in the profile's `deps` (of the debug and release profiles, and of a `--target`), the program is
+in the profile's directory, and that is `CARGO_BIN_EXE_<name>`. With `-v` the
 output says why the one that reads a file runs, by the calls from it to the file system, and
 how many tests run every time.
 
-Every test runs sandboxed (Linux and macOS, unless `RA_JIT_SANDBOX=off`): the one that reads a
+The workspace opts into sandboxed tests (`experimental = ["sandboxed-tests"]`), so every test
+runs sandboxed (Linux and macOS, unless `RA_JIT_SANDBOX=off`): the one that reads a
 file runs again only when the file changed, `-v` says which file, a test that writes into the
 package changes nothing of it outside its run, a test that writes outside fails and the command
 says what the sandbox denied it and how to take it out, a test its package takes out of the
@@ -30,7 +34,8 @@ sandbox (`unsandboxed-tests`) runs outside and writes there, every time, with
 `RA_JIT_SANDBOX=off` every test runs every time, `RA_JIT_TESTS=verify` runs the tests kept as
 passed and says they passed again, a store pushed to a remote and pulled into an empty one
 skips every test that passed, and so does the store under a fresh target and daemon, as on a CI
-runner.
+runner. A package that has not opted in runs every test under `affected`, and is told what to add
+to its manifest.
 
 Python 3, stdlib only.
 """
@@ -145,7 +150,8 @@ fn offset() -> u32 {
 """
 FILES = {
     "Cargo.toml": '[package]\nname = "tsel"\nversion = "0.1.0"\nedition = "2021"\n\n'
-                  '[dependencies]\ntbase = { path = "tbase" }\n\n[workspace]\nmembers = ["tbase"]\n',
+                  '[dependencies]\ntbase = { path = "tbase" }\n\n[workspace]\nmembers = ["tbase"]\n\n'
+                  '[workspace.metadata.blaze]\nexperimental = ["sandboxed-tests"]\n',
     "src/lib.rs": LIB,
     "data.txt": "tsel\n",
     # What the test that writes into the package overwrites: not `data.txt`, which the test
@@ -282,7 +288,7 @@ KEPT_FROM = re.escape(kept_from())
 if SANDBOXED:
     SAYS = {
         "outside the sandbox": [
-            r"Always tests::reads_a_file: it runs outside the sandbox: `RA_JIT_SANDBOX=off`$",
+            r"Always tests::reads_a_file: it runs outside the sandbox: `BLAZE_SANDBOX=off`$",
             r"\d+ tests outside the sandbox, run every time and never kept: ",
         ],
         "the file a test reads edited": [
@@ -371,6 +377,69 @@ def benched(root, env):
         return "NOT SERVED BY THE DAEMON"
     if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
         return f"ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
+    if not SANDBOXED:
+        return "ok"
+    # It has not opted into sandboxed tests: nothing is kept, and the note says how to opt in.
+    code, said = test(ws, env, "affected")
+    ran = {name for name, _ in RAN.findall(said)}
+    note = (r"note: no test is sandboxed, so none is kept as passed and every test runs: .*"
+            r'`experimental = \["sandboxed-tests"\]` under `\[workspace\.metadata\.blaze\]` in '
+            r"\S*/benched/Cargo\.toml$")
+    if ran != {"tests::added", "tests::adds", "tests::bench_add"} or code != 0:
+        return f"NOT OPTED IN, ENDED {code} HAVING RUN {', '.join(sorted(ran)) or 'nothing'}"
+    if not re.search(note, said, re.M):
+        return f"NOT OPTED IN, DID NOT SAY {note}"
+    return "ok"
+
+
+# A test finds its package's program from its own path, as fd's and ripgrep's do: it is in the
+# profile's `deps`, the program in the profile's directory, and that is `CARGO_BIN_EXE_<name>`.
+BESIDE_CHECK = """
+fn beside() -> (std::path::PathBuf, std::path::PathBuf) {
+    let exe = std::env::current_exe().unwrap();
+    let deps = exe.parent().unwrap();
+    assert_eq!(deps.file_name().unwrap(), "deps", "{}", exe.display());
+    let program = deps.parent().unwrap().join(format!("beside{}", std::env::consts::EXE_SUFFIX));
+    assert!(program.is_file(), "{}", program.display());
+    (exe, program)
+}
+"""
+BESIDE = {
+    "Cargo.toml": '[package]\nname = "beside"\nversion = "0.1.0"\nedition = "2021"\n',
+    "src/main.rs": "fn main() {\n    println!(\"beside\");\n}\n\n#[cfg(test)]\nmod tests {\n" + BESIDE_CHECK
+                   + "\n#[test]\nfn in_deps() {\n    beside();\n}\n}\n",
+    "tests/it.rs": BESIDE_CHECK + """
+#[test]
+fn finds_the_program() {
+    let (_, program) = beside();
+    assert_eq!(std::path::Path::new(env!("CARGO_BIN_EXE_beside")), program);
+    let ran = std::process::Command::new(&program).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "beside\\n");
+}
+""",
+}
+
+
+def beside(root, env):
+    """Tests in `deps` beside the program, in the debug and release profiles and of a target named."""
+    ws = os.path.join(root, "beside")
+    for path, text in BESIDE.items():
+        os.makedirs(os.path.dirname(os.path.join(ws, path)), exist_ok=True)
+        open(os.path.join(ws, path), "w").write(text)
+    host = re.search(r"^host: (\S+)", subprocess.run(["rustc", "-vV"], env=env, capture_output=True, text=True).stdout, re.M)[1]
+    try:
+        for args in ("", "--release", f"--target {host}"):
+            deadline = time.monotonic() + 300
+            while "[blaze]" not in (said := test(ws, env, f"all {args}"))[1]:
+                if time.monotonic() > deadline:
+                    return f"`{args}`: NEVER SERVED BY THE DAEMON"
+                time.sleep(0.5)
+            code, said = said
+            ran = {name for name, end in RAN.findall(said) if end == "ok"}
+            if ran != {"tests::in_deps", "finds_the_program"} or code != 0:
+                return f"`{args}`: ENDED {code} HAVING PASSED {', '.join(sorted(ran)) or 'nothing'}"
+    finally:
+        subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
     return "ok"
 
 
@@ -473,10 +542,13 @@ def main():
         verdict = benched(root, env)
         wrong += verdict != "ok"
         print(f"{'a test added beside a bench':34} {verdict}", flush=True)
+        verdict = beside(root, env)
+        wrong += verdict != "ok"
+        print(f"{'a test finds its program from deps':34} {verdict}", flush=True)
     finally:
         subprocess.run(["cargo", "ra-jit", "stop"], cwd=ws, env=env, capture_output=True, timeout=120)
         shutil.rmtree(OUTSIDE, ignore_errors=True)
-    print(f"{len(STEPS) + 1 - wrong} of {len(STEPS) + 1} right; under {root}, the daemon's home {home}")
+    print(f"{len(STEPS) + 2 - wrong} of {len(STEPS) + 2} right; under {root}, the daemon's home {home}")
     if wrong:
         sys.exit(1)
     shutil.rmtree(root, ignore_errors=True)

@@ -22,7 +22,6 @@
 mod dependency;
 mod edit_distance;
 mod graph;
-mod interning;
 pub mod lockfile;
 pub mod metadata;
 mod names;
@@ -32,24 +31,24 @@ mod poll;
 mod registry;
 mod resolve;
 pub mod resolver;
-mod source_id;
 mod summary;
 mod version;
 pub mod workspace_resolve;
 
+use blaze_source::{interning, source_id};
+
+pub use blaze_source::{
+    CRATES_IO_DOMAIN, CRATES_IO_HTTP_INDEX, CRATES_IO_INDEX, CRATES_IO_REGISTRY, CanonicalUrl,
+    GitReference, InternedString, Precise, SourceId, SourceIdAsUrl, SourceKind,
+};
 pub use dependency::{DepKind, Dependency};
 pub use edit_distance::{closest, closest_msg, edit_distance};
 pub use graph::Graph;
-pub use interning::InternedString;
 pub use names::{validate_feature_name, validate_package_name, validate_registry_name};
 pub use package_id::PackageId;
 pub use package_id_spec::PackageIdSpec;
 pub use registry::{IndexSummary, MemRegistry, QueryKind, Registry};
 pub use resolve::{LockfileMetadata, Resolve, ResolveVersion};
-pub use source_id::{
-    CRATES_IO_DOMAIN, CRATES_IO_HTTP_INDEX, CRATES_IO_INDEX, CRATES_IO_REGISTRY, CanonicalUrl,
-    GitReference, Precise, SourceId, SourceIdAsUrl, SourceKind,
-};
 pub use summary::{FeatureMap, FeatureValue, MissingDependencyError, Summary};
 pub use version::{OptVersionReq, PartialVersion, RustVersion};
 

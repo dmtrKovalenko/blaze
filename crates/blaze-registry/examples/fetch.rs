@@ -5,8 +5,10 @@
 //!         [--config <config.toml>]... [--store <dir>] [--offline] [--roots]
 //!
 //! `--config` files are read for `[source]` and `[registries]` in the order given, a later one
-//! over an earlier one, which is a sketch of what blaze-manifest reads. `--roots` prints where
-//! each package is.
+//! over an earlier one, which is a sketch of what blaze-manifest reads. A registry that requires
+//! authentication gets its token from the configuration cargo would read from the lock file's
+//! directory with that `CARGO_HOME` and the `--config` files. `--roots` prints where each
+//! package is.
 
 use std::{
     collections::BTreeMap,
@@ -16,9 +18,12 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use blaze_registry::{
-    Context, Locked, Package, SourceConfig, SourceDef, SourceId, Sources, download::From,
+    Context, Locked, Package, SourceConfig, SourceDef, Sources,
+    auth::{Auth, Stderr},
+    download::From,
     http::HyperHttp,
 };
+use blaze_source::SourceId;
 use semver::Version;
 
 fn main() -> anyhow::Result<()> {
@@ -28,15 +33,18 @@ fn main() -> anyhow::Result<()> {
             "usage: fetch <Cargo.lock> <CARGO_HOME> [--config <file>]... [--store <dir>] [--offline] [--roots]"
         );
     };
-    let mut context = Context::new(PathBuf::from(home), HyperHttp::shared()?);
+    let mut context = Context::new(PathBuf::from(&home), HyperHttp::shared()?);
     let mut config = SourceConfig::default();
+    let mut files = Vec::new();
     let mut print_roots = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--offline" => context.net.offline = true,
             "--roots" => print_roots = true,
             "--config" => {
-                read_config(Path::new(&args.next().context("--config needs a file")?), &mut config)?
+                let file = args.next().context("--config needs a file")?;
+                read_config(Path::new(&file), &mut config)?;
+                files.push(file);
             }
             "--store" => {
                 let dir = PathBuf::from(args.next().context("--store needs a directory")?);
@@ -47,6 +55,11 @@ fn main() -> anyhow::Result<()> {
             other => bail!("unknown argument `{other}`"),
         }
     }
+    let cwd = std::path::absolute(&lock)?.parent().context("a lock file's directory")?.to_owned();
+    let env = std::env::vars().filter(|(k, _)| k != "CARGO_HOME");
+    let env = env.chain([("CARGO_HOME".to_owned(), home.clone())]);
+    let settings = blaze_manifest::Config::load(&cwd, env, &files)?;
+    context.auth = Some(Arc::new(Auth::new(settings, Box::new(Stderr))));
     let sources = Sources::new(&config, Arc::new(context))?;
     let text = std::fs::read_to_string(&lock).with_context(|| format!("reading {lock}"))?;
     let lock: toml::Table = toml::from_str(&text)?;
@@ -60,23 +73,22 @@ fn main() -> anyhow::Result<()> {
         let v1 = format!("checksum {name} {version} ({source})");
         let checksum = field("checksum")
             .or_else(|| metadata.and_then(|it| it.get(&v1)).and_then(|it| it.as_str()));
-        let (source, precise) = SourceId::from_url(source)?;
+        let source = SourceId::from_url(source)?;
         let mut package = Package {
             name: name.to_owned(),
             version: Version::parse(version)?,
             checksum: checksum.unwrap_or_default().to_owned(),
         };
-        let from = sources.map().replacement(&source, precise.is_some())?;
+        let from = sources.map().replacement(source)?;
         if from.is_remote_registry() && !from.is_sparse() {
             *counts.entry("git index").or_default() += 1;
             continue;
         }
         // A lock file of cargo before 1.53 may name no checksum: the index's.
         if checksum.is_none() && from.is_remote_registry() {
-            package.checksum =
-                sources.registry(&from)?.checksum(&package.name, &package.version)?;
+            package.checksum = sources.registry(from)?.checksum(&package.name, &package.version)?;
         }
-        locked.push(Locked { source, precise, package });
+        locked.push(Locked { source, package });
     }
     let fetched = sources.fetch(&locked)?;
     for (_, from) in &fetched {

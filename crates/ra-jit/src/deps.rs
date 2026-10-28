@@ -49,11 +49,10 @@ fn unpacked_max() -> anyhow::Result<Option<u64>> {
     match std::env::var("RA_JIT_DEPS_MAX") {
         Err(_) => Ok(Some(UNPACKED_MAX)),
         Ok(text) if text == "off" => Ok(None),
-        Ok(text) => {
-            Ok(Some(ra_jit_store::parse_size(&text).with_context(|| {
-                format!("RA_JIT_DEPS_MAX=`{text}` is neither a size nor `off`")
-            })?))
-        }
+        Ok(text) => Ok(Some(
+            ra_jit_store::parse_size(&text)
+                .with_context(|| format!("BLAZE_DEPS_MAX=`{text}` is neither a size nor `off`"))?,
+        )),
     }
 }
 

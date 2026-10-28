@@ -13,7 +13,9 @@ use semver::{Version, VersionReq};
 use serde_derive::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::{Package, SourceId};
+use blaze_source::SourceId;
+
+use crate::Package;
 
 /// A vendored package.
 #[derive(Clone, Debug)]

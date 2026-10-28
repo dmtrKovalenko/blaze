@@ -8,7 +8,22 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ## [Unreleased]
 
+## [0.20261027.0] - 2026-10-27
+
 ### Added
+
+- Credential providers are asked as cargo asks them (#315): `cargo:token-from-stdout`, and
+  credential processes in cargo's protocol, version 1, in the order of
+  `registry.global-credential-providers`, for the index, `.crate` files and the web API
+  commands alike. `cargo:wincred`, `cargo:macos-keychain` and `cargo:libsecret` on their own
+  platform are refused, naming the provider and what to set instead; they were refused with
+  every other provider but `cargo:token`. `credentials.toml` gives only tokens, below their
+  environment variables, as in cargo 1.101 (`harness/own_registry.py`, 101 of 101 cases).
+
+- Nightly's `#[derive(From)]` (`#![feature(derive_from)]`, `std::from::From`) expands, as
+  rustc's does: `From` of the type of a struct's one field, keeping the struct's generics.
+  Every use of the conversion was refused ("no impl of the trait was selected for it"). On an
+  enum, a union, or a struct without exactly one field it is an error, as in rustc (#600).
 
 - `blaze lock --fetches [--target <triple>]...` pins what build scripts download, as Nix pins a
   fixed-output derivation: each download by its sha256 in `Cargo.fetches.lock` beside
@@ -73,8 +88,7 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 - `cargo blaze search`, `owner`, `yank`, `login` and `logout` are blaze's own: blaze-registry
   has a client of a registry's web API (crates-io 0.41's), with cargo's choice of registry, its
   token and `credentials.toml` as cargo writes it, and its errors (`harness/own_registry.py`,
-  73 of 73 cases against a mock registry, requests and credentials files too). Credential
-  providers other than `cargo:token` are refused.
+  73 of 73 cases against a mock registry, requests and credentials files too).
 - `cargo blaze vendor` is blaze's own for registry packages: each unpacked from its `.crate`
   with its `.cargo-checksum.json`, and the `[source]` configuration printed
   (`harness/own_vendor.py`, 18 of 18 cases, every file by its sha256). A git package is
@@ -560,6 +574,17 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Changed
 
+- Sandboxed tests are an experiment a workspace opts into: `experimental = ["sandboxed-tests"]`
+  under `[workspace.metadata.blaze]` in its root manifest, or `tests = true` under
+  `[package.metadata.blaze.sandbox]` in a package's. Elsewhere `cargo blaze test` runs tests as
+  `cargo test` does, so a test that writes `$HOME` passes where it failed with the sandbox's
+  denial. A test outside the sandbox has no record of what it read, so `RA_JIT_TESTS=affected`
+  keeps no pass of it and it runs on every commit; when no test of the command is sandboxed, a
+  note says what to add and to which manifest. `experimental` is the one list of opt-in
+  features: an unknown name, or a value that is not a list of names, is an error naming the
+  manifest and the known names. `tests = false`, `unsandboxed-tests` and `RA_JIT_SANDBOX=off`
+  work as before; build scripts stay sandboxed and proc macros WebAssembly. blaze's own
+  workspace opts in (docs/cargo.md, "Sandboxed tests (an experiment, opt-in)").
 - The programs print `blaze`, not `ra-jit` (#270, "What the programs print"): the `blaze:`
   prefix of their notes, `Finished ... profile [blaze]`, `blaze is enabled`, `plain cargo:
   through blaze`, `blaze could not compile`, `blaze cache gc` and the other errors and notes.
@@ -1031,6 +1056,30 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
 
 ### Fixed
 
+- A proc-macro server that dies or fails an expansion fails the build with what it said, the
+  macro and its library (`ra_jit_expand::server_failed`), at the end of the cold build and on
+  every build after. Before, the build went on without the expansion and failed far from it:
+  fd with a server killed after its first five derives said `fd::run: frontend: mir:
+  MissingFunctionDefinition`, as `Opts::parse` had no `#[derive(Parser)]` impl to resolve to;
+  now it says the server failed to expand `Parser` of clap_derive, and how it exited.
+- A build after `cargo blaze clean`, `cargo clean` or `rm -rf target` while the daemon runs
+  builds, by the same worker (#721, reported by @maddada). The worker read the standard
+  library's unit it had written under `target/ra-jit/whole/` again, and every build until
+  `blaze stop` failed "a build of src/main.rs panicked: the standard library blaze built:
+  reading .../<name>.std.o: No such file or directory". Before each build the worker now
+  writes the unit again when it is gone or another file than it wrote (from the store when it
+  has it), and builds a program in full when its object is gone; a unit it can't read is an
+  error, not a panic (`harness/cargo_ra_jit.py`, `cleaned`).
+- blaze finds the toolchain behind Homebrew's rustup. Homebrew installs `rustc` as a script
+  that starts rustup, beside no toolchain, and blaze took a proxy only by the name `rustup`,
+  so the script's directory was read as a toolchain with no standard library: every build
+  script failed with "the toolchain has no source of the standard library". A `rustc` that is
+  not in the `bin` of a sysroot with `lib/rustlib` is now a proxy, whatever it is called.
+- A crate blaze builds itself (a proc macro, a build script, or what either links) reads the
+  variables its build script set with `cargo:rustc-env`: `mime_guess`'s
+  `MIME_TYPES_GENERATED_PATH`, so `rust-embed-impl` builds. blaze kept only cargo's own
+  `CARGO_*` and `OUT_DIR`; it now reads the names from the script's output, `output` in cargo's
+  layout of `target` and `run/stdout` in the build-dir layout.
 - An integration test that names a program (`env!("CARGO_BIN_EXE_app")`) builds when its
   build starts the daemon's worker: the worker was started with the variables of its build
   but not the places cargo set, so its load, which compiles before the first request is read,
@@ -1868,6 +1917,689 @@ each one's section: what `[Unreleased]` had, and the title of each change merged
   selecting dev targets still checks them with their dependencies (#634, reported by
   @om606bosch; also #632).
 
+### Merged
+
+- ra-jit-live 0.1.0 is on crates.io: a README for it, its metadata, and the README asks for it by version
+- demo/life: the editor is back, on the right of the window
+- Mach-O splice: the unwinder's tables of the program are renamed with seven bytes again
+- CI: hosted runners, nix, unit graph, live demo checks (#1)
+- Dependabot leaves vendor/ alone: it read the submodule's crates/* glob against this repository's crates/ and failed on hir-ty-codegen, which has no Cargo.toml
+- nix/units: ra-jit and ra-jit-bench say rust-version 1.99, as Cargo.toml has since the crates.io commit; the units were stale and every nix build refused to evaluate
+- A build that panics is the build's error, not the worker's end; the daemon logs a worker's end; a daemon of another nix build is replaced
+- live_e2e.py: the running program takes LIVE_EDITS edits one after another; live-debug workflow keeps the logs
+- The daemon keeps its workers while a program that takes edits runs
+- A location or debug row in the installed standard library on Windows names the file as rustc does, <sysroot>\lib/rustlib/src/rust\library\.., not with backslashes throughout
+- On main a CI run is no longer cancelled by the next push: it finishes and the newest push waits behind it, so main gets a verdict while several agents push
+- rust-analyzer fork with rustc-shaped MIR (unwind trees, Assert, promotion); futures mix by default
+- The daemon links rustc's symbols.o, the object that names what a program keeps, from the copy it takes of it: GNU ld reads each archive once, and without that object it never took the panic runtime, which rustc puts before the standard library, so a panic=abort program failed to link on aarch64 Linux. A Windows path counts as symbols.o by its end again, and cargo_ra_jit.py says a failed cargo install is a failure instead of crashing
+- LLVM no longer folds a comparison of two statics' addresses to false: a static's global has a type without a size, so an extern static and the #[no_mangle] one it links to compare equal as under rustc
+- operands unwind before the temporaries they borrowed
+- The store may take 32 GiB by default, not 8: the cache rarely evicts on a dev machine, which matters more than how it evicts
+- vendor/ as subtrees, flake builds from self alone
+- Merge commit '8dbb3d6d3d8b2b6584fdbfb725c1a3e2ca8eb8a5' into HEAD
+- debuginfo.py prints what gdb said after the breakpoint when its steps never leave the line, as it does when gdb does not stop
+- A function a macro of the crate's own writes is declared, for the debugger, where the macro writes it, as rustc declares it. Its lead line row was the call site, and gdb on aarch64 takes every later row with a smaller line for prologue, so a step into it stopped past its calls and ran on to the exit when the panic was in one of them. The panic Location still reports the outermost call site.
+- backtrace_line is open on macOS: std's backtrace finds a line through ld64's debug map, which ld64 writes only for objects with DWARF in them, and ra-jit writes DWARF for ELF and COFF only, so the frame has a name and no line.
+- a simple let lowers straight into its binding, as rustc's MIR does
+- debuginfo.py no longer calls perf's short stacks a fault of the CFI when perf looks the CFI up in the wrong place. perf's libdw unwinder takes a module's base as the mapping's start less its file offset, a page off for the executable segment lld lays out a page above its offset, so each frame's CFI is read from the code a page below it and a stack stops where that code is in its prologue (ra-jit::fold::2274 on the corpus, looked up in new::2229's push of rbp). The CFI is right: eu-stack and std's unwinder reach main. Where perf is told the right base, a stack that does not reach main is still NOT UNWOUND, and perf's stacks are printed.
+- A 128-bit integer argument that finds one integer register left on x86-64 is passed in memory on the stack, alone or as half of a pair, so Cranelift places the arguments after it where rustc and LLVM do, and the LLVM backend leaves any other signature of that shape to Cranelift.
+- Live edits are timed step by step: the worker and the program stamp each edit, harness/live_latency.py splits save-to-running, live-latency.yaml runs it on macOS arm64
+- Edits go to the daemon as text, and the program applies the patch as it lands
+- live_latency.py reads the log of a worker that was a spare
+- Live edits time the refusal checks and the patch's layout for the program apart
+- Live edits time the change to the database, the statics and the patch's object apart; live_latency.py takes new code that runs before its outcome is said
+- Live edits time the setup of a patch's object and the outline of the edited file apart; one file's bodies are lowered and hashed without threads
+- A worker's socket fits macOS's 104 bytes under a long RA_JIT_HOME
+- Installing the daemon's programs holds cargo's lock on the build directory
+- The harness counts only the disabled build's own calls of the user's wrapper
+- The toolchain's commit is read from rustup's manifest once while it is unchanged, not on every build: a patch spent 2 ms on it
+- Merge branch 'parity-let-fix' into merge-letfix-rustd
+- Merge branch 'rustd-issues' into merge-letfix-rustd
+- Merge branch 'fix-issue5-quadratic-drops' into merge-letfix-rustd
+- site: the ra-jit-updates D1 database is created and migrated; /updates is live
+- README: the signup button is centred and the mp4 link is gone
+- README: live-edit and build tables with speedups (24x for a one-function live edit), and what is not measured yet
+- A panic unwinds through a spliced macOS executable again: dyld on macOS 15.4 to 15.7 finds `__unwind_info` and `__eh_frame` only by the name of their segment's load command, and the splice had put both tables in `__RA_JIT_TEXT` and renamed the program's, so the unwinder found none and every panic aborted. Now the tables stay in `__TEXT`: `__unwind_info`, which the linker puts right in front of `__eh_frame`, moves into the header's spare room, and the patch's frames take its place, so `__eh_frame` starts with them and no section overlaps another, which `strip` refuses.
+- main.rs is formatted the way rustfmt wants, so the format check passes.
+- Real projects measured: cargo ra-jit build against cargo build on ripgrep 15.1.0, just 1.43.0 and nushell 0.108.0 on a 64-core x86-64 host. A library edit is 10x, 14x and 26x faster; the first build until the daemon is ready takes about twice cargo's. harness/realbench.py, docs/results.md section 11 (issue #7).
+- where the time of a build goes: spans of client, daemon and worker, RA_JIT_TRACE, a breakdown that sums to the total
+- warm edits: nushell's main edit 0.40 s to 0.30 s, a library edit 0.21 s to 0.18 s
+- results: warm edits before and after on dev-aws-6, with where the time goes
+- an edit inside one function lowers only that body; panic places and debugger rows come from the body alone; harness/movedlines.py
+- LLVM gets rustc's attributes (tiered Life step 528 to 763 generations/s); edits never wait for LLVM; the sampler stops when its reader is gone; harness/tierbench.py
+- Cargo.lock: ra-jit depends on tracing, so cargo no longer rewrites the lock on every build
+- README and site: credits thank the projects ra-jit stands on
+- macOS edits spliced for programs with a large unwind table; faster code signing of splices
+- dep-info read as rustc writes it (#14); the macOS headerpad sized from the program and kept beside it (#13)
+- harness/live_e2e.py: the new answer the program prints before `outcome:` counts, and the harness builds with the toolchain the others pin
+- rust-analyzer: the solver grows its stack as rustc's does, so an unoptimized build infers as deep as an optimized one
+- docs/harness.md: spaces.py and headerpad.py
+- nix/units: the daemon's unit graph with stacker and psm, which hir-ty's solver grows its stack with
+- CI: one build per platform, harnesses in parts of a few minutes, unit tests with the known failures named, one 'ci' check
+- rust-analyzer: a tail's temporaries before the 2024 edition are dropped after the block's locals also when the tail unwinds, as rustc's (breakers: unwind_tail_after_local)
+- CI: unit tests read cargo's colored output and run rust-analyzer's slow tests; breakers names the open cases that pass now, and frame_of_tables and backtrace_line on macOS LLVM do
+- rust-analyzer: what leaving a scope early drops (break, continue, return, a future dropped at an await) is written at the scope's end, as rustc writes every drop it schedules (debuginfo: the corpus's async_drops frames)
+- debuginfo.py: what is known to be wrong is named in OPEN with why: rung2's ra-jit build polls a future rustc's code makes and lays out apart
+- buildmodel.py: a case known to come out WRONG says why in its case.json's `open` (all hosts, or by host), shows as open, and fails once it does not: doctest_future_generic, no_std_no_main on Linux, lto_single_linked on Windows
+- splices.py: Windows splices 60 of the 71 steps, not 61: the step with nothing edited links nothing, and the ten full links are the ones the count was set for
+- storefull.py: only rooms smaller than two thirds of what a cold build writes are tried, as LLVM on Windows writes under 512 KB and fills none of that
+- storelib: the store harnesses work in /tmp on macOS, whose temporary directory is too long for a daemon's socket (storecorrupts)
+- cargo_ra_jit.py: the second-user check shows what the request said on stderr when it printed nothing
+- CI: the action bumps of dependabot's #3 (checkout 7, upload-artifact 7, download-artifact 8, cache 6, wrangler-action 4), which closed when main was rewritten
+- cargo_ra_jit.py: a daemon that turns the second user away can close before the request is sent, a broken pipe the probe now reports as its answer (the uid check's '' on macOS and Linux)
+- docs/harness.md: CI, what runs when and how long, ci.py as the one list of the gate, the known-wrong lists, the ruleset; CHANGELOG: tail temporaries on unwind, the lines of early-exit drops
+- the daemon skips a build script's cargo check when cargo ra-jit just ran it, a script runs once per edit, the bench measures Cranelift as released; README bench table from dev-aws-11
+- script.rs tests: the script a test has rustc compile is stamped as compiled now, as a copy on macOS keeps the time of the file it was copied from (a_script_newer_than_its_source..., a_script_that_read_a_variable...)
+- Merge origin/main into the linux-speed merge: the runtime bench, new on main, takes the LLVM build, now that RA_JIT_BIN is the build without it
+- Merge origin/main into the linux-speed merge
+- #[ra_jit::cache] keeps the results of pure functions across runs, keyed by the code they reach (#17)
+- release binaries are thin LTO (`dist`) with PGO; a worker loaded beside cargo's first build ends with its daemon
+- benchreport: the build table says it times ra-jit's `cargo build --release`, and that release binaries are `dist` with PGO (docs/reports/RELEASE-BUILD.md)
+- Merge origin/main into the build-profile merge (CHANGELOG: both Changed entries kept)
+- the first edits patch what rustc linked, so the daemon is ready as cargo finishes (#11)
+- Merge origin/main into the cold-start merge
+- Merge origin/main into the cold-start merge again
+- Merge origin/main into the cold-start merge once more
+- cargo: rustc's link for Apple without chained fixups, so the first edits splice under nix (#30)
+- daemon: an edit that comes as the own base starts is not lost when it is interrupted
+- rustcbase.py: an edit that interrupts the own base may be either a patch or in full
+- Merge origin/main into the cold-start merge, before pushing
+- Merge origin/main into the cold-start merge, before pushing
+- async blocks and async fn bodies borrow-checked (1172/1165)
+- a program the daemon is writing in place is handed on once the write is over (#44)
+- lifetime errors in async fn bodies, E0621 as rustc (1188/1181)
+- Add Linux x86-64 live edits (#19)
+- E0381 for indexed arrays and captures (1191/1184)
+- the daemon's links keep code nothing reaches on every platform (after #23)
+- script.rs tests: a script a test runs is written by another process
+- hir-ty-wfcheck, item well-formedness E0309/E0310 (1200/1193)
+- where-clause and GAT well-formedness (1204/1197)
+- cargo is no longer stalled by the spare, lighter work beside cargo, generic copies patched (#11)
+- on macOS a patch whose frames outgrow the unwind table is spliced, both tables in the header's room
+- region constraints of proving trait bounds through the solver (Polonius 1223, NLL 1216)
+- struct literal where clauses, array repeat Copy, method turbofishes, well-formed type-relative paths (Polonius 1230, NLL 1223)
+- memory reports per request and on macOS, and what the daemon's memory is (#39)
+- a closure's creator's late-bound lifetimes, annotated variables in closures, function items called through variables (Polonius 1241, NLL 1234)
+- annotations in patterns, constructors called through variables (Polonius 1248, NLL 1241)
+- bun 1.4.3's Rust port built by cargo ra-jit, in the harness, the bench and nightly CI
+- assignment's drop is a write (E0506), match scrutinee read for moved values (1259/1253)
+- includes.py: the steps begin once the daemon's own build from the store is over (#54)
+- inlining across crates and runtime parity (1.21x of release's time over 15 benchmarks at the merge), cold build times beside it, AVX-512/NEON intrinsics
+- match tests at the scrutinee, E0713, E0373 for block-bound closures, E0597 for static impl Trait returns (1278/1272)
+- cargo fmt
+- cargo_ra_jit.py: wait_warm names the checkout by its real path (#59)
+- Workers hold at most half the machine's memory, or RA_JIT_MEMORY_MAX (#60)
+- a crate outside the workspace named through a link is found by the link (#51)
+- a file written while a worker loads is built as written (#53)
+- the daemon links rustc's symbols.o from its copy (GNU ld, panic=abort)
+- 'static in signatures and fields, Copy bounds, loops unwind, one E0596 per variable (1294/1288)
+- axum's futures, bevy's examples and main, doctests with -q (#26, #27, #28, #32)
+- well-formedness in bodies (1312 of 1579 Polonius, 1304 NLL)
+- buildmodel: no_std_no_main is no longer open on Linux
+- a fast CI tier for every change, the slow suites nightly, no run on main cancelled; parallel-lane workflow doc (#67)
+- CI: a cargo ra-jit job that fails or hangs keeps the daemons' logs and what was running (#64)
+- socket lock released on drop, plain cargo's settle waits for its cargo, stop waits for the daemon and its workers (#68)
+- Linux live edits splice a running executable as a copy, every Linux program gets a build ID (#70, closes #16)
+- an edit through a blanket impl's `impl Trait` is built, and an edit only a function left to rustc reaches goes to cargo (#25)
+- with `panic = "abort"` no call unwinds, and none has a landing pad (#66)
+- a source written since rustc built it is found through a link (#50)
+- the pinned run-pass tests run under a link, on Linux x64 and macOS (#49)
+- macOS: an executable linked with `-no_compact_unwind` is spliced (#33)
+- fn-cache: core's functions that turn an address into data are not pure (#18)
+- a daemon or --watch build does not inline across crates (#63)
+- an interrupted build keeps what rustc's copies are of (#71); full-tier expectations; perf count on arm64; worktrees.py diagnostics (#72)
+- Merge Bun nightly blocker E2E fixtures (#75)
+- every README benchmark a matrix over macOS arm64, Linux aarch64 and Linux x86-64
+- the own base is built when an include is not there (zed restarted it every second), and given up past a quarter of memory (#55)
+- glancer.md says who has each item, with the no-rustc, flat-syntax and share-types lanes
+- ra-jit never runs rustc (#80)
+- nocompact.py asks one instruction in (macOS 15's unwinder backs the pc up, #74); every harness script imports in the fast tier
+- CI: harness imports after the toolchain is installed (some scripts ask rustc for the host), failing on an import that fails only
+- dyn bindings invariant, unsizing proves the object's trait, Self constructors, constructors called through variables, const fn promotion in const items (1317 Polonius, 1309 NLL)
+- asm! takes its function's AArch64 extensions (bat's crc32w); whole-program links keep symbols.o so GNU ld takes the panic runtime (tokei, eza) (#78)
+- E0793 for unaligned references to packed fields, E0507 for moves in match guards and out of enum casts (1329 Polonius, 1321 NLL)
+- live latency: a number is judged once three runs before it show the runners' spread (benchhistory.py check --least); the same runner's medians differ by twice between rounds of one binary (#77)
+- closures called through variables, fn items through references, self of impl dyn Trait (1337 Polonius, 1329 NLL)
+- where ra-jit runs rustc, how often, and the plan to remove it (#94)
+- bevy's last steps in no-rustc.md (#95)
+- constructor-extended temporaries, expression statements (1339 of 1579)
+- the glancer lane owns #37's part of no-rustc step E
+- LLVM -O3 builds the shown bodies in first and cleans them as Cranelift's (nbody 1.97 -> 1.28 of release on Graviton4)
+- x86-64 SIMD intrinsics and one region-erasure cache from runtime-parity-2, without its in-bounds addresses and SLP
+- associated types in signatures, for loops over &mut (1363 of 1579)
+- a patch of rustc's executable calls no local of an optimized object (#52)
+- no syntax tree outlives its query; what syntax holds and costs (#42)
+- no program size is a reason to link in full; bevy's panic in the drop passes (#79, #96)
+- a spare worker only for a build that asks for one (#56); salsa lru with cycle handling measured, not merged (#57)
+- raw pointer relations, let fake reads, statics, Fn::call; 1373 of 1579
+- count every rustc and rustdoc run, refuse new ones; doctests built with their package's features (#97)
+- written lifetimes of constants and closure signatures, SCC representatives, impl Trait meeting its bounds; 1392 of 1579
+- nushell's forced-collect times
+- an error the daemon finds fails the build as rustc writes it, with no rustc (#84)
+- trait object upcasts, implied bounds of projections, raw pointer casts (borrowck 1400/1395, floor 1397)
+- dropck of associated types and opaques, const values (borrowck 1405/1401, floor 1402)
+- a flat syntax tree behind rowan's cursor; the compiler builds no green tree (#42)
+- the README's benchmark charts in colour, a hue per platform, cargo the neutral reference
+- associated types' alias bounds, impl anonymous lifetimes (borrowck 1414/1410, floor 1411)
+- every benchmark chart ra-jit against cargo around 1x, with each platform's geometric mean
+- opaque types' outlives, 'static from well-formedness, closure &dyn parameters, move error groups (borrowck 1422/1418, floor 1419)
+- the merge queue lands every change, a pull request runs fmt alone; macOS norustc.py back from 25 minutes to 79 s; apt packages cached (#106)
+- ra-jit answers rustc's questions: each asked of rustc once per toolchain (no-rustc B) (#100)
+- FnMut escapes through by-reference captures, closure E0521 naming, annotated locals (borrowck 1429/1425, floor 1426) (#108)
+- asm: no rustc to assemble asm! and global_asm! (no-rustc C) (#102)
+- proc-macro expansions kept in the store (#38) (#110)
+- bun built whole by ra-jit on Linux x86-64: every function compiled, linked, runs as cargo's (frame pointers, ELF sections, exported statics, same-name crates, macro fragments, cfg_if, dtoa, std copies, inline consts, adt_const_params, type_info); bun's Linux bench (#107)
+- docs: steps A, B and C done, their owners and what is left; counts on ripgrep and nushell after them (#112)
+- memcmp by its own name (tokei 1.51 -> 1.34 of release on Linux x86-64), and nushell links and runs: AArch64 crypto and NEON sums, masked loads and stores, dyn vtables of statics, narrow tuple constructors, provided-method futures, test-only global allocators (#111)
+- a let's written type keeps the lifetimes an alias or a _ shares, constant patterns ascribed contravariantly (borrowck 1430/1426, floor 1427) (#113)
+- a static a body's macro declares finds rustc's symbol: helix's own base in one round (#37, no-rustc E) (#114)
+- const { .. } blocks checked with their function, as rustc checks inline consts (borrowck 1433/1429, floor 1430) (#115)
+- docs/glancer.md: #56 merged, #57 closed, #55 restarted (#116)
+- a callee's projection bounds relate regions, array subslice moves checked per element (borrowck 1440/1436, floor 1437) (#117)
+- bun as a regular project in every README benchmark table and chart, and in the geometric means (#118)
+- Runtime numbers of main 9c31e64d83 on macOS arm64, Linux aarch64 (first time) and Linux x86-64, every program matching cargo's output (#119)
+- ra-jit answers rustc's -vV and --print questions from its own data, no first asks (fixture cold build 18 to 6, check 8 to 5) (#120)
+- borrowck: match guards (E0510, guard E0596), array-to-slice unsizing keeps the element type, compound assignments through fields with lifetimes report read and write; 1451/1447 of rustc's tests, floor 1448 (#121)
+- Linux AArch64's target specs in ra-jit's answers (cold build 7 to 6 there), and codegen options of no bearing answered without rustc (#122)
+- asm! is never assembled by rustc: without LLVM or a C compiler the build fails naming clang to install (rustc start sites 20 to 18) (#123)
+- doctests build the library with the features of the build cargo was asked for: ripgrep's globset example no longer crashes (#101) (#124)
+- borrowck: unsizing inside a struct, closures typed against an Fn bound take its arguments, annotated variables related as type annotations; 1455/1451 of rustc's tests, floor 1452 (#125)
+- the compiler path's hot walks read flat trees' arrays, not rowan's cursor (tree walking 4.9% to 2.05% of nushell's cold-start CPU, 10.0% to 5.0% of ripgrep's)
+- borrowck: errors in an expression a macro writes are reported at the macro's definition, and by-value captures in a move closure returned as impl Trait give E0597 as rustc; 1459/1455 of rustc's tests, floor 1456 (#126)
+- doctests: what rustc compiled of an example is reused while nothing it read has changed; the fixture's doctests 6 to 3 (step L, first part) (#127)
+- steps F and G: the standard library compiled by ra-jit and served from the store, every crate of ripgrep compiled by ra-jit and linked with nothing rustc built (#86, #87) (#128)
+- borrowck: function items used as values prove their where clauses, locals are Sized, a returned impl Trait's bounds hold of the type it hides, and closures see their impl's anonymous lifetimes; 1463/1459 of rustc's tests, floor 1460 (#130)
+- tests: ra-jit writes the test harness, so a test added is a build the daemon makes; a library's change in its tests alone keeps rustc's build; the fixture's tests 12 to 7 (step H) (#129)
+- bench: count each block of the disk once, so reflinked copies are not counted twice (#131)
+- borrowck: async blocks and nested impl Trait in returned hidden types, an async fn's returned impl Trait in member constraints, C variadics' VaList; 1471/1467 of rustc's tests, floor 1468 (#132)
+- bevy edits faster than cargo (body 0.90 s vs 3.0 s, leaf 0.27 s vs 10.4 s, new function 0.75 s vs 3.0 s; the first edit no longer waits for the whole-program compile), in_set and bitflags' contains compiled; D: deny lints, errors written before the daemon loaded, cargo ra-jit check (#98, #84)
+- no-rustc G: ra-jit's own link line derived from the target and #[link] attributes, the global allocator shim, build-script cfgs computed by ra-jit, panic_abort, bodiless intrinsics skipped (#86, #87) (#133)
+- taking away a function an edit added, or one rustc compiled, is a patch: no full link (new-fn-removed, fn-removed in rustcbase.py) (#137)
+- macOS builds the llvm feature against the flake's pinned LLVM (#138)
+- borrowck: iterator adapters' closures normalized in trait bounds, trait objects' 'static bound at unsizing and not from fields, aliases under a binder live by all arguments, Trait<'static> supertrait outlives; 1476/1472 of rustc's tests, floor 1473 (#134)
+- H follow-up: integration tests get ra-jit's harness, cfg_attr on tests expanded, rustc's harness kept until the tests change (test-edit back to main's timings), and widen only takes over crates rustc linked (fixes the link failure after adding a test). ripgrep test-added 18 -> 0 rustc, nushell 11 -> 0. (#135)
+- LLVM from the flake only: one pinned LLVM 20.1.8 for dev shells, CI and release builds; build.rs refuses any other (#140)
+- cargo ra-jit check with no build loaded is the daemon's verdict, not cargo check (#141)
+- borrowck 1499/1495 of rustc's tests (floor 1496): a shared borrow of a temporary built from constants is of rustc's promoted copy, loop exits ordered as rustc reports them, destructor conflicts through enum variants, and dropck of what coroutines and async closures capture (#144)
+- store: compress sealed packs in zstd blocks (about a fifth of the size), bound the store to a tenth of its disk with ra-jit cache gc and the size in ra-jit status, and have bench.py say what each project adds to one store per machine (#136)
+- deprecated_safe_2024, elided_lifetimes_in_paths and unsafe_op_in_unsafe_fn fail a build that denies them, 0 wrong on rustc's UI tests and 85 probes (#145)
+- Merge borrowck-7: borrowck 1506/1502 of rustc's tests (floor 1503): rustc's unused_mut lint, and rustc's false edges between match candidates in the MIR lowering, so a later arm's guard or pattern is checked where an earlier one is tested (#148)
+- frozen dependency artifacts: each crate's def map, impls and lang items served from the store with check and verify modes; ripgrep with a warm remote 4.25 s against cargo's 5.5 s (#40) (#149)
+- #[ra_jit::cache] keeps each function's results for its last three codes, and cargo ra-jit cache lists and clears stale ones (#143)
+- bun's whole program at 1.28x release (was 5.9x) and linking on macOS (#35); adding a function to bun a 0.6 s patch (was 19.8 s); a regression test for the rust-src check (#142)
+- ra-jit allocates with jemalloc on Unix: the daemon after edits 1.57 GB instead of 2.03 on ripgrep, 9.52 instead of 10.80 on nushell, 11.07 instead of 12.13 on helix (#39) (#146)
+- the daemon loads build scripts and proc macros from cargo's build instead of building them again (bevy's target 16.2 to 15.8 GB, ready 30 to 20 s), packs go to a remote compressed once, and docs/research/disk.md after F/G projected (#153)
+- #[ra_jit::cache] takes Rc, Arc and HashMap arguments, keys by the sysroot's metadata hash, and looks through the MIR of core and alloc: _rdtsc and the like refused, inlining hides no address (#18 items 1-3) (#150)
+- Linux x86-64 bench at 28f22ff4a8: bevy edits faster than cargo (a function 3.15 s to 650 ms, a widely used one 10.69 s to 240 ms) (#156)
+- docs say the workflows that commit to main push with RA_JIT_BOT_TOKEN past the ruleset, not GITHUB_TOKEN (#157)
+- Merge borrowck-7: borrowck 1509/1505 of rustc's tests (floor 1506): the super lets of format_args! and pin! extend their temporaries only when a let extends them, as rustc since #145784, a variable another crate's macro declares is a temporary in the messages, and an error at what a macro lowers to is at the macro call (#151)
+- link only what is reached of the standard library: the unit at line tables, split into an archive of 17 parts lld reads in parallel; hello's link 160 -> 130 ms, executables 20.4 -> 15.2 MB and ripgrep's 55.1 -> 50.1 MB (#87) (#152)
+- the daemon keeps ra-jit.o zstd-packed between the links that read it on Linux (helix's target 5.0 to 4.5 GB, nushell 6.2 to 5.8), and docs/research/disk.md with it (#158)
+- Release parity: a returned local is built in the caller's memory and a moved argument shares its slot (NRVO), rustc's ThinLTO pre-link and link pipelines, the SLP vectorizer on again, NEON's 16-byte addp as iadd_pairwise, and a trait's provided method's inner functions compiled with the crate ra-jit names. Runtime against cargo's release: nbody 1.26 to 0.98 on x86-64 and 1.29 to 1.05 on Graviton4, qsort 1.11 to 1.04, eza 1.08 to 1.00-1.06, words 1.28 to 1.24 on Graviton4 (#160)
+- Debug type sets share what each type is told as (#55); the own base gives memory back before giving up (#163)
+- borrowck: no false errors on tracing 0.1.44's trace! fields (#109) or on a trait object given for a parameter bounded T: 'a (#84) (#164)
+- doctests: ra-jit compiles and links the examples with no probe (L's second part); kept programs and parallel compiles; the fixture's doctests 3 to 0 (#162)
+- tests: ra-jit's harness always, written when a program of tests is first asked for; test-edit 0.2 s on ripgrep, 1.4 s on nushell; fixture tests 7 -> 6 rustc runs (#169)
+- borrowck: all of cargo 0.99 checks clean: impl header object lifetimes, promoted closures, unwind drops of values without drop glue, async fn hidden type lifetimes (#170)
+- LLVM is told what each read-only constant holds; tokei 1.39 to 1.34 on x86 and 1.29 to 1.21 on Graviton4, bun 1.27 to 1.24 (#171)
+- land.py's waiting survives the caller and a tool that ends its process group, logs to .git/land, and land.py --wait follows it again (#172)
+- Roots from the store: a checkout's own functions put in the object from the store when it has them whole, asked about once on every core, the crates listed on every core; ripgrep, nushell and helix with a warm remote under cargo's cold build (4.0 s against 5.5, 31.5 against 33.1, 26.0 against 31.3) (#166)
+- main green again: storefull.py on a 64 MB disk, which takes the 18 MB of frozen def maps a cold build now keeps (fixes #174), run in the merge queue's fast tier; vendor/'s ra-jit edits formatted, and CI's fmt checks the whole workspace (#175)
+- borrowck: no panic on concrete associated types in where clauses, and a checker panic fails the gate (#177)
+- splice: one copy of what a debugger reads, the linker's let go of once copied and a section moving only behind every room: bevy's target on ext4 23,487 → 21,930 MB, helix's 5,471 → 4,964, XFS and edits unchanged; disk.md: the daemon's program against rustc's by section, compressed debug information off (#182)
+- runtime on Linux x86-64 and aarch64 and bun's on x86-64, at e8d8a63da4 (#183)
+- frozen def maps name the file each include! reads: bevy's second checkout no longer panics reading crunchy's def map before its OUT_DIR file is loaded (#178)
+- borrowck: lifetimes needed by normalizing signatures and where-clause projections, and item check of projections in fields (1517 of 1580) (#181)
+- build scripts compiled and linked by ra-jit (step I, first part): every crates.io script through the wrapper, runs kept in the store, the standard library's unit made once per store; fixture cold build 6 -> 5 rustc runs, ripgrep's scripts 7 -> 1, nushell's 50 -> 5 (#186)
+- Frozen def maps name the files their include!s read, so a warm store loads them before serving (#161, #40); harness/frozenwarm.py covers a warm-store second run over macro_rules from an included file (#179)
+- an edit never links in full for want of an own base: a build in full is spliced whole into rustc's executable on Linux, and the edits after it patch (#159) (#184)
+- a whole program's compiles import what they call, as ThinLTO's backends: bun builds in 129.2 s against cargo release's 135.6 s on x86-64 (was 666.9 s) at 1.22x, and 160.2 s against 167.4 s on Graviton4 (was 694.1 s) at 1.17x; ripgrep, helix and nushell 3-8x faster to build; bun's Linux aarch64 rows; a transitive import's call type and dit asm fixed; norustc clears a target's RUSTFLAGS (#185)
+- borrowck: impl Trait with late-bound or elided lifetimes, inferred outlives bounds, for<'r> closure bounds, function item return types and trait-object associated type bounds (1523 of 1580) (#187)
+- README for people using ra-jit on their own projects; binstall metadata (#191)
+- nix: unit graphs with hir-ty-borrowck's new hir-ty-wfcheck dependency (#192)
+- borrowck: guarded arms bind by value after the guard, const promotion as rustc, nested impl Trait member constraints applied, unit cfgs in the scorer (1532 of 1581) (#193)
+- Fix the miscompiles fuzzing found on main: on aarch64 a 128-bit integer that goes to the stack in the Rust ABI takes the integer registers left out of use, as LLVM and rustc do, where Cranelift gave them to the arguments after it (#189: told-rpa-41's wrong checksum and land2-rpa-33/-85/-96's crashes); reify and fn pointer shims place the arguments after a receiver as their callers do (#190: told-rpx-57 c20 on x86). The 7 reduced programs go in harness/fuzz/found/, and CI's new Linux part quick-3 replays all of found/ under each backend (a small change to harness/ci.py) (#194)
+- the standard library shipped with each release and fetched over HTTPS before a build with nothing of rustc's first reads the store: empty-store cold build ripgrep 11.6 -> 4.4 s, nushell 38.9 -> 27.7 s; push compresses packs (std 65 -> 18.8 MB); cmpxchg16b compiles (#195)
+- borrowck: E0510 in indexing expressions, member constraints through a nested impl Trait, closures mutating through a captured Box (1535 of 1581) (#196)
+- each debug type described once, in groups of the types made of each other that every set shares: zed's own base finishes (62.6 GB, 662 s) and links when a link that keeps unreached code fails on what only that code uses; after the base and edits nushell 7.63 → 7.36 GB, helix 6.55 → 5.87, bun 15.97 → 14.47 (#29) (#197)
+- MIR ways out share their drops as rustc's drop trees do, and a call's arguments end with it: Xlib's open (x11-dl, 781 fields each ?) 2,986,013 -> 29,201 blocks, bevy's ra-jit --crate breakout --dev-deps 364 GB OOM -> 76 GB peak, 516 s; growth.py covers a struct of fields (#198)
+- Linux aarch64 bench at c93e530e47: bevy edits faster than cargo (a function 22.81 s to 884 ms, a widely used one 32.13 s to 352 ms); aarch64 headline 17x to 24x (#201)
+- build scripts that include! files or read variables with env!/option_env! are compiled by ra-jit: their dep-info names the files and variables (# env-dep), include_str!/include_bytes! files key the store; ripgrep cold 39 -> 38 rustc runs, nushell 493 -> 490 (#199)
+- A returned impl Trait captures the lifetimes elided in its function's parameters, so mutating self while an iterator from fn evens(&self) -> impl Iterator<Item = &i32> + '_ is live is E0502 (1536 of 1581) (#204)
+- the axis hints under the edits chart no longer overlap when nothing is worse than 1× (#205)
+- proc macros, J0 and the plan: a build script that links a proc macro is compiled by ra-jit, the macro expanded with rustc's library of it; nushell cold 490 -> 488 rustc runs; docs/no-rustc.md plans J1 (ra-jit's own proc-macro server) and J2 (proc macros compiled by ra-jit) (#207)
+- Build exports of bodies up to 16 Cranelift instructions per LLVM instruction of room, not 4: Cranelift's IR of small std calls is many times LLVM's (SipHash's d_rounds is 1792 Cranelift instructions and about 50 LLVM ones), so at 4 no export of it was built and every hasher called it out of line. kernels words: x86 1.27x -> 1.14x, aarch64 1.38x -> 1.23x; geomean of kernels, numeric, jsonrt, ripgrep, fd, tokei, bat: x86 1.14x -> 1.12x, aarch64 1.15x -> 1.14x; build time +0-5%. (#210)
+- unused_mut fails the build, scored on rustc's UI tests with --deny; unit-typed expressions give their place () (#211)
+- J2: a program links proc_macro, ra-jit links shared libraries and writes a proc-macro crate's list of macros into its library; difftest fixtures build in their own target dir (#213)
+- RA_JIT_UNITS=1 compiles a whole program in codegen units, many functions to an LLVM module, found from IR in one round with kept imports; off by default, as helix builds in 71.1 s against 69.7 s and runs 1.28x against 1.21x on x86-64, and LLVM takes 4x rustc's time for code of the same size either way; imports linked to each other two at a time, then into the module once (#176) (#209)
+- Prove for<'a> bounds for placeholders, as rustc does: &'static str: DeserializeOwned and a forwarding impl that needs more than the where clause gives are rustc's higher-ranked lifetime error (1539 of 1581) (#212)
+- compile-ahead gives up on what it compiles once the symbols are read: bevy's second warm-store run ready in 26.5 s, was 148 s; salsa ignores a thread's own cancellation in cycle-recovering queries, so the threads are stopped as a write stops them and the trait solver checks per goal (#217)
+- the SSE and AVX compares lowered (cmp.ps/ss/pd/sd and the 256-bit ones): glam's Vec4::cmpeq and is_finite_mask, which bevy calls, compiled (#218)
+- Linux x86-64 bench at 42cb85270f with the standard library fetched as a release does: the daemon after edits helix 12.3 -> 6.0 GB, bevy 39.6 -> 15.0 GB, nushell 10.9 -> 7.2 GB; cold builds slower and larger (#203) (#221)
+- LLVM builds put asm! blocks where they are called, as rustc does, instead of calling their wrappers: each block's template, operands, clobbers and options become LLVM inline asm in the caller (x86_64 and aarch64; blocks with labels, sym operands, clobber_abi, noreturn or may_unwind, and vector registers keep the wrapper; RA_JIT_INLINE_ASM=0 turns it off). bun's stack check (1.5% of its samples as a call) is gone from its profile; bun's run time is unchanged at 1.21x. A small change to vendored rust-analyzer's MIR: inline asm keeps its clobber_abi and whether each register operand may be written. (#208)
+- Borrow-check the constants of a signature (array lengths, const generic defaults); 1541 of 1581 of rustc's tests (#219)
+- J1: the release's proc-macro server built by ra-jit, loading ra-jit's proc-macro libraries, held against the toolchain's server (#220)
+- f32::max in a constant is evaluated (core's fallback body), so nsh apps' builds stay whole-program and their edits patch; a trait method left without an impl names its Self type (#224) (#228)
+- biome: the first edit after a cargo build stays the daemon's, memory bounds follow the control group, biome in the bench set (#229)
+- cargo ra-jit test: RA_JIT_TESTS=affected runs only the tests an edit reached since they passed, from the daemon's hash of each test's code and all it calls (#227) (#230)
+- docs/research: the store's block cache measured on helix's warm start (no gain), and bbtree against papaya and DashMap for ra-jit's shared maps (#231)
+- AGENTS.md: own the whole stack, and stay a superset of Rust (#234)
+- cargo ra-jit check writes rustc's JSON diagnostics as cargo check does (424/424 fields against rustc), -Z, --exclude and several targets checked by the daemon; the borrow checker's 4 trait-solver panics fixed at their causes; the 5,204-arm else-if chain in 4.5 s (#206); ide-diagnostics passes and runs in the fast tier (#222)
+- Affected tests: TypeId::of and the dyn Any methods are leaves of the hash walk (#238)
+- build lists the crates it asks for on every core: a signature edit's roots stage 53 to 30 ms, edit-to-binary 410 to 373 ms on nushell (#236) (#239)
+- harness: leanprof.py and cpufold.py --phases; research: lean-frontend.md, where nushell's cold start, edits and heap go and the lean path ranked (#236) (#240)
+- warm start with nothing of rustc's: store entries read once, interner found under a read lock, future types walked once, edits do not wait on store writes, a stopping daemon lets workers finish writing; helix's restarted build on a warm store 106.5 -> 38.3 s, store reads 561 -> 131 s of thread time (#41) (#235)
+- Affected tests: say why a test runs every time as the call path to what it reaches (cargo ra-jit test -v, a count in the summary); a HashMap's seed and a backtrace count as the test's code, ripgrep's always-run tests 881 -> 469 of 1,144 (#227) (#241)
+- the patch base is asked one mark per root and per instance, not one per row (#243)
+- salsa is vendored, and an interned value already verified this revision is checked without the shard's lock (#244)
+- a build verifies the impls of the crates it builds on every core, beside the stale check (#245)
+- borrowck: the locals initialized at drops are found from the initialized paths, not by walking every local (#246)
+- Affected tests: a failing test program forgets only the tests libtest says failed, helix-core with no edit 170 -> 14 run of 170 (#227) (#247)
+- helix builds again: the fn pointer a match of fn items or closures coerces to holds for any lifetime they elide (#212's higher-ranked lifetime error) (#251)
+- biome's first edit after a cargo build is the daemon's: a source a build script touches before cargo's rustc reads it is no change (biome's body edit 232 s and 27 GB to 0.7 s) (#250)
+- a build names its crates through queries of the crate graph, not by walking it for every name (#252)
+- Cranelift: the self-relocation placeholder FuncId is u32::MAX - 1, so debug builds of ra-jit no longer refuse every function (split from #237) (#254)
+- Test harness: a test in a private module named as a public function beside it is reached; helix-core's edits are the daemon's again (#227) (#256)
+- a tracked function's interned arguments can be kept for good, and six hot ones whose arguments salsa never collects are; cpufold.py counts samples by period; lean-frontend.md, slices 2 to 4 (#253)
+- Doctests: one load of the workspace for every library's examples, and the daemon's store; warm cargo ra-jit test --doc on ripgrep 82.6 -> 3.3 s, helix 125.3 -> 9.7 s (#28, #227) (#248)
+- docs/ci-runner.md: our own CI runner on ix, a warm ra-jit seed per repository and a copy-on-write fork per branch (#264) (#266)
+- a daemon's first start after a cold build finds what that build stored: one toolchain identity either way (nushell restart 0 to 103,750 functions found, cold compile 17.9 s to 11.9 s) (#267)
+- tests that reach outside their code run in a Linux sandbox and rerun only when what they touched changed (#257) (#263)
+- ra-jit is renamed blaze: `cargo blaze` is the command, `cargo-blaze` the crate and binary, BLAZE_* the settings; `cargo ra-jit` and RA_JIT_* keep working (#268)
+- docs/roadmap.md: blaze-next, the floor of an edit for coding agents: Merkle VFS, sans-IO core, push invalidation, image state, agent API, lints (#279) (#280)
+- frozen def maps of a crate with a build script are shared by every checkout: OUT_DIR keyed from cargo's build dir and named by a mark in the bytes (nushell second checkout 221 to 374 of 478 crates) (#281)
+- research: lean-frontend.md, slice 4's four functions measured alone, and #236's rest left for blaze-next (#282)
+- Unit tests: an edit to a library they link is the daemon's, not cargo's; ripgrep's edits run the tests they affect (#258, #84) (#265)
+- roadmap: the agent API in deterministic CBOR, and the concurrency model (a shared-nothing control and IO plane, a compute plane of snapshots, work stealing and one committer, a deterministic scheduler) (#284)
+- README and install.sh: blaze installs with one line (install.sh, checked on Linux and macOS), and the docs say `cargo blaze` (#285)
+- Repo renamed indexable-inc/blaze: land.py, release, bench, site, templates, workflows and crate metadata name it (#288)
+- Test harness: ra-jit writes it for benches and an ignore with a list too, so a test added there is the daemon's (#88, #258) (#286)
+- biome joins the README's benchmarks and charts (Linux x86-64, both backends) (#289)
+- bench: biome in the README chart and tables, Linux x86-64 at 1a005421b7 (biome body 2.4 s, leaf 0.38 s against cargo's 9.9 s) (#290)
+- Debuginfo: work out the types of variables only when variables are written (#225)
+- cargo ra-jit: a build that goes to cargo says it is a bug, and testselectbench fails on one for ripgrep and helix (#84, #258) (#287)
+- patch marks keyed by stable names: a daemon started on a store takes the checkout's code as it is, no rebuild before the first edit (nushell restart 30.8 to 21.4 s) (#295)
+- README heading: ix mark vertically centered on the blaze wordmark (#297)
+- cargo blaze builds with Rust 1.99.0 whatever toolchain the project pins (#269): no build goes to cargo for it; plain errors when 1.99.0 or rust-src is missing (#296)
+- docs/self-contained.md: the plan for a blaze with no rustup and no cargo that resolves as cargo does (#298) (#301)
+- blaze-build-script: the environment cargo 1.99.0 gives a build script, computed with no cargo (#89, #298) (#304)
+- README: an animated pixel-fire header and a short, scannable README; the long parts move to docs/install.md, docs/usage.md and docs/benchmarks.md (#308)
+- docs: J, K and M planned together (#298): J first, K behind it, M last (#313)
+- A cargo daemon takes the checkout's roots from the store too, not only a build with nothing of rustc's (#320)
+- Update tagline in README for clarity
+- blaze-build-script: build script output read as cargo 1.99.0 reads it, and who receives what (#89, #298) (#306)
+- README: the three commands to try in a plain block (no builtin colour on `test`) (#323)
+- Make the first build the daemon's: after cargo's build, wait for the daemon to load the workspace and build the program, with one quiet Waiting line (#310)
+- splice: a function shorter than a jump takes it over its padding, or hops to traps near it: biome's leaf edit 360.7 s to 0.50 s (#242) (#303)
+- ra-jit std ships the standard library's unit of a dev program too: a whole build from nothing no longer compiles it (#91) (#330)
+- J1: proc macros of a load linked by ra-jit and expanded by its server behind RA_JIT_PROC_MACRO_SERVER (#90); macroserver.py compares every proc-macro call of the bench apps, 3,465 the same (#329)
+- blaze-manifest, blaze-registry, blaze-resolve and blaze-build-script together (#304 #305 #306 #307 #309 #311 #312), workspace members as crates/* (#298) (#314)
+- cargo blaze reads the workspace with blaze-manifest, not `cargo metadata --no-deps` (#298): equal to cargo on 385 of 385 workspaces (#319)
+- J: blaze's proc-macro server ships in the Linux release beside ra-jit, built by ra-jit; RA_JIT_PROC_MACRO_SERVER=1 finds it there and the toolchain's server starts only for a library blaze's does not serve (#343)
+- install.sh without rustup, blaze brings its Rust; install.yaml on a machine with no Rust (#298) (#340)
+- J: proc macros are blaze's by default: the daemon's loads, the checker and build scripts expand with libraries ra-jit makes from each crate's record, kept in the store by content; macroserver.py builds each app again over the store (#348)
+- blaze-registry fetches every source a lock file names as cargo 1.99 does ([source] replacement, vendored directories, git checkouts), held to cargo fetch by harness/fetchdiff.py (#298) (#324)
+- docs/self-contained.md: the no-rustup install measured on a clean machine, the metadata switch (#298) (#352)
+- a workspace resolved as cargo 1.99.0 does around its resolver: two resolves, [patch] and the lock file's locks (#298) (#339)
+- a name is looked up in an index of the names in rustc's function symbols: biome's first body edit 6.63 s to 5.25 s (#325) (#356)
+- The store keyed by what ra-jit was built from, crate ids below CARGO_HOME, build-script runs keyed with the checkout and target directory apart (#105) (#326)
+- cargo blaze build and run from nothing build the programs whole with blaze, no cargo build, behind RA_JIT_WHOLE_BUILD (no-rustc K, #91) (#345)
+- keep calls of rustc's copy of a function of the checkout in the store (#216) (#360)
+- blaze-manifest: .cargo/config.toml as cargo 1.99 reads it (config get 103/103) and profiles as cargo computes them (86/89 over 235,924 units) (#298) (#354)
+- Linux builds held to glibc 2.34 (RHEL 9), and install.sh to blaze run checked in Debian 12, Ubuntu 22.04 and RHEL 9 containers (#351) (#355)
+- a build over rustc's base compiles the statics and TypeIds it needs in one round, and one with thread-locals of its own is linked in full at once: biome's signature edit no longer falls back to cargo (#299) (#358)
+- blaze-build-script: build scripts run as cargo runs them, held to cargo by harness/scripts.py over 463 runs (#89, #298) (#341)
+- closures named by their place and their source, so an edit above one keeps what the store has (#362)
+- site: Flecs content, Rust renderer in wasm, RFCs with inline comments, charter, narration (#363)
+- whole build: names, debug info and store entries made on every core after the compile, the store written on several threads, roots and data-only instances given to the threads that compile ahead; nushell's cold whole build 88 s to 70 s on dev-aws-8 (#361)
+- the daemon's loads read the workspace with blaze's own resolution (blaze-metadata): no cargo metadata, the graph of the build, axum's whole build builds (#364)
+- whole build: a request to the daemon, whose worker loads the workspace, links each program before it answers, and builds the edits after on what it loaded (#91) (#365)
+- the first edit after a restart: code from the store told unchanged by its items; ripgrep 382 to 17 functions asked, 0.31 to 0.22 s (#366)
+- whole build: edits spliced into the executable the daemon linked, and the programs planned by blaze's own resolution (#91) (#367)
+- added and removed types and new statics go out as live patches (#368)
+- blaze builds with the latest nightly, nightly-2026-10-25, in place of stable 1.99.0: rustc_abi and the proc-macro server from it, deref patterns, -Z flag table, cargo's second build-dir layout, TypeId numbering, nightly cargo-features (#372)
+- Cranelift probes the stack on every target rustc does (#374)
+- a static in a const _ block is looked up under rustc's _ segment (#376)
+- Stateful statics stay rustc's wherever rustc linked them (#373)
+- A cargo build of one program leaves the others the daemon built as they run (#375)
+- A local no place mentions has no stack slot (bug D: closure frames held dead copies of their captures) (#377)
+- every test runs in a sandbox by default, on Linux and macOS (Seatbelt and an interposer), one per test executable, with per-test records and opt-outs (#257) (#383)
+- five external PRs (tobi #370 #371, gakonst #292 #293 #294) (#381)
+- splice: a stub for a call of a patch's function that replaces one of the executable (#380)
+- whole build: the cold compile's store names listed once per crate, frozen parts on every core, sharded type sets and interner front caches; RA_JIT_RUSTC_BASE reaches its worker (#384)
+- let go of the own base's MIR and code after a build, give pages back (#261) (#385)
+- rustcbase typeid-ctor: an edit under axum's Body::from_stream(stream.map(Ok)) is built by the daemon, not cargo (#369) (#389)
+- keep an interrupted own base's work, set lru only when serving, test salsa's patch (#261) (#387)
+- stateful statics LLVM renamed or kept private are rustc's copy, or the function is refused (bug E) (#379)
+- reth's first edit after ready: the define pass's statics and closures counted once a definition, on-demand functions wanted once a crate (#259) (#391)
+- restart: stored roots' lookup sharded, their types read when described, def maps of crates with proc macros frozen (nushell restart 15.6 s to 12.6 s) (#394)
+- AGENTS.md: no fallback, ever; fail fast with a clear error so the bug gets fixed (#395)
+- No fallback: a stateful static whose copy in rustc's code can't be shared stops the build with an error naming it (CodegenError::Refused), instead of leaving the function to rustc (#396)
+- every cargo blaze subcommand is blaze's own: none is passed to cargo (#397)
+- build scripts and proc-macro servers run in the sandbox by default, with per-package opt-outs, read-recorded reruns, and hardening: own session, no TIOCSTI, host Unix sockets, Mach services and io_uring refused (#147, #257) (#390)
+- cargo blaze tree, pkgid, fetch, clean, new and init are blaze's own (#398)
+- blaze-fmt: blaze's own formatter, rustfmt ported onto blaze's syntax tree, byte-equal to stock rustfmt on the bench apps (#400)
+- AGENTS.md: blaze is its own toolchain (one nightly it controls), moving off rustc; never follows the project's toolchain or pins stable (#407)
+- CI as a merge gate of minutes and a release train on main that releases when green (#419)
+- serve the site at ix.dev/blaze; ra-jit.ix.dev and blaze.ix.dev 301 there (#411)
+- cargo blaze fmt is blaze's own: blaze-fmt in process, cargo-fmt over the targets or rustfmt over the files named (#415)
+- borrowck: no false errors on helix or biome (#406)
+- route ix.dev/blaze* so /blaze?query reaches the worker; document the manual deploy (#424)
+- agent rules move to typed agents/rules.ts; a SessionStart hook injects the numbered rules without reasons; AGENTS.md is generated and checked in CI (#417)
+- cargo blaze fmt and clippy are blaze's own, enable links them; search, owner, yank, login, logout, uninstall, read-manifest, report, config, remove and vendor are blaze's own; borrowck fix (#416)
+- macOS: the sandbox's library carries an arm64e slice; the prebuilt std's names are read without Mach-O's underscore (#425)
+- cargo blaze doc writes HTML documentation from rust-analyzer's HIR, with no rustdoc (#410)
+- codegen: finish the block before building unwind pads (drop_ladder, guarded) (#426)
+- say blaze, not ra-jit, on every page and in the narration (#428)
+- cargo blaze doc documents the crates cargo does, links undocumented crates at html_root_url, applies blanket impls as rustdoc does, lifts rust-analyzer's macro token limit (#427)
+- AGENTS.md rule blaze-builds-blaze (#432)
+- build(deps): bump the actions group with 4 updates (#430)
+- README: Using blaze at work? (#422)
+- cargo blaze: Windows MSVC builds go through the daemon (#346)
+- ra-jit-live: live edits on Windows x86-64 (#347)
+- Whole-program builds lay functions out in the order they were asked for, so every build of the same source is the same object (#200) (#409)
+- blaze is its own toolchain: blaze-<date>, linked into rustup as blaze, a note when a project pins another (#405)
+- A macro call in parentheses or brackets with no `;` after it has to expand to one expression, as rustc parses it (#154) (#429)
+- Fix binding references in nested match guards (#393)
+- One path: build, run and test are the whole build, and blaze runs the doc tests: no cargo build, rustc or rustdoc (#408)
+- the LLVM backend on our fork's LLVM 23.1.4, linked statically and shipped in release binaries; LLVM's diagnosed errors are errors; asm texts in the store key (#431)
+- LLVM's inliner at threshold 500 by default, measured against 225, 1000 and nothing built in by blaze; the threshold is in the store key (#434)
+- No-rustc E: generic functions aren't roots and pathless functions are named by place, so std's 12,108 'no rustc symbol' are gone (#439)
+- On macOS the doctests are ra-jit's: the standard library's unit is not weakened (#255) (#440)
+- define the injected extern crate std in a 2015 crate root (#437)
+- No-rustc E: #[rustc_comptime] functions aren't roots; the const-heap intrinsics run rustc's runtime bodies (#441)
+- x86 float compares read their predicate as an immediate (literal, inline const, or a const generic cast) (#438)
+- docs: remote-cache.md, design of the shared remote cache (Worker gateway, public/private CAS, signed index) (#444)
+- x86 crc32, pternlog and 512-bit pshufb intrinsics, so crc-fast and blaze's own whole build compile (#442)
+- Install line: curl -fsSL https://ix.dev/blaze/install.sh | sh (the site serves install.sh from main; blaze.ix.dev redirects there) (#446)
+- x86 avx512 permvar intrinsics, the last function of blaze's own whole build left without code (#447)
+- Shorter install line: curl -fsSL https://ix.dev/blaze | sh (site worker serves install.sh at / to curl/wget, HTML to browsers) (#448)
+- in a load nothing is rustc's: ra-jit links the build scripts and proc macros and only describes their libraries (#450)
+- Fix three refusals of blaze's own whole build: asm! const operands as anonymous constants, AVX-512 IFMA intrinsics, stand-in messages read from their own section (#452)
+- Build scripts run with blaze as RUSTC: probes, -vV and --print answered by blaze, no rustc (#451)
+- whole build: later programs read the store in batches, keep entries across rounds and learn the others' rejections (230 s -> ~13 s a program) (#456)
+- ci.py: no timing line for a harness that is gone, and stop at one (#413) (#449)
+- borrowck: no false errors in blaze's own tree (elision ignores the impl's lifetimes in Self; a trait object's implied bounds) (#457)
+- agents: heavy work runs in ix VMs, not AWS dev hosts (#459)
+- No-rustc F: the toolchain's commit from its channel manifest or blaze's pins, not rustc's libstd rlib (#436)
+- No-rustc E: lane-by-lane simd intrinsics, funnel shifts, frem_algebraic and one-lane vectors by value are compiled (#85) (#443)
+- on macOS an edit is spliced into the daemon's own link, not built in full (#445)
+- the check of an edit asks only for the bodies it changed (#455)
+- a link_name written as the symbol is not prefixed again (aws-lc-rs on macOS) (#454)
+- test: cover LLVM store checksum regression from #418 (#464)
+- harness: borrowck_apps.py, borrow-check the bench apps (#465)
+- one train concurrency group per ref (#472)
+- blaze clippy reads the terminal's width only on unix, so ra-jit builds on Windows again (#471)
+- borrowck: check nested bodies in unreachable code (#469)
+- borrowck: buffer E0382 across a function and its closures as rustc does (#470)
+- CI's ra-jit.tar carries cargo-blaze, which ra-jit enable needs (#473)
+- wfcheck: the bounds of an impl Trait a trait's method returns are well-formed (E0310/E0311) (#474)
+- fix two borrowck test fixtures that only fail in fork alone (#476)
+- borrowck: a type that must outlive any placeholder must outlive 'static (#475)
+- the standard library's metadata is blaze's, no cargo metadata of the sysroot (#477)
+- a program that reaches a function ra-jit refused is an error naming it and why, not a link failure (#479)
+- config_get test stops the config walk at its scratch dir (#478)
+- borrowck: prove a closure's creator's where clauses at its creation (snocat-regression) (#480)
+- doctests and whole-workspace link line as nightly-2026-10-25 has them (buildmodel WRONG x3) (#483)
+- No-rustc E: NEON intrinsics, barriers, rndr, rounding simd intrinsics and small vectors by value compile on aarch64 (#85) (#482)
+- borrowck: relate function item types with the item's variances (#481)
+- borrowck: a cast's user type annotation is the type written (#487)
+- borrowck: report a capture's borrow at the first use of the place (#486)
+- remote.py a remote that lies changes every pack A sent (.pack.zst too) (#489)
+- testselect: count "that test taken out of the sandbox" again (#495)
+- debuginfo.py counts a value gdb cannot print as optimized out as optimized out, not wrong (#493)
+- Fn-trait vtable slots of written impls take the arguments one by one (self-test segfaults) (#492)
+- wfcheck: a signature's and impl header's trait bounds are well-formed (E0310, E0477) (#497)
+- std's foldhash, rand and nested define_opaque no longer refuse (No-rustc E, #85) (#494)
+- borrowck: higher-ranked subtyping of fn pointer types (expect-fn-supply-fn) (#499)
+- borrowck: a slice's bounds check reads its length where it is indexed (#501)
+- a link that fails on a name the standard library's unit refused (an extern call to an exported function nothing in the library calls) is an error naming the function and why (#503)
+- borrowck: a function an asm! names by sym has its where clauses proven (E0309) (#498)
+- borrowck: normalize the return slot's type with regions of its own (#500)
+- CI's ra-jit.tar carries blaze's proc-macro server, so a load links its proc macros (#491)
+- the whole build gives integration tests CARGO_TARGET_TMPDIR, as cargo does (#504)
+- hir-ty-codegen: count each constant once in the unit read-back test (#506)
+- Windows tests read paths as cargo is given them; ra-jit finds a quoted response file and a crate asked by a /-path on Windows (#507)
+- borrowck: check builtin derives as rustc expands them, packed structs' fields copied out (#505)
+- sandbox: say how on when a container's seccomp refuses the user namespace (#420) (#510)
+- A build that would write a cdylib or staticlib stops with an error, not a silent Finished (#262) (#511)
+- No-rustc E: SVE/SVE2 scalable vectors, their layout and a first family of intrinsics compile on aarch64 (#85) (#514)
+- borrowck timings mode; an edit re-checks only the bodies it changed (#512)
+- f16, f16b and f128 compile on AArch64 Linux (#502)
+- a workspace load asks cargo nothing of the toolchain or the configuration (#485)
+- borrowck: a temporary may be unsized, as rustc's as_temp makes one; a place statement moves into it (#515)
+- borrowck: closure-to-fn-pointer casts and written projections under for<'a> (issue-102800) (#509)
+- blaze's proc-macro server builds on macOS; CI's ra-jit.tar and the macOS release ship it (#508)
+- a red train opens its issue again: train_issue.py reads job logs with gh api --allow-escape-sequences (#517)
+- 128-bit atomics on AArch64 Linux compile (No-rustc E, #85) (#496)
+- borrowck: a returned impl Trait's hidden type is well-formed at the signature in its defining body (#519)
+- blaze-gateway v0, the Worker in front of R2, deployed (#520)
+- cargo_ra_jit.py's warm-up check asks whether the warm-up linked build scripts or proc macros again (#522)
+- Windows tests expect config and dependency paths joined part by part (#523)
+- mir eval reads a slice's length as the target's usize (wasm32 consts) (#524)
+- blaze-units makes cargo's unit graph with no I/O; plan.rs runs no cargo build --unit-graph (#516)
+- the gateway's blob store (/has /get /blob /put), D1 locations, private HMAC namespaces (#526)
+- a toolchain without rust-src is turned down saying so again (rustsrc.py, core-2) (#528)
+- A stateful static whose first value changed, which ours can't replace, stops the build instead of keeping rustc's old value (#392) (#527)
+- nix-live runs beside the train, not in its run: a cold nix build no longer holds main's next train (#532)
+- Daily toolchain bump to the latest nightly, gated by the train (#404) (#529)
+- Keep a load's two proc-macro modes apart, take the mode from the build, and name the way through (#460) (#530)
+- ra-jit reads and writes the cache gateway (Place::Gateway), RA_JIT_REMOTE_REQUIRED, e2e numbers (#525)
+- wasm objects: a segment is aligned as the code generator asked, not by its size (#534)
+- No stale program after an edit of the global allocator or a daemon restart (#386) (#536)
+- No-rustc E: SVE and SVE2 intrinsics but gathers and scatters compile on aarch64 (#85) (#537)
+- the daemon's own link passes -C link-arg and -C link-args, as rustc's does (#488)
+- toolchain-bump: verdict runs main's scripts; --checks corpus invocation (#540)
+- No-rustc E: unsized values taken by value compile (#85) (#539)
+- hir-def: expand a std prelude macro at item level as it is collected (fixes #327) (#538)
+- No-rustc E: SVE gathers, scatters, gather prefetches and svrev compile on aarch64 (#85) (#554)
+- what each build script of the bench corpus reaches in the sandbox (590 scripts, 17 would be denied) (#556)
+- the sandbox record test is Unix-only again (lost in #510's merge) (#565)
+- splices.py holds Windows to 57 splices, the count since thread-locals carry their own copy (#562)
+- borrowck: a closure parameter's &dyn Trait of a 'static trait defaults to 'static (#558)
+- buildmodel crate_staticlib links synchronization.lib on MSVC (#564)
+- borrowck: lifetime elision counts only lifetimes the written signature has (#559)
+- docs: wasm32 measured at the pinned nightly (#555)
+- borrowck: offset_of! takes no reference (no false E0793 on packed structs) (#553)
+- CI's blaze-remote action: pull blaze's store from the gateway, push from main (slice 1 wiring) (#552)
+- A crate-local writable static (OnceLock, Mutex, atomic, static mut) reached from main builds in a --release whole build (#551)
+- The build manifest (#41): an unchanged build on a fresh machine writes the program from the store and links (#550)
+- toolchain: remove the nightly an older blaze downloaded once the new one is in (#548)
+- a whole build's marker of a program of tests is not the program (fd's `tests` was truncated by every cargo ra-jit test) (#568)
+- borrowck: a body's trait object under an inferred lifetime has its own lifetime (#547)
+- borrowck: a fn item's elided lifetime is late-bound when it is reified to a for<'a> fn (train: fork alone) (#546)
+- borrowck: interval sets, SCC region inference, block-wise loan scopes (speed, no rule changes) (#545)
+- the half-precision NEON intrinsics compile on AArch64 (#544)
+- Link a library's cdylib as a shared library at cargo's path (#262) (#513)
+- borrowck: Self written in a trait object's bounds or a fn pointer is the impl's self type (#557)
+- buildmodel finds the whole workspace's link line on Windows (#563)
+- borrowck --project refuses a workspace cargo metadata fails on; apps sweep fetches bun's vendored crates (#570)
+- stringify! spells tokens that came out of a proc macro as rustc does (#560)
+- no merge queue: pull requests merge directly once ci passes, not required to be up to date (#566)
+- a state another ra-jit wrote is a cache miss; cargo blaze has no cargo-fallback path left (#571)
+- locals whose storage never overlaps share their stack slots (#561)
+- blaze disable removes the bin directory of cargo's home that enable made (#572)
+- a whole build's tests are where cargo puts them, in its build directory and its second layout (#569)
+- toolchain-bump: compare the bump's train with the train of the main commit it is on (#578)
+- wasm32: functions that take ..., their list the address of what the caller wrote (#573)
+- train: a wasm32 job (harness/wasm32.py under the flake's wasm shell) (#535)
+- cargo_ra_jit.py's checks of the daemon's life follow the one-path whole build (#575)
+- borrowck: impl Trait captures in traits, hidden-type WF, OpaqueType blame, async closure captures (#490)
+- debuginfo.py counts a value gdb prints in part, the rest optimized out, as optimized out (#577)
+- borrowck speed: timings measure an edit; wfcheck's inferred outlives is a query; is_copy once per type (#576)
+- a whole build fails on an error as rustc and cargo write it, also one in code nothing reaches written while no daemon ran (#574)
+- borrowck: promote by the qualifs of the value, as rustc's check_consts::qualifs (#579)
+- A patch's own statics take names of their own: no TLS DataDeclaration::merge panic after a regen edit (#291) (#581)
+- docs agree on Windows x86-64 MSVC: builds and live edits go through blaze (#462) (#587)
+- No-rustc E: the AVX-512 intrinsics and asm kreg operands compile on x86_64 (#85) (#584)
+- nix/units: regenerated, the flake evaluates again (#531)
+- borrowck --project: a test of the refusal of failed metadata; bun's vendored crates get their patches (#583)
+- store: a build that compiles std's crates refuses entries that call into the std unit (#328) (#533)
+- link proc_macro into a build script or program whose crates name it (bat) (#588)
+- No-rustc G: blaze builds and links wasm32 programs (#567)
+- Doctests: keep the line after an example's crate attributes, as rustdoc does (#249) (#589)
+- build scripts and proc macros, built and run, are store entries keyed by what they read (interim: the Nix-model closure key replaces the run read set next) (#585)
+- wasm32: v128 and the simd128 / relaxed-simd operations lowered to wasm SIMD, 128-bit integer operations, vectors in the wasm C ABI (#590)
+- doc tests run again after an edit to the library, and -q shows them tersely (#594)
+- Codegen: fma keeps the NaN rustc keeps on AArch64 (#586)
+- MIR: a call that writes only the const generics of a #[rustc_legacy_const_generics] function as arguments passes them as generics, as memory_size(0) (#591)
+- cargo's home is an overlay in the test sandbox, so a test that runs cargo passes (#602)
+- a sandboxed build script's directives are checked before cargo reads them (link-search, link-arg, rustc-env rules; 0 of 587 corpus runs refused) (#603)
+- integer constants are immediates, not loads of data (#606)
+- a cdylib exports the C-level symbols of every crate it links, as rustc's (#605)
+- inline(always) library callees are inlined in wasm objects (#607)
+- wasm objects carry rustc's custom sections: link_section statics and target_features (#604)
+- a build script run for host and target is read as the target's run (#609)
+- wasm32: writable data of only zeros is .bss, which the linker leaves out of the module, as LLVM makes it (#610)
+- wasm C ABI: an aggregate of one scalar goes as that scalar (#608)
+- nix/units merge when two PRs change Cargo.lock: units keyed by name, lock and manifest mirrored (#353) (#611)
+- a sandbox can see a view in place of the machine: its binds alone on a root of its own (Linux: tmpfs root, pivot_root, own /proc /dev /etc /tmp), for build scripts under the Nix model (#612)
+- borrowck: a _ inside an associated type in a user type annotation is solved by equating with the inferred type (#518)
+- No-rustc E: svdupq_n_* compile on aarch64, the last of the SVE class (#85) (#613)
+- No-rustc E: f16 and f128 compile on x86-64 Linux (#85) (#614)
+- toolchain-bump: run the bump train's failed jobs again once before red blocks it (#615)
+- borrowck: promote the autoref'd mutable borrow of an empty array (&mut [][..]) (#580)
+- each whole-build worker links in a directory of its own, so features and flags don't leak into the next build (#593)
+- borrowck: wfcheck normalizes fn signatures in an inference context, as rustc's WfCheckingCtxt (#618)
+- growth.py measures both sizes under one register allocator (#619)
+- closure: nixpkgs store paths for build scripts, fetched and verified by blaze itself (no nix binary), kept as lasting store entries, laid out per path (#617)
+- remote.py reads push/pull's outcome after #525's traffic line (#616)
+- corpus's packed struct of offset_of! is PackedHeader, not compared with std's Windows allocator Header (#621)
+- std unit: a #![no_std] program links core and compiler_builtins, not std, as rustc puts them in (#622)
+- remote-cache gateway: signed index, refresh inside head writes, 80-day expiry, lifecycle rules (slice 4 server side) (#620)
+- ra-jit assembles intrinsic stubs in parallel: std unit cold compile 15.4 s -> 3.0 s (#85) (#624)
+- Programs print blaze, not ra-jit (#270, what the programs print) (#626)
+- a daemon that starts from a manifest takes the store's code while nobody asks, so its first edit is a patch (storetracked, #550) (#627)
+- LLVM_SYS_231_PREFIX is given to build scripts, so blaze builds itself in nix develop again (#630)
+- hir-ty: never-type fallback to ! in every edition, if-let captures as let, &mut borrow makes a place maybe-init (#73) (#623)
+- docs: wasm32 measured at main: nothing of rustc's for wasip1 programs, wasm-host guests and Cloudflare Workers (#625)
+- build-script downloads pinned by sha256 in Cargo.fetches.lock (blaze lock --fetches) and handed to the script through its crate's own variable, with no network (#637)
+- No-rustc E: x86-64 SSE to AVX2, crypto and machine-state intrinsics and __rust_probestack compile (#85) (#640)
+- build scripts' builds make the standard library once a store (#203) (#642)
+- nocompact.py finds answer by the name the daemon's own link gives it (#638)
+- tier events show own functions by their path; tiers.py reads next_age's demotion (#639)
+- buildmodel and storeguards registries are local-registries, which blaze reads (no git index) (#641)
+- a patch compiles the changed code an unchanged copy of the base reaches again (#582) (#628)
+- the fake gateway of the remote tests hashes each body once, so the parts test keeps within the client's deadline in blaze's own build (#649)
+- No-rustc E: f16 intrinsics, AVX512-FP16, AVX512-BF16, AVX-NE-CONVERT and f16b compile on x86-64 (#85) (#644)
+- borrowck: wfcheck needs what normalizing a signature needs; no projection from impls with E0207 params (#646)
+- the sandbox view tests run outside cargo blaze test's sandbox; a sandbox nested in another says why it can't be made (#650)
+- test passes kept in the store and shared through the remote, keyed like a build; tests hermetic by default (#647)
+- harness: check_apps.py, cargo blaze check against cargo check on the bench apps (#653)
+- breakers.py's procmacro and overlap cases pass (stringify! keeps a proc macro's re-spanned parentheses; LLVM shares the frame slots of locals that never overlap) (#648)
+- toolchain-bump: count std refusals against toolchain/base's build, not main's newest (#657)
+- no cap on the tokens one macro expands to, as rustc has none (#423: biome_wasm's #[wasm_bindgen] block) (#654)
+- borrowck speed: a trait reference is proven by a canonical query (rustc's type_op_prove_predicate) (#651)
+- a dependency named only in another crate's macro output is loaded, so its impls are seen (#423: biome_analyze's derived Deserializable) (#643)
+- the first load's check reads only modules of a crate, not rustfmt.toml (macOS fd mended 101) (#660)
+- a codegen refusal refuses that build, not the daemon (#656)
+- CHANGELOG has no stray conflict marker (#665)
+- Codegen: fma keeps the NaN rustc keeps on x86-64 (#85) (#661)
+- a SIMD vector is copied, and 16 bytes of lanes stored, whole: sha2's SHA-NI rounds 3 times faster (#662)
+- bench/remote-cache: blaze's own store through the gateway, and the 16 GB limit on a cold self-build (#664)
+- x86-64 inline asm drops a template's $ in Intel syntax, as rustc's LLVM does (Windows doctests build) (#663)
+- blaze builds and runs a load's build scripts and proc macros; a cargo blaze build or test runs no cargo but the typed one (#658)
+- coldbuild.py's uncompilable function is a `do yeet`, refused on every target (#666)
+- a named local keeps its stack slot to itself through its scope, for the debugger (#667)
+- hir-ty: E0525 when a closure's kind does not allow the Fn* trait it must implement (#670)
+- docs: cargo blaze builds the wasm32 workers and the no_std simd guest (#672)
+- hir-def: a name bound twice in one pattern is a binding of its own, as rustc's fresh_binding (#671)
+- a build script is given the variables it declares with rerun-if-env-changed, keyed by their values (#585) (#673)
+- allrajit_wasm.py reads the link line as blaze prints it (#270) (#674)
+- allrajit_wasm.py: the link line says blaze since #626 (#675)
+- the first load's check reads the crates the build compiles when the program came from the store (macOS fd mended 101) (#676)
+- allrajit_wasm.py: the cdylib and the no_std guest by cargo blaze build too (#677)
+- closure lay-out renames before sealing (macOS), borrowck test path separator (Windows) (#678)
+- test passes on a fresh runner, measured on 7 bench apps (verify clean; reach walk is the cost left) (#679)
+- docs: resolve.py ctdeps results on main after #658 (#682)
+- a build from the store describes what a cold build would (#242) (#681)
+- hir-ty: a failed match guard ends its pattern's bindings, so E0384 needs no exception for bindings (#680)
+- the store reads a pack through a buffer to check it, holding its index, not the pack (#685)
+- start a worker with the places cargo set, so its load compiles env!("CARGO_BIN_EXE_<name>") (#687)
+- tests' walk by stable names: a fresh daemon with main's store compiles no dependency to hash the tests (axum walk 6.2 s -> 0.94 s) (#688)
+- a constant's raw pointer keeps what the pointers it points at point to (io::Error of a message no longer segfaults) (#689)
+- No-rustc E: x86-64 FMA wrappers compiled as LLVM folds them at -O0, 90 refusals fewer (#85) (#690)
+- toolchain-bump: retry GitHub's 502s, say so when the verdict cannot decide, -f train=<id> to decide again (#691)
+- borrowck speed: is_copy and normalizing are canonical queries, dominators by semi-NCA (#692)
+- wasm: lower a memory routine reached through try_call as call does (derive_more_impl builds as wasm) (#695)
+- Codegen: NEON fused multiply-adds keep the NaN rustc keeps in NEON f64 lane fma (#85) (#694)
+- hir-def: an expansion of one expression and a `;`, called where rustc parses an expression, is that expression (#693)
+- toolchain: pin nightly-2026-10-27 (#543)
+- toolchain-bump: a green bump merges on its own and its merge starts main's workflows (#699)
+- ra-jit --run-tool, blaze's std::process for wasm32-wasip1 build scripts (#698)
+- build scripts under WASI, an opt-in runner (RA_JIT_BUILD_SCRIPTS=wasi) (#700)
+- docs/toolchain.md: measured lag and bump time; the bump keeps the docs' pin current (#702)
+- build scripts under WASI over the bench corpus (473 of 624 unchanged) (#701)
+- git worktrees share a whole build's worker again; a worktree's build is linked before it answers (#645)
+- a whole build's integration test gets CARGO_BIN_EXE_<name> at run time, as cargo gives it (#659)
+- give plain cargo its own copy of the daemon's executable (no Text file busy) (#703)
+- borrowck: a reified fn item's elided `&dyn Trait` is `&'a (dyn Trait + 'a)`, rustc's object lifetime default (#704)
+- testselect expects the provenance ra-jit keeps (commit and run under GitHub Actions) (#705)
+- DWARF units are written as each is full (nushell cold build 19.0 -> 17.5 GB peak, #38 part 1) (#707)
+- cargo_ra_jit.py's other build of ra-jit has the proc-macro server beside it (daemon replace rows) (#708)
+- a load's unit graphs are made once in that load, so a reload after a manifest edit sees its features (buildmodel reload_feature_toggled) (#709)
+- a daemon's worker has its build's RUSTFLAGS and profiles, not the daemon starter's (#710)
+- Copy, not move, a Copy value a closure captures by value (#711)
+- own answers: rustc --print cfg with -C target-feature and -C target-cpu (#706)
+- doctests are named by the line of their fence where rustdoc finds it (nightly-2026-10-27) (#712)
+- breakers.py counts neon_fma_lanes' splatted function as left to rustc on purpose (#713)
+- docs/borrowck.md: counts at 68be5dec, every app clean, what is left (#715)
+- the store keeps a program's files without copying them (nushell manifest 17.4 -> 14.8 GB) (#716)
+- borrowck speed: drop liveness as rustc's dropck finds it (SCCs, adt_dtorck_constraint query, drop glue query) (#718)
+- borrowck speed: a goal whose answer names a placeholder is proven by the query too, as rustc's canonical response (#727)
+- Proc macros run as WebAssembly by default (watt-style, Wasmtime in the daemon; warm corpus 4.01 s native -> 2.61 s) (#726)
+- a whole build's object is not held twice while it is written and weakened (#729)
+- Windows: the whole build builds and live-edits demo/life (#697)
+- check: leave dev targets out of a plain check (#684)
+- cargo: retry failed workspace loads on the next build (#652)
+- remote.py's lying-remote check allows B's own pack to be one of A's to the byte (#733)
+- docs no longer describe the merge queue as current (#736)
+- install.md describes the dated releases, not a moving nightly build (#737)
+- build scripts run in their closure and are kept by what they are made of (opt-in): 425/434 corpus runs, 371/371 cross-host hits (#714)
+- docs no longer say cargo blaze hands builds to cargo (#739)
+- Name build-script files that differ on rerun (#725)
+- train: nushell's projects jobs do not block the verdict until #734 (16 GB runner OOM) (#735)
+- macOS sandbox makes the directories above a /tmp overlay (nested cargo dep-info ENOENT) (#738)
+- One SourceId: blaze-source holds it, blaze-registry drops its own (#321) (#740)
+- harness: cargo_ra_jit.py keeps a failed run's work directory, so CI uploads its workers' logs (#741)
+- roots: list a crate's roots with the crate, not on every edit (#696)
+- blaze-resolve's Registry over the index, fetched concurrently (#321) (#742)
+- borrowck speed: the walk order of drop live locals is found once per local (#743)
+- clippy's warnings and denied lints outside the hot paths, no behaviour change (#744)
+- one hex helper and one package_dir in ra-jit instead of their copies, no behaviour change (#745)
+- chunks of a constant size taken with as_chunks where clippy asks, outside the hot paths, no behaviour change (#746)
+- nightly's #[derive(From)] expands as rustc's does (#600) (#747)
+- proc-macro server: one missing-server message, which says macOS releases ship it too (#460) (#749)
+- macOS: a first link has the header room its unwind information wants (#173) (#748)
+- a sandboxed build script may forward CARGO_CFG_* and CARGO_ENCODED_RUSTFLAGS to its crate, as cargo accepts (#719) (#753)
+- sandboxed tests are an experiment a workspace opts into; by default tests run as cargo test runs them (#754)
+- resolver.feature-unification = "workspace" builds -p app with the features other members enable, as cargo does (#596) (#752)
+- cargo: crates blaze builds read the variables their build scripts set (#467)
+- Fork sync runs in the forks, with their own token: blaze needs no secret for it (#755)
+- corpus: every const-generic NEON intrinsic at each end of its range (#756)
+- farsplices: an edit of an 8-byte AArch64 function past a branch's reach is spliced (#300) (#757)
+- answers: a rustc outside a toolchain is rustup's proxy, whatever it is called (#466)
+- auth-required registries' index and .crate files fetched with the token cargo sends, from one credential lookup (#315) (#758)
+- keep the names read of an executable across a splice (#453) (#750)
+- train: by hand only for now; releases are cut by hand (#765)
+- opening the store reads each pack's index, not its values, and holds 16 bytes a key (#686) (#759)
+- blaze toolchain says nothing of a project's toolchain; the first build says it once (#762)
+- say Compiling only of what is built, and a new-user experience harness (#760)
+- a workspace that fails to load says why, not only its outermost error (#764)
+- blaze's own toolchain has wasm32-wasip1's std, so proc macros build without rustup (#763)
+- docs/cargo.md names cargo blaze and the BLAZE_* settings (#270) (#770)
+- macOS sandbox stand-ins are named as what they stand for, so realpath is right in an overlay (#767)
+- the messages blaze prints name blaze and the BLAZE_* settings (#270), no behaviour change (#768)
+- the daemon requests only the stand-in first build sent are gone, no behaviour change (#772)
+- the runtime crates read BLAZE_* settings too, and the user docs name them (#270) (#769)
+- experience.py finds blaze's processes by the program they run (macOS pgrep -a is ancestors) (#774)
+- a worker writes again what a clean took from under it (#721) (#761)
+- statics that name one section share it, so macOS programs with >255 #[link_section] statics build (#724) (#766)
+- AArch64 16-byte vector copies only at frame offsets an immediate reaches (valgrind SIGILL in difftest corpus) (#777)
+- credential processes and cargo:token-from-stdout asked as cargo asks them; keychain providers refused by name (#315) (#778)
+- a proc-macro server that failed an expansion fails the build with what it said (#521)
+- release cut: the train's release job by hand, while the train runs by hand only (#782)
+
 ## [0.1.0] - 2026-10-20
 
 The first release.
@@ -1895,5 +2627,6 @@ The first release.
 - No borrow checker: keep running `cargo check`.
 - Changing a struct the running program uses asks for a restart.
 
-[Unreleased]: https://github.com/indexable-inc/ra-jit/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/indexable-inc/blaze/compare/v0.20261027.0...HEAD
+[0.20261027.0]: https://github.com/indexable-inc/blaze/releases/tag/v0.20261027.0
 [0.1.0]: https://github.com/indexable-inc/ra-jit/releases/tag/v0.1.0

@@ -380,6 +380,9 @@ STEPS = [
     ("a static of bytes grown to a megabyte", [
         ("static TABLE: [u8; 8] = [8, 7, 6, 5, 4, 3, 2, 9];", "static TABLE: [u8; 1 << 20] = [3; 1 << 20];"),
     ], None),
+    ("a static another points into, grown", [
+        ('static WORDS: [&str; 3] = ["uno", "dos", "tres"];', 'static WORDS: [&str; 4] = ["uno", "dos", "drei", "cuatro"];'),
+    ], None),
     ("a static added and used", [
         ("static TABLE:", "static BONUS: [u32; 4] = [10, 20, 30, 40];\nstatic TABLE:"),
         ("TABLE.iter().map(|&b| u32::from(b)).sum()", "TABLE.iter().map(|&b| u32::from(b)).sum::<u32>() + BONUS[3]"),

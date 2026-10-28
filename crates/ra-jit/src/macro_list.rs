@@ -71,6 +71,7 @@ fn wasm_text(macros: &[(u32, String, Vec<String>, String)]) -> String {
     for (kind, name, helpers, _) in macros {
         _ = writeln!(list, "{kind}\t{name}\t{}", helpers.join(","));
     }
+    let bytes: Vec<String> = list.bytes().map(|it| it.to_string()).collect();
     let mut text = String::from(MARK);
     _ = write!(
         text,
@@ -80,9 +81,11 @@ fn wasm_text(macros: &[(u32, String, Vec<String>, String)]) -> String {
          pub extern \"C\" fn {ALLOC}(len: usize) -> *mut u8 {{\n        \
          proc_macro::__blaze::alloc(len)\n    \
          }}\n\n    \
+         #[unsafe(link_section = \"{SECTION}\")]\n    \
+         static LISTED: [u8; {len}] = [{bytes}];\n\n    \
          #[unsafe(no_mangle)]\n    \
          pub extern \"C\" fn {LIST}() {{\n        \
-         proc_macro::__blaze::list({list:?})\n    \
+         proc_macro::__blaze::list_bytes(&LISTED)\n    \
          }}\n\n    \
          #[unsafe(no_mangle)]\n    \
          pub extern \"C\" fn {EXPAND}(\n        \
@@ -96,6 +99,9 @@ fn wasm_text(macros: &[(u32, String, Vec<String>, String)]) -> String {
         ALLOC = ra_jit_macro_wasm::exports::ALLOC,
         LIST = ra_jit_macro_wasm::exports::LIST,
         EXPAND = ra_jit_macro_wasm::exports::EXPAND,
+        SECTION = ra_jit_macro_wasm::exports::LIST_SECTION,
+        len = list.len(),
+        bytes = bytes.join(", "),
     );
     for (index, (kind, _, _, path)) in macros.iter().enumerate() {
         let call = match kind {

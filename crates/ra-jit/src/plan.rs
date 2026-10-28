@@ -598,7 +598,10 @@ impl Unit {
 
 /// Where the build `selection` names of the package of `manifest` is asked for: the directory,
 /// and the manifest when one is named.
-fn asked_where<'a>(manifest: &'a Path, selection: &'a Selection) -> (&'a Path, Option<&'a Path>) {
+pub(crate) fn asked_where<'a>(
+    manifest: &'a Path,
+    selection: &'a Selection,
+) -> (&'a Path, Option<&'a Path>) {
     match &selection.asked_in {
         Some(asked_in) if asked_in.is_dir() => (asked_in.as_path(), None),
         Some(asked_in) => (asked_in.parent().unwrap_or(Path::new(".")), Some(asked_in.as_path())),
